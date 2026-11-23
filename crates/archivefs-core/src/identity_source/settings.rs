@@ -70,6 +70,17 @@ pub struct ProviderSettings {
     /// [`DEFAULT_IMPORT_TIMEOUT_SECONDS`]'s own reasoning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub import_timeout_seconds: Option<u32>,
+    /// "Rename also updates RomM's title": the one RomM write EmuWiz makes,
+    /// described in [`super::romm::title_sync`]. Off unless the person turns
+    /// it on; absent in older settings, which keeps them read-only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rename_updates_title: bool,
+    /// The token file used only by that title update and its Undo: a RomM
+    /// client token with `roms.write`. Separate from `source.token_path`,
+    /// which stays the read-only token that browsing, import and every other
+    /// RomM request use. Read only through [`title_token_file`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_token_path: Option<PathBuf>,
 }
 
 impl ProviderSettings {
@@ -330,6 +341,29 @@ pub const MAX_TOKEN_FILE_BYTES: u64 = 8 * 1024;
 /// The order matters: the file's type and permissions are established before its
 /// contents are read, so an unsafe file is refused rather than read and then
 /// complained about.
+/// Loads the token for "Rename also updates RomM's title", with the same
+/// checks as [`load_token_file`]. Never falls back to the read-only token, and
+/// refuses that same file: title updates must not make the token used for
+/// everything else write-capable.
+pub fn title_token_file(settings: &ProviderSettings) -> Result<RommToken, String> {
+    let Some(path) = settings.title_token_path.as_deref() else {
+        return Err("no title-update token is set. Add a separate RomM client token with the roms.write permission on the RomM card; the read-only token is never used for this.".into());
+    };
+    if let Some(read_only) = settings.source.token_path.as_deref() {
+        let same = match (fs::canonicalize(path), fs::canonicalize(read_only)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => path == read_only,
+        };
+        if same {
+            return Err(format!(
+                "the title-update token file {} is the same file as EmuWiz's read-only RomM token. Give title updates their own token file, so the token used for browsing and import stays read-only.",
+                path.display()
+            ));
+        }
+    }
+    load_token_file(Some(path)).map_err(|refusal| refusal.detail())
+}
+
 pub fn load_token_file(path: Option<&Path>) -> Result<RommToken, TokenFileRefusal> {
     let Some(path) = path else {
         return Err(TokenFileRefusal::NotConfigured {

@@ -100,6 +100,10 @@ class Incremental(R.Base):
         wt, target, _ = self.cache()
         group = self.group(wt, target, ["debug/incremental"])
         group["inode"] += 1
+        path, digest = self.manifest([group])
+        rc, outer = self.run_retire(path, digest, execute=True)   # the signed-record gate refuses first
+        self.assertEqual(outer.get("groups"), [], outer)
+        self.inner_layer_only()                                    # then the per-group defence on its own
         self.refuse(wt, target, "DIRECTORY_IDENTITY_CHANGED", group)
 
     def test_source_worktree_and_audit_entries_refused(self):
@@ -124,6 +128,10 @@ class Incremental(R.Base):
         group["directory"] = wt
         group["device"], group["inode"] = os.stat(wt).st_dev, os.stat(wt).st_ino
         path, digest = self.manifest([group], "source.json")
+        _, outer = self.run_retire(path, digest, execute=True)    # the signed-record gate refuses first
+        self.assertEqual(outer.get("groups"), [], outer)
+        self.assertTrue(os.path.isdir(os.path.join(target, "debug", "incremental")))
+        self.inner_layer_only()
         _, result = self.run_retire(path, digest, execute=True)
         self.assertIn("SHARED_OR_EXTERNAL_TARGET", {h["code"] for h in result["groups"][0]["holds"]})
 

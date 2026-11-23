@@ -77,6 +77,7 @@ fn approval_for(fixture: &ReadyFixture) -> crate::launch::dosbox_autoexec::DosBo
 
 fn dummy_approval() -> crate::launch::dosbox_autoexec::DosBoxStartApproval {
     let identity = crate::launch::process_spawn::CapturedFileIdentity {
+        changed: None,
         device: 0,
         inode: 0,
         size: 0,

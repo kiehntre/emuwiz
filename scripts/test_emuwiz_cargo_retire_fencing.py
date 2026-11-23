@@ -196,13 +196,14 @@ class Fencing(R.Base):
         wt, target = self.managed_cache("concurrent")
         path, digest = self.manifest([self.group(wt, target, ["debug/deps"])])
         def second_executor():
-            previous = self.receipts
-            self.receipts = os.path.join(self.tmp, "second-receipts")
-            try:
-                _, receipt = self.run_retire(path, digest, execute=True)
-                self.assertIn("LIFECYCLE_LOCK_UNAVAILABLE", {h["code"] for h in receipt["groups"][0]["holds"]})
-            finally:
-                self.receipts = previous
+            # its own owner-signed record, in the canonical receipts directory (signed runs require it)
+            _, receipt = self.run_retire(path, digest, execute=True)
+            # fenced either way: the in-flight journal refuses the whole run, or the lifecycle lock holds the group
+            if receipt.get("refused"):
+                self.assertEqual(receipt["refused"]["code"], "INCOMPLETE_JOURNAL_PRESENT", receipt)
+            else:
+                self.assertIn("LIFECYCLE_LOCK_UNAVAILABLE", {h["code"] for h in receipt["groups"][0]["holds"]}, receipt)
+            self.assertTrue(os.path.isdir(os.path.join(target, "debug", "deps")))
         _, receipt = self.retire_paused(path, digest, second_executor)
         self.assertEqual(receipt["groups"][0]["outcome"], "RETIRED")
 

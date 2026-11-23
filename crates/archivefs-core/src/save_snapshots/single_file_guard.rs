@@ -27,7 +27,7 @@ use super::{
     SaveQuiescenceRequirement, SaveRestoreApplyOptions, SaveRestoreError, SaveRestorePreflight,
     SaveRestoreReceipt, SaveRestoreRefusal, SaveRestoreResult, SaveSnapshot,
     apply_single_file_restore_gated, build_single_file_restore_preflight, history::closure_binding,
-    history::snapshot_closure_supported, undo_single_file_restore,
+    history::snapshot_closure_supported, undo_single_file_restore_gated,
 };
 use crate::memory_card_inventory::restore_guard::{CardLeaseAttempt, CardWriteLease};
 use crate::persistent_state_inventory::StateEmulator;
@@ -189,7 +189,9 @@ pub fn undo_single_file_guarded(
     observer: &dyn QuiescenceProvider,
 ) -> Result<GuardedUndo, SaveRestoreError> {
     let window = Window::open(emulator, &receipt.target_binding.target_path, observer);
-    undo_single_file_restore(receipt, window.before)?;
+    // Re-proved after the previous save is staged, immediately before it is
+    // published over the restored file, exactly as apply does.
+    undo_single_file_restore_gated(receipt, window.before, &|| window.still_closed())?;
     Ok(GuardedUndo {
         opened_during_undo: !window.closed_after_write(),
     })

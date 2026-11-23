@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
@@ -830,4 +830,373 @@ fn an_absolute_search_directory_is_used_as_is() {
     };
     assert_eq!(verified.path, elsewhere.join("my-bios.bin"));
     fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+// --- automatic BIOS search (no Path<Region>, no BIOSFilename) -----------------------------------
+
+/// A synthetic 512 KiB image (the PS1 BIOS size DuckStation's search accepts).
+fn bios_sized(seed: u8) -> Vec<u8> {
+    (0..PS1_BIOS_SIZE as usize)
+        .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect()
+}
+
+fn search_fixture(label: &str) -> (Fixture, PathBuf) {
+    // The real layout: SearchDirectory names `bios/psx`, so the trusted BIOS
+    // tree is `bios` and everything else under the fixture root is outside it.
+    let fixture = build_fixture(label, "[BIOS]\nSearchDirectory=../bios/psx\n");
+    // Exactly the path DuckStation forms: its data root joined with the
+    // relative SearchDirectory.
+    let directory = fixture.profile.configuration_path.join("../bios/psx");
+    fs::create_dir_all(&directory).unwrap();
+    (fixture, directory)
+}
+
+#[test]
+fn search_directory_only_verifies_a_redump_bios_for_the_required_region() {
+    // Real settings.ini shape: only [BIOS] SearchDirectory, relative to the
+    // data root. Before the fix this was reported Missing.
+    let (fixture, directory) = search_fixture("auto-usa");
+    let usa = bios_sized(1);
+    let japan = bios_sized(2);
+    write_bios(&directory, "scph1001.bin", &usa);
+    write_bios(&directory, "scph5500.bin", &japan);
+    write_bios(&directory, "readme.txt", b"not a bios");
+    let inspection = inspection_for(&fixture, "SLUS-00404");
+    let evidence = vec![record_for("ps-22j", &japan), record_for("ps-22a", &usa)];
+    let outcome = resolve_duckstation_bios(&fixture.profile, &inspection, &evidence);
+    let DuckStationBiosVerificationOutcome::Verified(verified) = outcome else {
+        panic!("expected Verified, got {outcome:?}");
+    };
+    assert_eq!(verified.path, directory.join("scph1001.bin"));
+    assert_eq!(verified.record.name, "ps-22a");
+    assert_eq!(verified.required_region, Some("NTSC-U"));
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
+fn search_directory_with_only_another_regions_bios_is_not_verified() {
+    let (fixture, directory) = search_fixture("auto-wrong-region");
+    let japan = bios_sized(3);
+    write_bios(&directory, "scph5500.bin", &japan);
+    let inspection = inspection_for(&fixture, "SLUS-00404");
+    let outcome = resolve_duckstation_bios(
+        &fixture.profile,
+        &inspection,
+        &[record_for("ps-22j", &japan)],
+    );
+    assert_eq!(
+        outcome,
+        DuckStationBiosVerificationOutcome::Unknown {
+            path: directory.clone()
+        }
+    );
+    assert_eq!(
+        outcome.as_legacy_state(),
+        DuckStationBiosState::PresentUnverified
+    );
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
+fn search_directory_unverified_or_unknown_region_is_never_verified() {
+    let (fixture, directory) = search_fixture("auto-unverified");
+    let usa = bios_sized(4);
+    write_bios(&directory, "scph1001.bin", &usa);
+    // A matching hash whose record name carries no region is not enough.
+    let inspection = inspection_for(&fixture, "SLUS-00404");
+    let outcome = resolve_duckstation_bios(
+        &fixture.profile,
+        &inspection,
+        &[record_for("fixture", &usa)],
+    );
+    assert!(
+        matches!(outcome, DuckStationBiosVerificationOutcome::Unknown { .. }),
+        "{outcome:?}"
+    );
+    // No evidence at all: present, unverified.
+    let outcome = resolve_duckstation_bios(&fixture.profile, &inspection, &[]);
+    assert!(
+        matches!(outcome, DuckStationBiosVerificationOutcome::Unknown { .. }),
+        "{outcome:?}"
+    );
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
+fn search_directory_ignores_wrong_sizes() {
+    let (fixture, directory) = search_fixture("auto-size");
+    let usa = bios_sized(5);
+    write_bios(&directory, "short.bin", &usa[..1024]);
+    let inspection = inspection_for(&fixture, "SLUS-00404");
+    let outcome =
+        resolve_duckstation_bios(&fixture.profile, &inspection, &[record_for("ps-22a", &usa)]);
+    assert_eq!(outcome, DuckStationBiosVerificationOutcome::Missing);
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+// --- contained BIOS links (bios/psx/*.bin -> ../*.bin) ------------------------------------------
+
+#[test]
+fn a_relative_link_to_a_bios_in_the_folder_above_verifies() {
+    let (fixture, directory) = search_fixture("link-contained");
+    let usa = bios_sized(7);
+    write_bios(&directory.join(".."), "scph1001.bin", &usa);
+    symlink("../scph1001.bin", directory.join("scph1001.bin")).unwrap();
+    let inspection = inspection_for(&fixture, "SLUS-00404");
+    let outcome =
+        resolve_duckstation_bios(&fixture.profile, &inspection, &[record_for("ps-22a", &usa)]);
+    let DuckStationBiosVerificationOutcome::Verified(verified) = outcome else {
+        panic!("expected Verified, got {outcome:?}");
+    };
+    assert_eq!(verified.path, directory.join("scph1001.bin"));
+    assert_eq!(verified.record.name, "ps-22a");
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+fn assert_link_not_verified(label: &str, make: impl FnOnce(&Path, &Path, &[u8])) {
+    let (fixture, directory) = search_fixture(label);
+    let usa = bios_sized(8);
+    make(&fixture.root, &directory, &usa);
+    let inspection = inspection_for(&fixture, "SLUS-00404");
+    let outcome =
+        resolve_duckstation_bios(&fixture.profile, &inspection, &[record_for("ps-22a", &usa)]);
+    assert!(
+        !matches!(outcome, DuckStationBiosVerificationOutcome::Verified(_)),
+        "{label}: {outcome:?}"
+    );
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
+fn a_relative_link_escaping_the_bios_tree_is_refused() {
+    assert_link_not_verified("link-escape", |root, directory, usa| {
+        write_bios(&root.join("outside"), "real.bin", usa);
+        symlink("../../outside/real.bin", directory.join("scph1001.bin")).unwrap();
+    });
+}
+
+#[test]
+fn an_absolute_link_is_refused_even_inside_the_tree() {
+    assert_link_not_verified("link-absolute", |_, directory, usa| {
+        let real = write_bios(&directory.join(".."), "real.bin", usa);
+        let real = fs::canonicalize(real).unwrap();
+        symlink(&real, directory.join("scph1001.bin")).unwrap();
+    });
+}
+
+#[test]
+fn broken_and_looping_links_are_refused() {
+    assert_link_not_verified("link-broken", |_, directory, _| {
+        symlink("../missing.bin", directory.join("scph1001.bin")).unwrap();
+        symlink("loop-b.bin", directory.join("loop-a.bin")).unwrap();
+        symlink("loop-a.bin", directory.join("loop-b.bin")).unwrap();
+    });
+}
+
+#[test]
+fn a_link_to_a_directory_or_fifo_inside_the_tree_is_refused() {
+    assert_link_not_verified("link-special", |_, directory, _| {
+        fs::create_dir_all(directory.join("../a-folder")).unwrap();
+        symlink("../a-folder", directory.join("scph1001.bin")).unwrap();
+        let fifo = directory.join("../a-fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        symlink("../a-fifo", directory.join("scph5501.bin")).unwrap();
+    });
+}
+
+#[test]
+fn a_link_through_a_symlinked_folder_out_of_the_tree_is_refused() {
+    // bios/escape -> ../outside, then psx/scph1001.bin -> ../escape/real.bin:
+    // the canonical target leaves the tree, so it is refused.
+    assert_link_not_verified("link-via-folder", |root, directory, usa| {
+        write_bios(&root.join("outside"), "real.bin", usa);
+        symlink("../outside", directory.join("../escape")).unwrap();
+        symlink("../escape/real.bin", directory.join("scph1001.bin")).unwrap();
+    });
+}
+
+#[test]
+fn a_shallow_bios_folder_never_trusts_a_broad_parent() {
+    // Review of e9309492: the parent of `/mnt/x` or `~/bios` is far too broad.
+    let root = |path: &str| {
+        trusted_bios_root(Path::new(path), Some(Path::new("/var/home/user"))).map(Path::to_path_buf)
+    };
+    assert_eq!(
+        root("/mnt/usbdrive/[BIOS]/bios/psx"),
+        Some(PathBuf::from("/mnt/usbdrive/[BIOS]/bios"))
+    );
+    assert_eq!(
+        root("/home/user/bios"),
+        Some(PathBuf::from("/home/user/bios"))
+    );
+    // Final review: a mount root or the home folder is never trusted itself.
+    assert_eq!(root("/mnt/x"), None);
+    assert_eq!(root("/var/home/user"), None);
+    assert_eq!(root("/var/home"), None);
+    assert_eq!(root("/media/user/disk"), None);
+    assert_eq!(
+        root("/media/user/disk/bios"),
+        Some(PathBuf::from("/media/user/disk/bios"))
+    );
+    assert_eq!(root("/mnt/x/bios"), Some(PathBuf::from("/mnt/x/bios")));
+    assert_eq!(root("/mnt"), None);
+    assert_eq!(root("/"), None);
+    // Re-review: a deep parent can still be the whole home folder or every
+    // mounted drive; neither is ever trusted.
+    assert_eq!(
+        root("/var/home/user/bios"),
+        Some(PathBuf::from("/var/home/user/bios"))
+    );
+    assert_eq!(root("/run/media/user/USB"), None);
+    assert_eq!(root("/run/media/user"), None);
+    assert_eq!(root("/media/user"), None);
+    // Image-based systems: `/mnt` is a link to `var/mnt`, so canonical BIOS
+    // folders live below `/var/mnt` and its drives are mount roots too.
+    assert_eq!(root("/var/mnt/x"), None);
+    assert_eq!(root("/var/mnt"), None);
+    assert_eq!(
+        root("/var/mnt/x/bios"),
+        Some(PathBuf::from("/var/mnt/x/bios"))
+    );
+    assert_eq!(
+        root("/var/mnt/x/emu/bios/psx"),
+        Some(PathBuf::from("/var/mnt/x/emu/bios"))
+    );
+    // The BIOS folder is the home folder itself (standard layout).
+    assert_eq!(
+        trusted_bios_root(Path::new("/home/user"), Some(Path::new("/home/user"))),
+        None
+    );
+    assert_eq!(
+        root("/run/media/user/USB/bios/psx"),
+        Some(PathBuf::from("/run/media/user/USB/bios"))
+    );
+    assert_eq!(
+        root("/var/home/user/emu/bios/psx"),
+        Some(PathBuf::from("/var/home/user/emu/bios"))
+    );
+}
+
+#[test]
+fn a_link_to_a_file_that_is_not_bios_sized_is_never_hashed_or_verified() {
+    let (fixture, directory) = search_fixture("link-oversized");
+    // A record for the oversized bytes proves the size gate, not the hash,
+    // is what refuses it.
+    let mut big = bios_sized(9);
+    big.extend(std::iter::repeat_n(0u8, 4096));
+    write_bios(&directory.join(".."), "big.bin", &big);
+    symlink("../big.bin", directory.join("scph1001.bin")).unwrap();
+    let inspection = inspection_for(&fixture, "SLUS-00404");
+    let outcome =
+        resolve_duckstation_bios(&fixture.profile, &inspection, &[record_for("ps-22a", &big)]);
+    assert!(
+        !matches!(outcome, DuckStationBiosVerificationOutcome::Verified(_)),
+        "{outcome:?}"
+    );
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
+fn a_folder_of_only_broken_links_has_no_bios() {
+    let (fixture, directory) = search_fixture("link-only-broken");
+    symlink("../missing.bin", directory.join("scph1001.bin")).unwrap();
+    let inspection = inspection_for(&fixture, "SLUS-00404");
+    let outcome = resolve_duckstation_bios(&fixture.profile, &inspection, &[]);
+    assert!(
+        matches!(outcome, DuckStationBiosVerificationOutcome::Missing),
+        "{outcome:?}"
+    );
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
+fn junk_links_sorted_first_do_not_hide_a_real_bios() {
+    let (fixture, directory) = search_fixture("link-junk-first");
+    let usa = bios_sized(10);
+    write_bios(&directory.join(".."), "real.bin", &usa);
+    write_bios(&directory.join(".."), "junk.bin", b"not a bios");
+    for index in 0..(MAX_AUTO_SEARCH_HASHED + 5) {
+        symlink("../junk.bin", directory.join(format!("a{index:04}.bin"))).unwrap();
+    }
+    symlink("../real.bin", directory.join("z-scph1001.bin")).unwrap();
+    let inspection = inspection_for(&fixture, "SLUS-00404");
+    let outcome =
+        resolve_duckstation_bios(&fixture.profile, &inspection, &[record_for("ps-22a", &usa)]);
+    assert!(
+        matches!(outcome, DuckStationBiosVerificationOutcome::Verified(_)),
+        "{outcome:?}"
+    );
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
+fn an_empty_path_for_the_required_region_falls_back_to_the_search() {
+    // Only a PAL path is set; an NTSC-U game makes DuckStation search.
+    let fixture = build_fixture(
+        "auto-other-region-path",
+        "[BIOS]\nSearchDirectory=../bios-folder\nPathPAL=pal.bin\n",
+    );
+    let directory = fixture.root.join("bios-folder");
+    let usa = bios_sized(6);
+    write_bios(&directory, "scph1001.bin", &usa);
+    let inspection = inspection_for(&fixture, "SLUS-00404");
+    let outcome = resolve_duckstation_bios(
+        &fixture.profile,
+        &inspection,
+        &[record_for("ps-41a(w)", &usa)],
+    );
+    assert!(
+        matches!(outcome, DuckStationBiosVerificationOutcome::Verified(_)),
+        "{outcome:?}"
+    );
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
+fn redump_machine_names_map_to_regions() {
+    let bytes = b"x";
+    let region = |name: &str| redump_ps1_bios_region(&record_for(name, bytes));
+    assert_eq!(region("ps-41a"), Some(DuckStationRegion::NtscU));
+    assert_eq!(region("ps-41a(w)"), Some(DuckStationRegion::NtscU));
+    assert_eq!(region("ps-30e"), Some(DuckStationRegion::Pal));
+    assert_eq!(region("psone-43j"), Some(DuckStationRegion::NtscJ));
+    assert_eq!(region("ps-22j(v)"), Some(DuckStationRegion::NtscJ));
+    assert_eq!(region("ps-22d"), None);
+    assert_eq!(region("fixture"), None);
+    assert_eq!(
+        redump_ps1_bios_region(&record_for_system(
+            "ps-41a",
+            bytes,
+            FirmwareSystem::PlayStation2
+        )),
+        None
+    );
+}
+
+#[test]
+fn an_unset_or_unresolvable_home_trusts_no_bios_tree() {
+    // Final re-review: without a home folder the home guard cannot be
+    // applied, so every BIOS link must be refused rather than trusted.
+    let (_fixture, directory) = search_fixture("home-unset");
+    for home in [
+        None,
+        Some(std::ffi::OsString::new()),
+        Some(std::ffi::OsString::from(
+            "/nonexistent/emuwiz-home-for-test",
+        )),
+    ] {
+        assert!(
+            trusted_bios_tree_for_home(&directory, home.clone()).is_empty(),
+            "HOME {home:?} must trust no tree"
+        );
+    }
+    let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
+    if home
+        .as_deref()
+        .is_some_and(|home| std::fs::canonicalize(home).is_ok())
+    {
+        assert!(!trusted_bios_tree_for_home(&directory, home).is_empty());
+    }
 }

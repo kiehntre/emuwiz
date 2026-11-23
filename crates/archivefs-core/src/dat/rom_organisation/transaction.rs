@@ -47,7 +47,16 @@ pub fn is_organisation_transaction(transaction: &RenameTransaction) -> bool {
         && crate::dat::rename_apply::seal::workflow_of(transaction) == "rename_apply"
         && transaction.entries.iter().all(|entry| {
             matches!(entry.operation, TransactionOperation::RenameMove)
-                && entry.unknown.contains_key("organisation_catalogue_v1")
+                && (entry.unknown.contains_key("organisation_catalogue_v1")
+                    || entry
+                        .unknown
+                        .contains_key(crate::database::organisation_paths::COMPANION_KEY)
+                    || entry
+                        .unknown
+                        .contains_key(crate::database::organisation_paths::UNCATALOGUED_KEY)
+                    || entry
+                        .unknown
+                        .contains_key(crate::database::organisation_paths::SAVE_KEY))
         })
 }
 
@@ -243,6 +252,27 @@ pub fn prepare_organisation_catalogue(
     plan: &mut OrganisationPlan,
     database: &crate::Database,
 ) -> Result<(), String> {
+    prepare_organisation_catalogue_with_platforms(plan, database, &Default::default())
+}
+
+/// A platform correction sealed into a move's catalogue binding: the
+/// canonical platform the evidence established and the evidence source
+/// (`verified_dat` for a DAT hash, `header_identity` for a calibrated content
+/// validator). Committed with the path change; Undo restores the previous
+/// assignment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformCorrection {
+    pub platform: String,
+    pub source: &'static str,
+}
+
+/// [`prepare_organisation_catalogue`] that also seals the given platform
+/// corrections, keyed by source path, into the bindings.
+pub fn prepare_organisation_catalogue_with_platforms(
+    plan: &mut OrganisationPlan,
+    database: &crate::Database,
+    corrections: &std::collections::BTreeMap<std::path::PathBuf, PlatformCorrection>,
+) -> Result<(), String> {
     let approved = plan
         .suggested()
         .map(|e| e.source_path.to_string_lossy().into_owned())
@@ -251,6 +281,14 @@ pub fn prepare_organisation_catalogue(
         return Ok(());
     }
     let mut transaction = build_organisation_transaction(plan, &approved, plan.generation)?;
+    for entry in &mut transaction.entries {
+        if let Some(correction) = corrections.get(&entry.source_path) {
+            entry.unknown.insert(
+                crate::database::organisation_paths::PLATFORM_CHANGE_KEY.into(),
+                serde_json::json!({"platform": correction.platform, "source": correction.source}),
+            );
+        }
+    }
     crate::database::organisation_paths::bind(&mut transaction, database)?;
     for entry in &mut plan.entries {
         if let Some(bound) = transaction
@@ -285,7 +323,17 @@ pub fn apply_organisation_transaction(
     }
     crate::database::organisation_paths::validate_bound(transaction, database)
         .map_err(ApplyError::Journal)?;
-    apply_filesystem_organisation_transaction(
+    // A game with a prepared copy (see `crate::recovery`) keeps it, and its
+    // remembered launch choice, under its new name. Captured before, carried
+    // after, only for entries that were really applied; never affects the
+    // outcome of the rename itself.
+    let prepared = crate::recovery::moves::before(transaction.entries.iter().map(|entry| {
+        (
+            entry.source_path.as_path(),
+            entry.destination_path.as_path(),
+        )
+    }));
+    let result = apply_filesystem_organisation_transaction(
         transaction,
         approved_sources,
         generation,
@@ -294,21 +342,41 @@ pub fn apply_organisation_transaction(
         cancel,
         mode,
         master_root,
-    )
+    );
+    if let Ok(outcome) = &result {
+        crate::recovery::moves::after(prepared, |old, new| {
+            outcome.transaction.entries.iter().any(|entry| {
+                entry.state == crate::dat::rename_apply::model::EntryState::Applied
+                    && entry.source_path == old
+                    && entry.destination_path == new
+            })
+        });
+    }
+    result
 }
 
-/// Whether `parent` is a plausible canonical platform directory this
-/// transaction may create: exactly one safe component directly under the
-/// configured master ROM root.
-fn is_platform_directory_candidate(parent: &Path, master_root: &Path) -> bool {
+/// Directories the organiser may create and own: one platform folder
+/// (`<root>/nes`) or the two-level Unknown folder (`<root>/Unnamed/Unknown`),
+/// every component a safe plain name.
+const MAX_OWNED_DEPTH: usize = 2;
+
+fn owned_depth(directory: &Path, master_root: &Path) -> Option<usize> {
     use crate::dat::rename_apply::preflight::is_safe_basename;
-    let Some(name) = parent.file_name().map(|n| n.to_string_lossy()) else {
-        return false;
-    };
-    if !is_safe_basename(&name) {
-        return false;
+    let relative = directory.strip_prefix(master_root).ok()?;
+    let mut depth = 0;
+    for part in relative.components() {
+        match part {
+            std::path::Component::Normal(name) if is_safe_basename(&name.to_string_lossy()) => {
+                depth += 1
+            }
+            _ => return None,
+        }
     }
-    parent.parent().is_some_and(|root| root == master_root)
+    (1..=MAX_OWNED_DEPTH).contains(&depth).then_some(depth)
+}
+
+fn is_platform_directory_candidate(parent: &Path, master_root: &Path) -> bool {
+    owned_depth(parent, master_root).is_some()
 }
 
 /// The distinct platform directories an organisation transaction may need to
@@ -323,9 +391,19 @@ fn planned_platform_directories(
     for entry in &transaction.entries {
         if let Some(parent) = entry.destination_path.parent()
             && is_platform_directory_candidate(parent, master_root)
-            && !planned.contains(&parent.to_path_buf())
         {
-            planned.push(parent.to_path_buf());
+            // Parents first, so `Unnamed` exists before `Unnamed/Unknown`.
+            let mut chain: Vec<std::path::PathBuf> = parent
+                .ancestors()
+                .take_while(|dir| *dir != master_root)
+                .map(Path::to_path_buf)
+                .collect();
+            chain.reverse();
+            for dir in chain {
+                if !planned.contains(&dir) {
+                    planned.push(dir);
+                }
+            }
         }
     }
     planned
@@ -364,6 +442,7 @@ pub fn revalidate_organisation_plan(
             content_policy: plan.content_policy,
             candidates: std::slice::from_ref(&candidate),
             generation: plan.generation,
+            unknown_folder: None,
         });
         let re_entry = &re_plan.entries[0];
         if re_entry.status != super::model::OrganisationStatus::Suggested
@@ -381,7 +460,7 @@ pub fn revalidate_organisation_plan(
     Ok(())
 }
 
-fn live_resolution_for(
+pub(super) fn live_resolution_for(
     database: &crate::Database,
     source: &Path,
     generation: u64,
@@ -595,14 +674,36 @@ pub fn rollback_organisation_transaction(
         journal_dir,
         &transaction.transaction_id,
     );
+    refuse_to_separate_a_game_from_its_saves(transaction)?;
+    // Undo puts a prepared copy's link (and remembered launch choice) back
+    // with the file, exactly as apply carried it forward.
+    let prepared = crate::recovery::moves::before(
+        transaction
+            .entries
+            .iter()
+            .filter(|entry| entry.state == crate::dat::rename_apply::model::EntryState::Applied)
+            .map(|entry| {
+                (
+                    entry.destination_path.as_path(),
+                    entry.source_path.as_path(),
+                )
+            }),
+    );
     let rollback = rollback_transaction(transaction, journal_dir, cancel)?;
+    crate::recovery::moves::after(prepared, |old, new| {
+        transaction.entries.iter().any(|entry| {
+            entry.state == crate::dat::rename_apply::model::EntryState::RolledBack
+                && entry.destination_path == old
+                && entry.source_path == new
+        })
+    });
 
     let mut directories_removed = Vec::new();
     let mut directories_remaining = Vec::new();
     for directory in transaction.created_directories.iter().rev() {
         if !is_owned_platform_directory(directory, master_root) {
-            // Defensive: never remove a directory that is not exactly one safe
-            // component beneath the master root.
+            // Defensive: never remove a directory that is not one or two safe
+            // components beneath the master root.
             directories_remaining.push(directory.clone());
             continue;
         }
@@ -632,12 +733,41 @@ pub fn rollback_organisation_transaction(
     })
 }
 
-/// A directory EmuWiz may remove on rollback: exactly one safe component
-/// directly beneath the master ROM root.
+/// A game renamed with its RetroArch saves is undone as one group. The shared
+/// rollback refuses an entry whose file changed and reverses the rest, which
+/// would put the game back under its old name and leave a save (changed by
+/// playing) under the new one, so the game would no longer find it. Every
+/// renamed file is therefore checked first, with the same identity check the
+/// rollback uses, and nothing is moved unless all of them can go back.
+fn refuse_to_separate_a_game_from_its_saves(transaction: &RenameTransaction) -> Result<(), String> {
+    use crate::dat::rename_apply::identity::identity_matches;
+    use crate::dat::rename_apply::model::EntryState;
+    let has_saves = transaction.entries.iter().any(|entry| {
+        entry
+            .unknown
+            .contains_key(crate::database::organisation_paths::SAVE_KEY)
+    });
+    if !has_saves {
+        return Ok(());
+    }
+    for entry in &transaction.entries {
+        if entry.state != EntryState::Applied {
+            continue;
+        }
+        let unchanged = capture_identity(&entry.destination_path)
+            .is_ok_and(|current| identity_matches(&entry.identity, &current));
+        if !unchanged {
+            return Err(format!(
+                "{} has changed since the rename (a save changes when the game is played), so Undo would separate the game from its saves. Nothing was undone: the game and its saves keep the new name together. To go back to the old name, rename the game again.",
+                entry.destination_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A directory EmuWiz may remove on rollback (only when it created it and it
+/// is empty): one or two safe components beneath the master ROM root.
 fn is_owned_platform_directory(directory: &Path, master_root: &Path) -> bool {
-    use crate::dat::rename_apply::preflight::is_safe_basename;
-    let Some(name) = directory.file_name().map(|n| n.to_string_lossy()) else {
-        return false;
-    };
-    is_safe_basename(&name) && directory.parent().is_some_and(|root| root == master_root)
+    owned_depth(directory, master_root).is_some()
 }

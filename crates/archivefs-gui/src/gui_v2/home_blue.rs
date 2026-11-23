@@ -6,10 +6,12 @@
 //! existing cover and platform pictures. Every button routes to a page that
 //! already exists; nothing here starts work the Classic Home would not.
 //!
-//! Honest gaps against the boards: EmuWiz records no play history, so there
-//! is no "Continue playing" hero or "Recently played" row. The hero shows the
-//! game opened most recently in this session (or the welcome panel), and the
-//! cover row is the existing "Recently opened" / "Newest in your library".
+//! EmuWiz records no play history of its own. "Continue playing" comes from
+//! RetroArch's own History playlist, matched to Library games by exact path
+//! (`recently_played`). The hero shows the game opened most recently in this
+//! session, else the game RetroArch played most recently (or the welcome
+//! panel); the cover rows are "Continue playing" and the existing
+//! "Recently opened" / "Newest in your library".
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -283,11 +285,17 @@ impl App {
     }
 
     fn home_welcome_panel(&mut self, ui: &mut egui::Ui, compact: bool) {
-        let recent = self
+        let opened = self
             .imagery
             .recently_opened()
             .first()
             .and_then(|id| self.library.game(*id).cloned());
+        let continue_playing = opened.is_none();
+        let recent = opened.or_else(|| {
+            self.recently_played
+                .first_game()
+                .and_then(|id| self.library.game(id).cloned())
+        });
         let mut go = None;
         blue_card(ui, if compact { 14 } else { 28 }, |ui| {
             if !self.loaded {
@@ -324,8 +332,21 @@ impl App {
                     self.picture(ui, &game, Kind::Cover, cover);
                     ui.add_space(12.0);
                     ui.vertical(|ui| {
-                        eyebrow(ui, "Recently opened");
+                        eyebrow(
+                            ui,
+                            if continue_playing {
+                                "Continue playing"
+                            } else {
+                                "Recently opened"
+                            },
+                        );
                         ui.label(RichText::new(&game.platform).color(palette::SECONDARY_TEXT));
+                        if continue_playing {
+                            ui.label(
+                                RichText::new("Played most recently in RetroArch")
+                                    .color(palette::SECONDARY_TEXT),
+                            );
+                        }
                         super::title_fit::title_label(
                             ui,
                             &game.title,
@@ -415,6 +436,7 @@ impl App {
 
     fn home_collection(&mut self, ui: &mut egui::Ui) {
         if self.loaded && !self.library.games.is_empty() {
+            self.home_recently_played(ui);
             self.home_showcase(ui);
             self.home_systems(ui);
         }

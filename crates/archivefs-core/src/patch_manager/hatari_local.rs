@@ -917,7 +917,7 @@ fn representation(path: &Path) -> HatariFloppyRepresentation {
         _ => HatariFloppyRepresentation::Other,
     }
 }
-fn machine_model(value: &str) -> Option<HatariMachineModel> {
+pub(crate) fn machine_model(value: &str) -> Option<HatariMachineModel> {
     match value.trim().to_ascii_lowercase().as_str() {
         "0" | "st" => Some(HatariMachineModel::St),
         "1" | "ste" => Some(HatariMachineModel::Ste),

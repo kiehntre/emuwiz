@@ -190,13 +190,32 @@ fn outcome_message(outcome: &Ps2RecoveryOutcome) -> String {
     }
 }
 
-/// Worker: Core's recovery for every unfinished record. Never writes a card;
-/// refused unless PCSX2 is proven closed so the card is judged at rest.
+/// What one recovery pass reported, and whether any of it needs a person:
+/// a record that could not be resolved (NeedsAttention), could not be
+/// checked, or could not be listed. Such a pass is not a finished job.
+pub(in super::super) struct RecoveryRun {
+    pub(in super::super) messages: Vec<String>,
+    pub(in super::super) attention: bool,
+}
+
+/// Test helper: [`recover_run`]'s messages only.
+#[cfg(test)]
 pub(in super::super) fn recover(
     journal_dir: &Path,
     observer: &dyn QuiescenceProvider,
     now_unix_seconds: u64,
 ) -> Result<Vec<String>, String> {
+    recover_run(journal_dir, observer, now_unix_seconds).map(|run| run.messages)
+}
+
+/// Worker: Core's recovery for every unfinished record. Never writes a card;
+/// refused unless PCSX2 is proven closed so the card is judged at rest.
+/// Also says whether anything needs attention.
+pub(in super::super) fn recover_run(
+    journal_dir: &Path,
+    observer: &dyn QuiescenceProvider,
+    now_unix_seconds: u64,
+) -> Result<RecoveryRun, String> {
     let binding = archivefs_core::memory_card_inventory::restore_guard::ps2_card_binding(
         journal_dir,
         "restore recovery",
@@ -214,6 +233,10 @@ pub(in super::super) fn recover(
         }
     }
     let run = recover_all_interrupted_ps2_restores(journal_dir, now_unix_seconds);
+    let attention = !run.problems.is_empty()
+        || run.outcomes.iter().any(|(_, outcome)| {
+            matches!(outcome, Err(_) | Ok(Ps2RecoveryOutcome::NeedsAttention(_)))
+        });
     let mut messages: Vec<String> = run
         .outcomes
         .iter()
@@ -234,7 +257,10 @@ pub(in super::super) fn recover(
     if !run.problems.is_empty() {
         messages.push("Some restore records could not be listed, so this check may be incomplete. Nothing was removed.".into());
     }
-    Ok(messages)
+    Ok(RecoveryRun {
+        messages,
+        attention,
+    })
 }
 
 /// What a person sees before marking a record reviewed. `allowed` explains

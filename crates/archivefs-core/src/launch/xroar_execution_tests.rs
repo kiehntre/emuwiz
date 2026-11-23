@@ -154,9 +154,14 @@ fn matching_stat_cannot_hide_changed_cassette_bytes() {
     let original = fs::metadata(&f.tape).unwrap().modified().unwrap();
     fs::write(&f.tape, vec![b'X'; TAPE.len()]).unwrap();
     File::open(&f.tape).unwrap().set_modified(original).unwrap();
+    // Device, inode, size and mtime match by construction (ctime moves
+    // whenever the kernel's timestamp tick did); either check refuses.
+    let four = |i: crate::launch::process_spawn::CapturedFileIdentity| {
+        (i.device, i.inode, i.size, i.modified)
+    };
     assert_eq!(
-        capture_file_identity(&f.tape).unwrap().1,
-        f.request.expected_content_identity
+        four(capture_file_identity(&f.tape).unwrap().1),
+        four(f.request.expected_content_identity)
     );
     assert!(preflight_xroar_launch(&f.request, &f.roots, &f.identity).is_err());
 }

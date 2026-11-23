@@ -61,13 +61,20 @@ fn unsupported_hardware_and_media_names_do_not_become_folder_aliases() {
         "vc-4000",
         "daphne",
         "beena",
-        "sega-pico",
-        "pico",
         "ipf",
         "roms",
         "preservation",
     ] {
         assert!(platform_for_folder_name(name).is_none(), "{name}");
+    }
+    // Sega Pico became a registry system on 2026-11-10 (owner approval;
+    // PicoDrive route). Its folders name it, never Mega Drive.
+    for name in ["sega-pico", "pico", "kids-pico"] {
+        assert_eq!(
+            platform_for_folder_name(name).map(|p| p.id),
+            Some("Sega Pico"),
+            "{name}"
+        );
     }
     assert!(
         detect_platform_with_details("/synthetic/preservation/ipf/Game.ipf", "/synthetic")
@@ -211,7 +218,11 @@ fn audit_database_copy_read_only() {
     let owned = tempfile::tempdir().unwrap();
     let validation_path = owned.path().join("validation.sqlite3");
     connection
-        .backup(rusqlite::MAIN_DB, &validation_path, None)
+        .backup(
+            rusqlite::MAIN_DB,
+            &validation_path,
+            None::<fn(rusqlite::backup::Progress)>,
+        )
         .unwrap();
     let mut validation = Database::open_or_create(&validation_path).unwrap();
     let evidence =

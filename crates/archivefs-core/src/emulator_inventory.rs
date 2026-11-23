@@ -319,9 +319,16 @@ fn probe_version(path: &Path, emulator: InventoryEmulator) -> Option<String> {
     // Flycast has no version CLI; its cheat installer uses pinned artifact hashes.
     // PCSX2-Qt rejects `--version` with a modal "Unknown parameter" dialog and
     // keeps running, so it is never executed to read a version.
+    // xemu is a full emulator start-up, not a version query: on this machine
+    // `~/.local/bin/xemu` wraps `flatpak run app.xemu.xemu`, and merely
+    // starting EmuWiz rewrote the production `xemu.toml`. It is recognised by
+    // name and never executed for discovery.
     if matches!(
         emulator,
-        InventoryEmulator::ShadPs4 | InventoryEmulator::Flycast | InventoryEmulator::Pcsx2
+        InventoryEmulator::ShadPs4
+            | InventoryEmulator::Flycast
+            | InventoryEmulator::Pcsx2
+            | InventoryEmulator::Xemu
     ) {
         return None;
     }
@@ -661,13 +668,46 @@ mod tests {
     fn other_emulators_are_still_probed_for_a_version() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("xemu");
-        fs::write(&p, "#!/bin/sh\necho 'xemu_version: 0.8.136'\n").unwrap();
+        let p = dir.path().join("dolphin-emu");
+        fs::write(&p, "#!/bin/sh\necho 'Dolphin 2509'\n").unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
-            probe_version_output(&p, InventoryEmulator::Xemu)
-                .is_some_and(|out| out.contains("0.8.136"))
+            probe_version_output(&p, InventoryEmulator::Dolphin)
+                .is_some_and(|out| out.contains("2509"))
         );
+    }
+
+    /// Starting xemu (even as `xemu --version`) rewrites its production
+    /// `xemu.toml`, so discovery must recognise it without executing it.
+    #[test]
+    fn xemu_is_discovered_but_never_executed_to_read_a_version() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("xemu-was-executed");
+        let launcher = dir.path().join("xemu");
+        fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\ntouch '{}'\necho 'xemu_version: 9.9.9'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+        let found = discover_in_path_entries(vec![dir.path().into()], true);
+        let xemu: Vec<_> = found
+            .installations
+            .iter()
+            .filter(|i| i.emulator == InventoryEmulator::Xemu)
+            .collect();
+        assert_eq!(xemu.len(), 1, "xemu must still be reported as installed");
+        assert_eq!(xemu[0].version, None);
+        assert!(!marker.exists(), "xemu must not be executed for discovery");
+        assert_eq!(
+            probe_version_output(&launcher, InventoryEmulator::Xemu),
+            None
+        );
+        assert!(!marker.exists());
     }
     #[test]
     fn real_smoke_is_bounded_and_read_only() {

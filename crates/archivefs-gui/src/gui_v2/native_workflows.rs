@@ -25,6 +25,7 @@ mod native_texture_packs;
 
 #[path = "game_firmware_guidance.rs"]
 mod game_firmware_guidance;
+mod launch_input_memo;
 
 #[path = "dat_name_review.rs"]
 mod dat_name_review;
@@ -54,6 +55,11 @@ pub(super) struct NativeWorkflows {
     pub(super) app: ArchiveFsApp,
     /// Set by the readiness card's Hasheous shortcut; Game Details takes it.
     lookup_online_requested: bool,
+    /// "Rename also updates RomM's title", read when the RomM card is first
+    /// drawn and after each change (and why saving it failed, if it did).
+    romm_title_setting: Option<bool>,
+    romm_title_setting_error: Option<String>,
+    romm_title_token_draft: Option<String>,
     native_romm: native_romm::State,
     selected: Option<PathBuf>,
     catalogue_identity_report: Option<archivefs_core::game_identity::GameIdentityReport>,
@@ -64,9 +70,37 @@ pub(super) struct NativeWorkflows {
     launch_game_at_start: Option<i64>,
     launch_was_active: bool,
     launch_kind: Option<LaunchKind>,
+    /// Records each launch in the save-continuity session journal (records
+    /// only; never touches a save).
+    session_tracking: super::session_tracking::SessionTracking,
+    /// The process log's next sequence number, as last noted while no
+    /// launch was active.
+    launch_sequence_mark: u64,
     launch_attempts: launch_readiness_summary::AttemptTracker,
+    /// The summary the Game Details readiness card last displayed, keyed by
+    /// game and path; read-only input for the Game Doctor.
+    shown_readiness: Option<(i64, PathBuf, launch_readiness_summary::GameReadinessSummary)>,
+    /// Set when Play was pressed before the launch plan could be built; the
+    /// Launch page then starts the game itself the moment the plan is ready.
+    /// The pass number is the last egui pass this game's Launch page was
+    /// drawn in: see [`pending_play_is_live`].
+    pending_play: Option<(i64, u64)>,
+    /// Scan history read straight from the library database on a background
+    /// thread, so Sources shows real history while the full library snapshot
+    /// is still loading.
+    saved_source_history: SavedSourceHistory,
     /// The last "can a launch request be built" answer, for the game shown.
     route_truth: std::cell::RefCell<launch_readiness_summary::route_truth::RouteCache>,
+    /// The launch input the pages are drawing. Never read by Play or any
+    /// other action; see [`launch_input_memo`].
+    launch_input_memo: launch_input_memo::LaunchInputMemo,
+    /// The interface's context: where background readiness workers count
+    /// the answers they hand back, and what a drawn input asks for its next
+    /// frame.
+    context: egui::Context,
+    /// The scan-result part of the emulator-environment signature, shared by
+    /// the drawing memo and the Library's background readiness checks.
+    environment_heavy: std::cell::RefCell<super::bg_readiness::HeavySignatureCache>,
     source_job: Option<u64>,
     cheat_catalogues: native_cheat_catalogues::State,
     provider_job: Option<u64>,
@@ -186,6 +220,21 @@ fn source_availability_detail(source: &SourceFolderView) -> String {
     }
 }
 
+/// Shown instead of "Not scanned yet" when the saved scan history is simply
+/// not loaded (the library snapshot is still loading or unavailable), so a
+/// source with years of scan history never reads as never scanned.
+const SCAN_HISTORY_NOT_LOADED: &str = "Saved scan history not loaded yet";
+
+/// The history is known when the library snapshot loaded (a configured source
+/// with no row then truly has never been scanned) or when the record itself
+/// carries history. Only a bare configured path with no snapshot is unknown.
+fn scan_history_loaded(source: &SourceFolderView, catalogue_available: bool) -> bool {
+    catalogue_available
+        || source.id.is_some()
+        || source.last_scan_status.is_some()
+        || source.last_scan_at.is_some()
+}
+
 fn source_scan_label(status: Option<SourceScanStatus>) -> &'static str {
     match status {
         None => "Not scanned yet",
@@ -256,13 +305,48 @@ pub(super) fn offers_review_identity(input: &launch_readiness_page::LaunchReadin
         input,
         launch_readiness_page::LaunchReadinessInput::IdentityUnknown(
             launch_readiness_page::IdentityUnknownReason::SystemNotChosen
-                | launch_readiness_page::IdentityUnknownReason::NotConfirmed,
+                | launch_readiness_page::IdentityUnknownReason::NotConfirmed
+                | launch_readiness_page::IdentityUnknownReason::FolderOnly(_)
+                | launch_readiness_page::IdentityUnknownReason::SystemUnknown
+                | launch_readiness_page::IdentityUnknownReason::MediaConflict { .. },
         ) | launch_readiness_page::LaunchReadinessInput::DiscFilesUnresolved(_)
             | launch_readiness_page::LaunchReadinessInput::IdentityConflicting
     )
 }
 
 pub(super) const REVIEW_IDENTITY: &str = "Review identity";
+pub(super) const CHANGE_SYSTEM_PERMANENTLY: &str = "Change system permanently…";
+pub(super) const TRY_ANYWAY: &str = "Try anyway (this launch only)";
+pub(super) const REMEMBER_LAUNCH_CHOICE: &str = "Remember this launch choice";
+pub(super) const FORGET_LAUNCH_CHOICE: &str = "Forget this launch choice";
+
+/// Shown before a try of an archive EmuWiz cannot unpack as one cartridge.
+pub(super) const ARCHIVE_TRY_NOTE: &str = "This archive is not a single cartridge EmuWiz can unpack, and EmuWiz cannot open other archives for launch from here yet. A try is likely to stop at \"No runnable game file\"; extracting the game first works today. The file itself is not the problem.";
+
+/// Saves (`Some`) or forgets (`None`) the person's remembered launch system
+/// for `path` as it is now. Never touches the library or identity.
+fn save_remembered_launch_choice(path: &Path, system: Option<&'static str>) -> Result<(), String> {
+    use archivefs_core::launch::remembered_launch_system as remembered;
+    let store = remembered::default_remembered_launch_systems_path()?;
+    match system {
+        Some(system) => {
+            if !crate::emulator_setup::unverified_media::remembering_allowed(path, system) {
+                return Err(format!(
+                    "This launch choice cannot be remembered: the folder suggests another system, so {} can only be tried once for this file.",
+                    archivefs_core::platform::display_name_for(system)
+                ));
+            }
+            let entry = remembered::RememberedLaunchSystem::for_current_file(path, system)
+                .ok_or_else(|| {
+                    "This launch choice cannot be remembered: the game file could not be read."
+                        .to_string()
+                })?;
+            remembered::remember_launch_system_at(&store, &entry)
+        }
+        None => remembered::forget_launch_system_at(&store, path),
+    }
+    .map_err(|error| format!("The launch choice was not saved: {error}"))
+}
 
 /// The Launch page's identity button and the sentence above it, per reason.
 /// Unsupported archives have no identity screen to go to, so they offer only
@@ -275,6 +359,14 @@ pub(super) fn identity_next_step(
         Input::IdentityUnknown(Reason::SystemNotChosen) => (
             "Choose system",
             "Next step: Choose system sets the system for this game after you review its confirmation. Without a system EmuWiz cannot pick an emulator.",
+        ),
+        Input::IdentityUnknown(Reason::FolderOnly(_) | Reason::SystemUnknown) => (
+            CHANGE_SYSTEM_PERMANENTLY,
+            "Or change the system permanently: Review identity saves your choice for this game. It then outranks later automatic detection until you choose \"Use the detected system again\".",
+        ),
+        Input::IdentityUnknown(Reason::MediaConflict { .. }) => (
+            REVIEW_IDENTITY,
+            "Next step: the file's own header names another system. Review identity lets you change the system to match the file.",
         ),
         Input::IdentityUnknown(Reason::NotConfirmed) => (
             "Verify identity",
@@ -330,6 +422,9 @@ pub(super) struct SavedFileFacts {
     /// Game Details' unconfirmed DAT identity for the card's identity line
     /// (pending, not confirmed, or re-check needed); `None` otherwise.
     pub dat_identity: Option<launch_readiness_summary::IdentitySummary>,
+    /// Game Details' identity wording (`detail_identity::identity_wording`),
+    /// shown on the card's identity line in place of the launch projection's.
+    pub identity_label: Option<&'static str>,
     pub file_missing: bool,
 }
 
@@ -343,11 +438,16 @@ impl NativeWorkflows {
             .platform
             .clone()
             .map(|platform| (archive.absolute_path.clone(), platform));
+        let platform_source = archive
+            .platform_source
+            .clone()
+            .map(|source| (archive.absolute_path.clone(), source));
         // A cached identity was gathered under the earlier catalogue hint.
         // A changed or withdrawn choice must revoke that authority before
         // this same path can supply a launch key again.
         if self.selected.as_deref() == Some(archive.absolute_path.as_path())
-            && self.app.catalogued_platform_hint != platform_hint
+            && (self.app.catalogued_platform_hint != platform_hint
+                || self.app.catalogued_platform_source != platform_source)
         {
             self.app.cancel_selected_evidence_work();
             self.app.selected_evidence_ui.selected_evidence_generation += 1;
@@ -358,6 +458,7 @@ impl NativeWorkflows {
             self.app.launch_standalone.clear_cue_review();
         }
         self.app.catalogued_platform_hint = platform_hint;
+        self.app.catalogued_platform_source = platform_source;
         self.app.catalogued_row_health = Some((
             archive.absolute_path.clone(),
             archive.last_known_health.clone(),
@@ -424,6 +525,9 @@ impl NativeWorkflows {
         Self {
             app,
             lookup_online_requested: false,
+            romm_title_setting: None,
+            romm_title_setting_error: None,
+            romm_title_token_draft: None,
             native_romm: native_romm::State::default(),
             selected: None,
             catalogue_identity_report: None,
@@ -434,8 +538,16 @@ impl NativeWorkflows {
             launch_game_at_start: None,
             launch_was_active: false,
             launch_kind: None,
+            session_tracking: Default::default(),
+            launch_sequence_mark: archivefs_core::launch::process_log::next_sequence(),
             launch_attempts: Default::default(),
+            shown_readiness: None,
+            pending_play: None,
+            saved_source_history: SavedSourceHistory::default(),
             route_truth: Default::default(),
+            launch_input_memo: Default::default(),
+            context: context.clone(),
+            environment_heavy: Default::default(),
             source_job: None,
             cheat_catalogues: Default::default(),
             provider_job: None,
@@ -459,6 +571,13 @@ impl NativeWorkflows {
             remote_probe_results: BTreeMap::new(),
             remote_probe_jobs: BTreeMap::new(),
         }
+    }
+
+    /// Whether a new Sources-page action may start: the native app's one-writer
+    /// rule, which includes the Blue writer flag (S06-04), so the rebind dialog
+    /// and every other caller are gated by the same answer.
+    pub(super) fn source_action_available(&self) -> bool {
+        self.app.source_action_available()
     }
 
     pub(super) fn poll(&mut self, context: &egui::Context, activity: &mut Activity) {
@@ -494,7 +613,7 @@ impl NativeWorkflows {
             context.request_repaint();
         }
         self.observe_launch_activity(activity);
-        self.observe_readiness_activity(activity);
+        self.observe_readiness_activity_now(activity);
         self.observe_source_activity(activity);
         self.observe_catalogue_activity(activity);
         self.poll_remote_source_probes(context);
@@ -520,10 +639,21 @@ impl NativeWorkflows {
 
     fn observe_launch_activity(&mut self, activity: &mut Activity) {
         let active = self.launch_active();
+        if !active && !self.launch_was_active {
+            // Noted while no launch is active: a launch can start its
+            // process before this first sees it as active, and that process
+            // must still be recognised as the launch's own.
+            self.launch_sequence_mark = archivefs_core::launch::process_log::next_sequence();
+        }
         if active && !self.launch_was_active {
             self.launch_kind = self.active_launch_kind();
             self.launch_game_at_start = self.selected_game;
             self.launch_attempts.started();
+            self.session_tracking.launch_began(
+                self.launch_sequence_mark,
+                self.launch_kind_emulator(),
+                self.launch_session_game(),
+            );
             let job = activity.queue("Launching game", self.selected_route(), false);
             activity.start(job);
             self.launch_job = Some(job);
@@ -532,6 +662,7 @@ impl NativeWorkflows {
             && let Some(job) = self.launch_job.take()
         {
             let error = self.launch_failure();
+            self.session_tracking.launch_finished(error.clone());
             self.launch_attempts
                 .finished(self.launch_game_at_start.take(), error.clone());
             activity.finish(
@@ -548,7 +679,26 @@ impl NativeWorkflows {
         self.launch_was_active = active;
     }
 
-    fn observe_readiness_activity(&mut self, activity: &mut Activity) {
+    /// Finishes the "Preparing launch" job from the input its caller is
+    /// working with, so the page that queued the job and the check that ends
+    /// it never disagree about whether the evidence has loaded.
+    /// Settles a "Preparing launch" job from an input built now, never from
+    /// the remembered one. The Launch page queues that job from a fresh
+    /// build; settling it from an older answer lets the two disagree, and
+    /// the job is then finished and queued again on every frame. Builds
+    /// nothing unless such a job exists.
+    fn observe_readiness_activity_now(&mut self, activity: &mut Activity) {
+        if self.readiness_job.is_some() {
+            let input = self.launch_input();
+            self.observe_readiness_activity(activity, &input);
+        }
+    }
+
+    fn observe_readiness_activity(
+        &mut self,
+        activity: &mut Activity,
+        input: &launch_readiness_page::LaunchReadinessInput,
+    ) {
         let Some(job) = self.readiness_job else {
             return;
         };
@@ -560,7 +710,7 @@ impl NativeWorkflows {
             );
             self.readiness_job = None;
         } else if !matches!(
-            self.launch_input(),
+            input,
             launch_readiness_page::LaunchReadinessInput::EvidenceNotLoaded
         ) {
             activity.finish(job, "Launch readiness is ready to review.".into(), None);
@@ -588,6 +738,35 @@ impl NativeWorkflows {
             );
         }
         self.select(path);
+        // A "Try anyway" belongs to one file and one launch attempt: leaving
+        // the game or starting a launch consumes it. Nothing was ever saved.
+        if self
+            .app
+            .launch_system_trial
+            .as_ref()
+            .is_some_and(|(tried, _)| tried != path)
+            || (self.launch_active() && self.app.launch_system_trial.is_some())
+        {
+            self.app.launch_system_trial = None;
+        }
+        if self
+            .app
+            .launch_remember_choice
+            .as_deref()
+            .is_some_and(|p| p != path)
+        {
+            self.app.launch_remember_choice = None;
+        }
+        if self
+            .app
+            .launch_remember_error
+            .as_ref()
+            .is_some_and(|(p, _)| p != path)
+        {
+            self.app.launch_remember_error = None;
+        }
+        let remembered_system =
+            archivefs_core::launch::remembered_launch_system::remembered_launch_system(path);
         self.app.launch_standalone.focus_dosbox_game(Some(path));
         self.app.emulator_readiness.flycast_gdi.show(ui, Some(path));
         self.app.emulator_readiness.vice.show(ui, Some(path));
@@ -606,6 +785,61 @@ impl NativeWorkflows {
         self.start_launch_readiness(ui.ctx());
 
         let input = self.launch_input();
+        // A folder guess or no system at all: the person picks the system for
+        // one try (or remembers it); see `unverified_media`.
+        let folder_only = matches!(
+            input,
+            launch_readiness_page::LaunchReadinessInput::IdentityUnknown(
+                launch_readiness_page::IdentityUnknownReason::FolderOnly(_)
+                    | launch_readiness_page::IdentityUnknownReason::SystemUnknown
+            )
+        );
+        let trial_systems = if folder_only {
+            let recorded = self
+                .app
+                .catalogued_platform_hint
+                .as_ref()
+                .filter(|(hinted, _)| hinted == path)
+                .map(|(_, platform)| platform.as_str());
+            let environment = match &self.app.emulator_readiness.retroarch_profiles {
+                RetroArchProfilesState::Ready(discovery) => Some(&discovery.environment),
+                _ => None,
+            };
+            let has_route = |system: &str| {
+                environment.is_some_and(|environment| {
+                    archivefs_core::launch::planning::retroarch_core_installed_for(
+                        system,
+                        environment,
+                    )
+                })
+            };
+            // A disc started from its verified prepared copy is offered for
+            // the one system it was prepared for, never for every system
+            // that reads cue sheets.
+            match crate::emulator_setup::prepared_media::for_game(path, recorded) {
+                Some(copy) => crate::emulator_setup::unverified_media::trial_systems(
+                    &copy.launch_path,
+                    recorded,
+                    &has_route,
+                )
+                .into_iter()
+                .filter(|system| *system == copy.platform_id)
+                .collect(),
+                None => crate::emulator_setup::unverified_media::trial_systems(
+                    path, recorded, &has_route,
+                ),
+            }
+        } else {
+            Vec::new()
+        };
+        let active_trial = self
+            .app
+            .launch_system_trial
+            .as_ref()
+            .filter(|(tried, _)| tried == path)
+            .map(|(_, system)| *system);
+        let mut trial_pick: Option<Option<&'static str>> = None;
+        let mut remember_pick: Option<Option<&'static str>> = None;
         let readiness_error = self.readiness_error();
         if readiness_error.is_none()
             && matches!(
@@ -625,7 +859,23 @@ impl NativeWorkflows {
             activity.start(job);
             self.readiness_job = Some(job);
         }
-        self.observe_readiness_activity(activity);
+        self.observe_readiness_activity(activity, &input);
+        // A Play pressed while the plan was still loading waits, however long
+        // the checks take, only while this game's Launch page stays on screen;
+        // it can never fire on a later visit or for another game.
+        let pass = ui.ctx().cumulative_pass_nr();
+        if pending_play_is_live(self.pending_play, game_id, pass) {
+            match self.try_play(game_id) {
+                PlayOutcome::Started | PlayOutcome::Blocked => self.pending_play = None,
+                PlayOutcome::Waiting => {
+                    self.pending_play = Some((game_id, pass));
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(100));
+                }
+            }
+        } else {
+            self.pending_play = None;
+        }
 
         let (recovery_route, retry_readiness) = launch_scroll(ui, game_id, |ui| {
             ui.label("Choose an emulator, review its readiness, then launch. EmuWiz will refuse unsafe or incomplete media.");
@@ -679,12 +929,142 @@ impl NativeWorkflows {
             if launch_active {
                 ui.label("A launch is already in progress. Wait for it to finish before starting another.");
             }
+            // The controls note follows the emulator the page has selected
+            // (an explicit choice first, then the reviewed PicoDrive card).
+            if let launch_readiness_page::LaunchReadinessInput::Plan { plan, .. } = &input
+                && let Some(note) =
+                    crate::emulator_setup::unverified_media::sega_pico_controls_note(plan)
+            {
+                ui.label(note);
+            }
             // Unverified identity is not a dead end: the one place a game's
             // identity is explained and finished is Review identity.
             if is_unsupported_archive(&input) {
                 ui.label(
                     "Next step: this archive format is not supported for launch identity. Extract the game or use a supported format, then press Retry readiness check.",
                 );
+            }
+            if folder_only && !trial_systems.is_empty() {
+                ui.label(format!(
+                    "{TRY_ANYWAY}: EmuWiz will not start this game on a folder guess alone. Pick a system to try it once; you will see a warning, nothing is saved, and later scans are unaffected."
+                ));
+                // A ZIP or 7z that is not one cartridge EmuWiz unpacks cannot
+                // be opened for launch from here yet (archive mounting is the
+                // separate ArchiveFS follow-up): say so before the try, so a
+                // try that stops at "No runnable game file" is not a surprise.
+                let archive = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("zip") || e.eq_ignore_ascii_case("7z"));
+                if archive
+                    && !trial_systems.iter().any(|system| {
+                        archivefs_core::zip_cartridge_stage::zip_cartridge_member_fits(path, system)
+                            == Some(true)
+                    })
+                {
+                    ui.label(ARCHIVE_TRY_NOTE);
+                }
+                if trial_systems.len() > 1 {
+                    ui.label(format!(
+                        "EmuWiz cannot tell which system this file is for: {} systems with an installed emulator use this format and nothing in the file rules them out. A try may not start correctly.",
+                        trial_systems.len()
+                    ));
+                }
+                let folder_hint = crate::emulator_setup::unverified_media::folder_hint(path);
+                if let Some(hint) = folder_hint {
+                    let header_agrees =
+                        archivefs_core::launch::unverified_media::media_system_evidence_cached(
+                            path, hint,
+                        ) == archivefs_core::launch::unverified_media::MediaSystemEvidence::Agrees;
+                    if trial_systems.contains(&hint) && header_agrees {
+                        ui.label(format!(
+                            "The file's own header says this is a {hint} game, and the folder name agrees. EmuWiz has no system recorded for it yet, so try it as {hint}; only {hint} can be remembered for this file."
+                        ));
+                    } else if trial_systems.contains(&hint) {
+                        ui.label(format!(
+                            "The folder name suggests {hint} (a hint only, not identification). Nothing in the file confirms it; try it as {hint} first. Another system may not run it, and only {hint} can be remembered for this file."
+                        ));
+                    } else {
+                        ui.label(format!(
+                            "The folder name suggests {hint} (a hint only, not identification). No installed emulator starts {hint} games, and the systems below may not run them. A try is one launch only; it cannot be remembered for this file."
+                        ));
+                    }
+                    if self
+                        .app
+                        .launch_remember_choice
+                        .as_deref()
+                        .is_some_and(|_| !trial_systems.contains(&hint))
+                    {
+                        self.app.launch_remember_choice = None;
+                    }
+                }
+                let mut remember = self.app.launch_remember_choice.as_deref() == Some(path);
+                if folder_hint.is_none_or(|hint| trial_systems.contains(&hint))
+                    && ui
+                    .checkbox(&mut remember, REMEMBER_LAUNCH_CHOICE)
+                    .on_hover_text("Saves the system you press next for this file only, so you are not asked again. It applies only while the file is unchanged, is not game identification, never changes the library's recorded system, and anything the file itself shows still wins. Launch safety checks still apply. You can forget it here later.")
+                    .changed()
+                {
+                    self.app.launch_remember_choice = remember.then(|| path.to_path_buf());
+                }
+                ui.horizontal_wrapped(|ui| {
+                    for system in &trial_systems {
+                        // With remembering ticked, only systems that may be
+                        // remembered for this file are offered.
+                        if remember
+                            && !crate::emulator_setup::unverified_media::remembering_allowed(
+                                path, system,
+                            )
+                        {
+                            continue;
+                        }
+                        let name = archivefs_core::platform::display_name_for(system);
+                        let (label, hover) = if remember {
+                            (
+                                format!("Remember as {name}"),
+                                "Saves this launch choice for this unchanged file. Your library, the game's recorded system and catalogue evidence do not change. Launch safety checks still apply.",
+                            )
+                        } else {
+                            (
+                                format!("Try once as {name}"),
+                                "One launch attempt only. Your library, the game's recorded system and catalogue evidence do not change. Launch safety checks still apply.",
+                            )
+                        };
+                        if ui.button(label).on_hover_text(hover).clicked() {
+                            if remember {
+                                remember_pick = Some(Some(*system));
+                            } else {
+                                trial_pick = Some(Some(*system));
+                            }
+                        }
+                    }
+                });
+            }
+            if let Some(system) = remembered_system {
+                ui.label(format!(
+                    "Remembered launch choice: this file starts as {} while it is unchanged. This is your choice, not game identification.",
+                    archivefs_core::platform::display_name_for(system)
+                ));
+                if ui.button(FORGET_LAUNCH_CHOICE).clicked() {
+                    remember_pick = Some(None);
+                }
+            }
+            if let Some((_, error)) = self
+                .app
+                .launch_remember_error
+                .as_ref()
+                .filter(|(p, _)| p == path)
+            {
+                ui.colored_label(ui.visuals().error_fg_color, error.as_str());
+            }
+            if let Some(system) = active_trial {
+                ui.label(format!(
+                    "One-time try as {} is set for this game. It is used for the next launch only and is never saved.",
+                    archivefs_core::platform::display_name_for(system)
+                ));
+                if ui.button("Cancel this try").clicked() {
+                    trial_pick = Some(None);
+                }
             }
             let review_identity = offers_review_identity(&input) && {
                 let (button, note) = identity_next_step(&input);
@@ -700,6 +1080,16 @@ impl NativeWorkflows {
                 retry_readiness,
             )
         });
+        if let Some(pick) = trial_pick {
+            self.app.launch_system_trial = pick.map(|system| (path.to_path_buf(), system));
+            self.recheck_readiness_in_place(ui.ctx());
+        }
+        if let Some(pick) = remember_pick {
+            let result = save_remembered_launch_choice(path, pick);
+            self.app.launch_remember_error = result.err().map(|error| (path.to_path_buf(), error));
+            self.app.launch_remember_choice = None;
+            self.recheck_readiness_in_place(ui.ctx());
+        }
         if retry_readiness {
             self.recheck_readiness_in_place(ui.ctx());
         }
@@ -762,7 +1152,16 @@ impl NativeWorkflows {
         if saved.file_missing {
             launch_readiness_summary::note_file_missing(&mut summary);
         }
-        let action = launch_readiness_summary::show(ui, &summary);
+        let action = launch_readiness_summary::show(ui, &summary, saved.identity_label);
+        let unchanged = self
+            .shown_readiness
+            .as_ref()
+            .is_some_and(|(id, shown, last)| *id == game_id && shown == path && *last == summary);
+        if !unchanged {
+            // The Game Doctor may already have drawn this frame from the old answer.
+            ui.ctx().request_repaint();
+            self.shown_readiness = Some((game_id, path.to_path_buf(), summary));
+        }
         launch_readiness_page::show_dolphin_profile_guidance(ui, &input);
         self.show_game_firmware_guidance(ui, game_id, path, &input);
         self.readiness_action_route(ui.ctx(), action?, game_id)
@@ -880,7 +1279,7 @@ impl NativeWorkflows {
     /// project the current launch input. Owns no readiness facts. `checksum`
     /// also starts the deferred whole-file checksum pass.
     #[allow(clippy::too_many_arguments)]
-    fn readiness_projection(
+    pub(super) fn readiness_projection(
         &mut self,
         context: &egui::Context,
         game_id: i64,
@@ -891,23 +1290,27 @@ impl NativeWorkflows {
         activity: &mut Activity,
     ) -> (
         launch_readiness_summary::GameReadinessSummary,
-        launch_readiness_page::LaunchReadinessInput,
+        std::rc::Rc<launch_readiness_page::LaunchReadinessInput>,
     ) {
         self.selected_game = Some(game_id);
         self.catalogue_identity_report = catalogue_identity_report.cloned();
         self.select(path);
         self.start_launch_readiness_with(context, checksum);
-        let input = self.launch_input();
-        let freshness = if self.readiness_error().is_some() {
+        let input = self.shown_launch_input().input;
+        let error = self.readiness_error();
+        let freshness = if error.is_some() {
             ReadinessFreshness::Stale
         } else {
             ReadinessFreshness::Current
         };
-        self.observe_readiness_activity(activity);
+        self.observe_readiness_activity_now(activity);
         let mut summary = launch_readiness_summary::project(&input, freshness);
+        if let Some(error) = &error {
+            launch_readiness_summary::describe_check_error(&mut summary, error);
+        }
         if let launch_readiness_page::LaunchReadinessInput::Plan {
             plan, retroarch, ..
-        } = &input
+        } = &*input
             && let Some(candidate) = launch_readiness_summary::selected_candidate(plan)
             && matches!(
                 candidate.target,
@@ -922,6 +1325,12 @@ impl NativeWorkflows {
             launch_readiness_summary::note_retroarch_installation_refusal(&mut summary, &refusal);
         }
         self.note_launch_route(&mut summary, game_id, path, &input, Some(context));
+        launch_readiness_summary::note_flatpak_graphics(
+            &mut summary,
+            &input,
+            &launch_readiness_summary::host_flatpak_graphics(),
+        );
+        launch_readiness_summary::note_known_unplayable(&mut summary, path);
         if catalogue_verified {
             launch_readiness_summary::note_catalogue_verified(&mut summary);
         }
@@ -942,7 +1351,47 @@ impl NativeWorkflows {
         if action == ReadinessAction::LookUpOnline {
             self.lookup_online_requested = true;
         }
+        if action == ReadinessAction::Play {
+            // Play launches. The Launch page is only the fallback for a plan
+            // that is still loading, needs an emulator choice, or is blocked.
+            self.pending_play = Some((game_id, context.cumulative_pass_nr()));
+            if self.try_play(game_id) == PlayOutcome::Started {
+                self.pending_play = None;
+                return None;
+            }
+        }
         route_for_action(action, game_id)
+    }
+
+    /// Starts the game through the planner's single safe request, exactly as
+    /// Gamer View's Play does. Never picks between equally valid emulators.
+    pub(super) fn try_play(&mut self, game_id: i64) -> PlayOutcome {
+        use launch_readiness_page::GamerPlayAction;
+        if self.selected_game != Some(game_id) {
+            return PlayOutcome::Waiting;
+        }
+        if self.launch_active() {
+            // Never swallow Play: the Launch page says a launch is running.
+            return PlayOutcome::Blocked;
+        }
+        match launch_readiness_page::gamer_play_action(&self.launch_input()) {
+            GamerPlayAction::Launch(request) => {
+                request.start(
+                    &mut self.app.launch_retroarch,
+                    &mut self.app.launch_dolphin,
+                    &mut self.app.launch_pcsx2,
+                    &mut self.app.launch_standalone,
+                    &mut self.app.launch_amiga_whdload,
+                );
+                // A one-time "Try anyway" is consumed by this attempt.
+                self.app.launch_system_trial = None;
+                PlayOutcome::Started
+            }
+            GamerPlayAction::BlockedTyped(blocker) if still_checking(blocker.kind) => {
+                PlayOutcome::Waiting
+            }
+            GamerPlayAction::BlockedTyped(_) => PlayOutcome::Blocked,
+        }
     }
 
     /// True once after the card's "Check Hasheous…" shortcut was pressed.
@@ -952,9 +1401,40 @@ impl NativeWorkflows {
 
     /// Reuse the same current plan and candidate policy as Launch. Never
     /// substitute an inventory installation or select a different candidate.
+    /// The game a Play is waiting on the Launch page for, if any.
+    pub(super) fn play_pending(&self) -> Option<i64> {
+        self.pending_play.map(|(game, _)| game)
+    }
+
     #[cfg(test)]
     pub(super) fn launch_was_requested(&self, game_id: i64) -> bool {
         self.launch_active() || self.launch_attempts.for_game(game_id).is_some()
+    }
+
+    /// The game the readiness checks currently belong to, if any.
+    pub(super) fn selected_game_on_screen(&self) -> Option<(i64, PathBuf)> {
+        Some((self.selected_game?, self.selected.clone()?))
+    }
+
+    /// Exactly what the readiness card last displayed for this game and path.
+    pub(super) fn shown_readiness(
+        &self,
+        game_id: i64,
+        path: &Path,
+    ) -> Option<&launch_readiness_summary::GameReadinessSummary> {
+        self.shown_readiness
+            .as_ref()
+            .filter(|(id, shown, _)| *id == game_id && shown == path)
+            .map(|(_, _, summary)| summary)
+    }
+
+    /// `summary` as the Library's compact card would show it for the game on
+    /// screen (an identity answer still waiting on its checksum is partial).
+    pub(super) fn compact_of(
+        &self,
+        summary: &launch_readiness_summary::GameReadinessSummary,
+    ) -> launch_readiness_summary::CompactReadiness {
+        launch_readiness_summary::compact(summary, self.selected_checksum_pending())
     }
 
     /// The current readiness answer for the game on screen, for reading only.
@@ -966,14 +1446,24 @@ impl NativeWorkflows {
         if self.selected_game != Some(game_id) || self.selected.as_deref() != Some(path) {
             return None;
         }
-        let freshness = if self.readiness_error().is_some() {
+        let error = self.readiness_error();
+        let freshness = if error.is_some() {
             ReadinessFreshness::Stale
         } else {
             ReadinessFreshness::Current
         };
-        let input = self.launch_input();
+        let input = self.shown_launch_input().input;
         let mut summary = launch_readiness_summary::project(&input, freshness);
+        if let Some(error) = &error {
+            launch_readiness_summary::describe_check_error(&mut summary, error);
+        }
         self.note_launch_route(&mut summary, game_id, path, &input, None);
+        launch_readiness_summary::note_flatpak_graphics(
+            &mut summary,
+            &input,
+            &launch_readiness_summary::host_flatpak_graphics(),
+        );
+        launch_readiness_summary::note_known_unplayable(&mut summary, path);
         Some(summary)
     }
 
@@ -1015,13 +1505,14 @@ impl NativeWorkflows {
         {
             return None;
         }
+        let input = self.shown_launch_input().input;
         let launch_readiness_page::LaunchReadinessInput::Plan {
             plan, duckstation, ..
-        } = self.launch_input()
+        } = &*input
         else {
             return None;
         };
-        let candidate = launch_readiness_summary::selected_candidate(&plan)?;
+        let candidate = launch_readiness_summary::selected_candidate(plan)?;
         let game = self
             .catalogue_identity_report
             .as_ref()
@@ -1117,13 +1608,14 @@ impl NativeWorkflows {
         )?
         .with_disc_members(&snapshot.disc_members);
         let set = context.sets.first()?;
-        let decision = match self.launch_input() {
+        let input = self.shown_launch_input().input;
+        let decision = match &*input {
             launch_readiness_page::LaunchReadinessInput::Plan {
                 plan,
                 retroarch,
                 duckstation,
                 ..
-            } => launch_readiness_summary::selected_candidate(&plan).map(|candidate| {
+            } => launch_readiness_summary::selected_candidate(plan).map(|candidate| {
                 launch_readiness_page::multidisc_decision_with(
                     candidate,
                     retroarch.as_ref(),
@@ -1445,6 +1937,49 @@ impl NativeWorkflows {
         self.collection.take_route()
     }
 
+    /// While the full library snapshot is missing, loads just the sources'
+    /// scan history in the background; once the snapshot is back it is used
+    /// instead and the cache is dropped so the next gap reloads fresh data.
+    fn poll_saved_source_history(&mut self, context: &egui::Context, snapshot_missing: bool) {
+        // The snapshot supplies the history whenever it is present. The cached
+        // copy is kept (not dropped) across short gaps so a flickering snapshot
+        // never spawns a thread per gap, and is refreshed once it is stale.
+        if !snapshot_missing {
+            return;
+        }
+        if let SavedSourceHistory::Loaded(_, loaded_at) = &self.saved_source_history
+            && loaded_at.elapsed() > std::time::Duration::from_secs(60)
+        {
+            self.saved_source_history = SavedSourceHistory::NotStarted;
+        }
+        match &self.saved_source_history {
+            SavedSourceHistory::NotStarted => {
+                let (sender, receiver) = mpsc::channel();
+                let repaint = context.clone();
+                std::thread::spawn(move || {
+                    let _ = sender.send(load_saved_source_views());
+                    repaint.request_repaint();
+                });
+                self.saved_source_history = SavedSourceHistory::Loading(receiver);
+            }
+            SavedSourceHistory::Loading(receiver) => match receiver.try_recv() {
+                Ok(Some(saved)) => {
+                    self.saved_source_history =
+                        SavedSourceHistory::Loaded(saved, std::time::Instant::now());
+                }
+                Ok(None) | Err(TryRecvError::Disconnected) => {
+                    self.saved_source_history = SavedSourceHistory::Unavailable;
+                }
+                // The thread also repaints when it finishes; this is the safety
+                // net if that repaint lands before the next frame polls.
+                Err(TryRecvError::Empty) => {
+                    context.request_repaint_after(std::time::Duration::from_millis(250));
+                }
+            },
+            SavedSourceHistory::Loaded(..) | SavedSourceHistory::Unavailable => {}
+        }
+    }
+
     fn show_native_sources(
         &mut self,
         ui: &mut egui::Ui,
@@ -1457,10 +1992,14 @@ impl NativeWorkflows {
             .ok()
             .unwrap_or_default()
             .to_vec();
+        let snapshot_missing = self.app.database_state.snapshot().is_none();
+        self.poll_saved_source_history(ui.ctx(), snapshot_missing);
         let snapshot = self.app.database_state.snapshot();
         let source_state = crate::source_state::merge_configured_sources(
             &configured,
-            snapshot.map(|snapshot| snapshot.source_views.as_slice()),
+            snapshot
+                .map(|snapshot| snapshot.source_views.as_slice())
+                .or_else(|| self.saved_source_history.views()),
         );
         let archives = snapshot
             .map(|snapshot| snapshot.archives.clone())
@@ -1471,10 +2010,11 @@ impl NativeWorkflows {
             &source_state.sources,
             snapshot
                 .map(|snapshot| snapshot.source_health.as_slice())
+                .or_else(|| self.saved_source_history.health())
                 .unwrap_or(&[]),
         );
         let mut health_action = None;
-        let busy = !self.app.source_action_available() || self.collection.preparing();
+        let busy = !self.source_action_available() || self.collection.preparing();
         let mut action = None;
 
         self.poll_remote_source_probes(ui.ctx());
@@ -1613,7 +2153,14 @@ impl NativeWorkflows {
             ui.vertical(|ui| {
                 for source in &source_state.sources {
                     ui.push_id(&source.path, |ui| {
-                        self.show_native_source_card(ui, source, &archives, busy, &mut action);
+                        self.show_native_source_card(
+                            ui,
+                            source,
+                            &archives,
+                            busy,
+                            source_state.catalogue_available,
+                            &mut action,
+                        );
                     });
                 }
             });
@@ -1628,6 +2175,7 @@ impl NativeWorkflows {
         source: &SourceFolderView,
         archives: &[archivefs_core::PersistedArchive],
         busy: bool,
+        catalogue_available: bool,
         action: &mut Option<crate::SourceAction>,
     ) {
         crate::ui::components::card(ui, |ui| {
@@ -1665,17 +2213,31 @@ impl NativeWorkflows {
                     ui.label(source_availability_detail(source));
                     ui.end_row();
                     ui.weak("Last scan");
-                    ui.label(source.last_scan_at.as_deref().unwrap_or("Not scanned yet"));
+                    let history_loaded = scan_history_loaded(source, catalogue_available);
+                    ui.label(source.last_scan_at.as_deref().unwrap_or(if history_loaded {
+                        "Not scanned yet"
+                    } else {
+                        SCAN_HISTORY_NOT_LOADED
+                    }));
                     ui.end_row();
                     ui.weak("Scan status");
-                    ui.label(source_scan_label(source.last_scan_status));
+                    ui.label(if history_loaded {
+                        source_scan_label(source.last_scan_status)
+                    } else {
+                        SCAN_HISTORY_NOT_LOADED
+                    });
                     ui.end_row();
                     ui.weak("Game/media count");
-                    ui.label(
-                        source
-                            .last_archive_count
-                            .map_or_else(|| "Not available".into(), |count| count.to_string()),
-                    );
+                    ui.label(source.last_archive_count.map_or_else(
+                        || {
+                            if history_loaded {
+                                "Not available".into()
+                            } else {
+                                SCAN_HISTORY_NOT_LOADED.into()
+                            }
+                        },
+                        |count| count.to_string(),
+                    ));
                     ui.end_row();
                     ui.weak("Remote health");
                     if let Some(result) = self.remote_probe_results.get(&source.path) {
@@ -3090,7 +3652,7 @@ impl NativeWorkflows {
         );
         crate::ui::components::card(ui, |ui| {
             ui.strong("RomM");
-            ui.label("Optional metadata/artwork provider · token file required when configured · read-only towards RomM.");
+            ui.label("Optional metadata/artwork provider · token file required when configured · read-only towards RomM, except the optional Rename title update below.");
             ui.label(format!("Status: {}", view.state_label));
             if let Some(detail) = &view.state_detail {
                 ui.weak(detail);
@@ -3107,7 +3669,53 @@ impl NativeWorkflows {
             if ui.button("Refresh RomM status").clicked() {
                 self.app.start_romm_status_load(context.clone());
             }
+            // Hidden while the setup form is open, so the two never save over
+            // each other.
+            if self.app.romm_ui.config_draft.is_none() {
+                ui.separator();
+                let mut on = *self
+                    .romm_title_setting
+                    .get_or_insert_with(super::romm_title::title_updates_enabled);
+                if ui
+                    .checkbox(&mut on, super::romm_title::SETTING_LABEL)
+                    .changed()
+                {
+                    self.romm_title_setting_error = super::romm_title::set_title_updates(on).err();
+                    self.romm_title_setting = Some(super::romm_title::title_updates_enabled());
+                }
+                ui.weak(super::romm_title::SETTING_EXPLANATION);
+                if on {
+                    let draft = self
+                        .romm_title_token_draft
+                        .get_or_insert_with(super::romm_title::title_token_path);
+                    ui.horizontal(|ui| {
+                        ui.label(super::romm_title::TOKEN_LABEL);
+                        ui.add(
+                            egui::TextEdit::singleline(draft)
+                                .hint_text("~/.config/emuwiz/romm-title-token"),
+                        );
+                    });
+                    if ui.button("Save title-update token").clicked() {
+                        let path = self.romm_title_token_draft.clone().unwrap_or_default();
+                        self.romm_title_setting_error =
+                            super::romm_title::set_title_token_path(&path).err();
+                        if self.romm_title_setting_error.is_none() {
+                            // Read back what was saved.
+                            self.romm_title_token_draft = None;
+                        }
+                    }
+                }
+                if let Some(error) = &self.romm_title_setting_error {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!("The setting was not saved: {error}"),
+                    );
+                }
+            }
             if self.app.romm_ui.config_draft.is_some() {
+                // Read again once the form closes.
+                self.romm_title_setting = None;
+                self.romm_title_token_draft = None;
                 ui.separator();
                 ui.strong("RomM setup");
                 let mut request = self.app.show_romm_configuration(ui);
@@ -3593,7 +4201,7 @@ impl NativeWorkflows {
     /// already running is never duplicated; a new one gets a new generation, so
     /// a late result for an older check or another game is dropped by the
     /// selected-evidence pipeline.
-    fn recheck_readiness_in_place(&mut self, context: &egui::Context) {
+    pub(super) fn recheck_readiness_in_place(&mut self, context: &egui::Context) {
         let Some(path) = self.selected.clone() else {
             return;
         };
@@ -3602,6 +4210,24 @@ impl NativeWorkflows {
             selected_evidence_page::SelectedEvidenceState::Loading { path: current, .. }
                 if current == &path
         );
+        // An explicit recheck also forgets any cached MAME answer for this game,
+        // and the launch input the pages were drawing.
+        crate::arcade_mame_probe::invalidate_path(&path);
+        self.launch_input_memo.forget();
+        // ... and has the BIOS answers the card shows verified again.
+        self.app.emulator_readiness.pcsx2_bios_cache.verify_again();
+        self.app
+            .emulator_readiness
+            .flycast_bios_cache
+            .verify_again();
+        // RetroArch facts (save folders, the zipped-game save check) come from
+        // its background scan, so an explicit recheck refreshes that too.
+        if !matches!(
+            self.app.emulator_readiness.retroarch_profiles,
+            crate::emulator_setup::RetroArchProfilesState::Scanning { .. }
+        ) {
+            self.app.start_retroarch_profile_scan(context.clone());
+        }
         if !running {
             self.app.launch_standalone.clear_cue_review();
             self.app.start_selected_evidence_load(context.clone(), path);
@@ -3705,13 +4331,137 @@ impl NativeWorkflows {
         }
     }
 
+    /// A launch input built now. Everything that starts or authorises a
+    /// launch (Play, the Launch page, the bezel preview) uses this and never
+    /// the drawing memo. Its BIOS answers are fresh ones, never ones held for
+    /// drawing.
     fn launch_input(&self) -> launch_readiness_page::LaunchReadinessInput {
+        self.launch_input_memo.fresh(|| self.build_launch_input())
+    }
+
+    fn build_launch_input(&self) -> launch_readiness_page::LaunchReadinessInput {
         let live = match &self.app.state {
             LoadState::Ready(data) => Some(data.as_ref()),
             LoadState::Loading { previous, .. } => previous.as_deref(),
             LoadState::Error(_) => None,
         };
         self.app.build_launch_readiness_input(live)
+    }
+
+    /// The input the drawing memo remembers. It differs from
+    /// [`Self::build_launch_input`] in one way only: its BIOS answers may be
+    /// ones already held while they are verified again off this thread.
+    fn build_shown_launch_input(&self) -> launch_readiness_page::LaunchReadinessInput {
+        let live = match &self.app.state {
+            LoadState::Ready(data) => Some(data.as_ref()),
+            LoadState::Loading { previous, .. } => previous.as_deref(),
+            LoadState::Error(_) => None,
+        };
+        self.app.build_shown_launch_readiness_input(live)
+    }
+
+    /// The launch input for drawing. Reused across frames while nothing it
+    /// was built from has changed; see [`launch_input_memo`]. Only read by
+    /// code that shows readiness, never by code that launches.
+    fn shown_launch_input(&self) -> launch_input_memo::Shown {
+        let key = self.launch_input_key(self.launch_input_memo.now());
+        let shown = self
+            .launch_input_memo
+            .shown(key, || self.build_shown_launch_input());
+        if let Some(recheck_in) = shown.recheck_in {
+            // Whoever draws from a remembered input gets one more frame at
+            // the moment it may be rebuilt, so no page depends on some other
+            // timer to show a change the key does not cover.
+            self.context.request_repaint_after(recheck_in);
+        }
+        shown
+    }
+
+    /// How many launch inputs have been built, for drawing or for an action.
+    #[cfg(test)]
+    pub(super) fn launch_input_builds(&self) -> u64 {
+        self.launch_input_memo.builds()
+    }
+
+    /// Stops the drawn input's clock now, so a test can show that Play does
+    /// not depend on the remembered answer expiring.
+    #[cfg(test)]
+    pub(super) fn freeze_drawn_launch_input(&self) {
+        self.launch_input_memo.freeze(self.launch_input_memo.now());
+    }
+
+    /// The emulator-environment signature the background readiness checks
+    /// use: `None` while a scan it covers is unfinished.
+    pub(super) fn environment_signature(&self, now: std::time::Instant) -> Option<u64> {
+        super::bg_readiness::EnvSnapshot::cached_signature(
+            &self.app.emulator_readiness,
+            &mut self.environment_heavy.borrow_mut(),
+            now,
+        )
+    }
+
+    /// Everything a drawn launch input is known to depend on, or `None` when
+    /// nothing may be reused: the evidence is not ready or an emulator scan
+    /// is still running, and the input is then built on every call.
+    fn launch_input_key(&self, now: std::time::Instant) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let selected_evidence_page::SelectedEvidenceState::Ready {
+            generation,
+            report,
+            hasheous,
+        } = &self.app.selected_evidence_ui.selected_evidence
+        else {
+            return None;
+        };
+        let environment = self.environment_signature(now)?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // The game.
+        self.selected_game.hash(&mut hasher);
+        self.selected.hash(&mut hasher);
+        self.app.archive_context.focused.hash(&mut hasher);
+        // Its identity evidence: a new check has a new generation, and the
+        // deferred checksum pass and an online lookup change the report in place.
+        generation.hash(&mut hasher);
+        report.path.hash(&mut hasher);
+        std::mem::discriminant(&report.enrichment).hash(&mut hasher);
+        report.hashes.is_some().hash(&mut hasher);
+        report.dat_identity.is_some().hash(&mut hasher);
+        std::mem::discriminant(hasheous).hash(&mut hasher);
+        // Emulator scans, firmware evidence, emulator choices and settings.
+        environment.hash(&mut hasher);
+        // The library: generation, and which loaded snapshots are in use.
+        self.app.database_generation.0.hash(&mut hasher);
+        self.app
+            .database_state
+            .snapshot()
+            .map(std::ptr::from_ref)
+            .hash(&mut hasher);
+        match &self.app.state {
+            LoadState::Ready(data) => Some(std::ptr::from_ref(data.as_ref())),
+            LoadState::Loading { previous, .. } => previous.as_deref().map(std::ptr::from_ref),
+            LoadState::Error(_) => None,
+        }
+        .hash(&mut hasher);
+        // What the catalogue says about this file, and a one-launch choice.
+        self.app.catalogued_platform_hint.hash(&mut hasher);
+        self.app.catalogued_platform_source.hash(&mut hasher);
+        self.app.catalogued_row_health.hash(&mut hasher);
+        self.app.catalogued_loose_content.hash(&mut hasher);
+        self.app
+            .catalogued_scummvm_folder
+            .as_ref()
+            .map(|folder| (folder.id, &folder.absolute_path))
+            .hash(&mut hasher);
+        self.app.launch_system_trial.hash(&mut hasher);
+        // Scans the environment signature does not cover, by state only, and
+        // whether a cheat workflow is open (it can supply a fallback identity).
+        std::mem::discriminant(&self.app.emulator_readiness.flycast_profiles).hash(&mut hasher);
+        self.app.cheat_workflow.is_some().hash(&mut hasher);
+        // Answers from the per-game background checks (Mesen, shadPS4, Hatari,
+        // the MAME probe, the content inspections). They are only collected
+        // by a build, so the frame a worker wakes must build again.
+        crate::emulator_setup::answers::count(&self.context).hash(&mut hasher);
+        Some(hasher.finish())
     }
 
     /// An emulator is starting or running, whichever page started it.
@@ -3730,6 +4480,33 @@ impl NativeWorkflows {
             || self.app.launch_pcsx2.is_active()
             || self.app.launch_standalone.is_active()
             || self.app.launch_amiga_whdload.is_active()
+    }
+
+    /// The emulator this kind of launch is expected to start. Only a hint:
+    /// the session journal goes by the process that really starts.
+    fn launch_kind_emulator(&self) -> &'static str {
+        match self.launch_kind {
+            Some(LaunchKind::RetroArch) => "RetroArch",
+            Some(LaunchKind::Dolphin) => "Dolphin",
+            Some(LaunchKind::Pcsx2) => "PCSX2",
+            Some(LaunchKind::Standalone | LaunchKind::AmigaWhdLoad) | None => "",
+        }
+    }
+
+    /// The game being launched, as the session journal records it. What
+    /// was asked for, not proof that it ran.
+    fn launch_session_game(&self) -> archivefs_core::save_continuity::session::SessionGame {
+        archivefs_core::save_continuity::session::SessionGame {
+            library_id: self.selected_game,
+            title: self
+                .selected
+                .as_deref()
+                .and_then(|path| path.file_stem())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            product_code: None,
+            content_path: self.selected.clone(),
+        }
     }
 
     fn launch_failure(&self) -> Option<String> {
@@ -3805,6 +4582,23 @@ mod source_presentation_tests {
             "Permission denied"
         );
         assert_eq!(source_scan_label(None), "Not scanned yet");
+        // A bare configured path (library snapshot not loaded) is not "never
+        // scanned"; a real record, even with no scan yet, is.
+        let bare = crate::source_state::merge_configured_sources(
+            &[std::path::PathBuf::from("/games")],
+            None,
+        )
+        .sources
+        .remove(0);
+        assert!(!scan_history_loaded(&bare, false));
+        // Once the snapshot has loaded, a source with no row is truly unscanned.
+        assert!(scan_history_loaded(&bare, true));
+        let mut recorded = bare.clone();
+        recorded.id = Some(22);
+        assert!(scan_history_loaded(&recorded, false));
+        let mut scanned = bare;
+        scanned.last_scan_at = Some("2026-10-04T23:34:54Z".into());
+        assert!(scan_history_loaded(&scanned, false));
         assert_eq!(
             source_scan_label(Some(SourceScanStatus::Success)),
             "Completed"
@@ -3822,8 +4616,14 @@ mod source_presentation_tests {
 }
 
 #[cfg(test)]
+#[path = "native_workflows/launch_input_memo_tests.rs"]
+mod launch_input_memo_tests;
+#[cfg(test)]
 #[path = "native_workflows/launch_recovery_tests.rs"]
 mod launch_recovery_tests;
+#[cfg(test)]
+#[path = "native_workflows/saved_sources_tests.rs"]
+mod saved_sources_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3843,6 +4643,57 @@ mod tests {
         workflows.observe_launch_activity(&mut activity);
         assert!(workflows.launch_attempts.for_game(1).is_some());
         assert!(workflows.launch_attempts.for_game(2).is_none());
+    }
+
+    #[test]
+    fn play_waits_then_falls_back_to_the_launch_page_instead_of_launching_blind() {
+        let mut workflows = NativeWorkflows::new(egui::Context::default());
+        // No selected game / no loaded evidence: Play must not start anything,
+        // must remember the request, and must route to the Launch page.
+        let route =
+            workflows.readiness_action_route(&egui::Context::default(), ReadinessAction::Play, 5);
+        assert_eq!(workflows.pending_play.map(|(game, _)| game), Some(5));
+        assert!(matches!(route, Some(Route::Task { game: 5, .. })));
+        assert!(!workflows.launch_active());
+        // A different game's pending request is never carried over.
+        assert_eq!(workflows.try_play(6), PlayOutcome::Waiting);
+    }
+
+    #[test]
+    fn a_pending_play_never_waits_past_a_needed_confirmation_or_a_refusal() {
+        use launch_readiness_page::GamerBlockerKind as K;
+        for kind in [
+            K::UnknownSystem,
+            K::ConflictingIdentity,
+            K::ContentNeedsPreparation,
+            K::EmulatorNotInstalled,
+            K::EmulatorSetupIncomplete,
+            K::NoSafeEmulator,
+            K::MultipleChoices,
+            K::LaunchPlanInvalid,
+            K::InspectionIncomplete,
+        ] {
+            assert!(!still_checking(kind), "{kind:?} must end the pending Play");
+        }
+        assert!(still_checking(K::CheckingGame));
+        assert!(still_checking(K::EmulatorNotChecked));
+    }
+
+    #[test]
+    fn a_pending_play_waits_out_slow_checks_but_never_outlives_its_page_or_game() {
+        // Slow readiness: drawn every pass, it stays live with no clock.
+        let mut pending = Some((5, 10));
+        for pass in 11..10_000 {
+            assert!(pending_play_is_live(pending, 5, pass));
+            pending = Some((5, pass));
+        }
+        // Another game never inherits it.
+        assert!(!pending_play_is_live(pending, 6, 10_000));
+        assert!(!pending_play_is_live(None, 5, 1));
+        // Cancelled or left (Back, another page): the page was not drawn, so
+        // coming back later is not permission to launch.
+        assert!(!pending_play_is_live(Some((5, 10)), 5, 13));
+        assert!(!pending_play_is_live(Some((5, 10)), 5, 500));
     }
 
     #[test]
@@ -4376,6 +5227,19 @@ mod tests {
     }
 
     #[test]
+    fn only_launchable_or_unassessed_installations_can_be_chosen() {
+        use archivefs_core::launch::installation_support::LaunchSupport;
+        assert!(!super::lifecycle_choice_is_launchable(
+            &LaunchSupport::NotLaunchableYet {
+                reason: "no binding".into()
+            }
+        ));
+        assert!(super::lifecycle_choice_is_launchable(
+            &LaunchSupport::NotAssessed
+        ));
+    }
+
+    #[test]
     fn lifecycle_status_never_calls_detected_installations_not_installed() {
         use archivefs_core::emulator_lifecycle::LifecycleState;
 
@@ -4483,15 +5347,41 @@ fn lifecycle_setup_panel(
                             .map(update_status_label)
                             .unwrap_or("Latest version unknown")
                     ));
+                    ui.label(installation.launch_support.label());
+                    let launchable = lifecycle_choice_is_launchable(&installation.launch_support);
                     if !installation.selected
                         && let Some(path) = lifecycle_executable_path(&installation.exact_binding)
                         && let Some(emulator) = overridable_emulator(&projection.emulator_id)
-                        && ui.button("Use this installation").clicked()
+                        && ui
+                            .add_enabled(launchable, egui::Button::new("Use this installation"))
+                            .on_disabled_hover_text(
+                                "EmuWiz cannot launch this installation, so it cannot be chosen.",
+                            )
+                            .clicked()
                     {
                         app.emulator_readiness
                             .emulator_setup_overrides
                             .set_executable(emulator, Some(path.to_path_buf()));
                         ui.label("Selection saved through the existing emulator setup backend. Refresh to inspect it again.");
+                    }
+                    // RetroArch keeps its own installation choice (the sidecar
+                    // launch discovery honours); only native programs qualify.
+                    if !installation.selected
+                        && projection.emulator_id == "RetroArch"
+                        && let archivefs_core::emulator_lifecycle::ExactBinding::NativeExecutable {
+                            path,
+                        } = &installation.exact_binding
+                        && ui
+                            .add_enabled(launchable, egui::Button::new("Use this installation"))
+                            .on_disabled_hover_text(
+                                "EmuWiz cannot launch this installation, so it cannot be chosen.",
+                            )
+                            .clicked()
+                    {
+                        app.emulator_readiness
+                            .retroarch_installation_picker
+                            .start(Some(path.clone()), ui.ctx().clone());
+                        ui.label("Saving this RetroArch choice. Launches use only this program with its own settings; RetroArch settings are not changed. Refresh to inspect it again.");
                     }
                     ui.collapsing("Advanced details", |ui| {
                         ui.label(format!("Ownership: {}", ownership_label(installation.ownership_category)));
@@ -4557,6 +5447,18 @@ fn lifecycle_primary_state_label(
         archivefs_core::emulator_lifecycle::LifecycleState::Missing => "Detected",
         _ => lifecycle_state_label(state),
     }
+}
+
+/// "Use this installation" is offered only for an installation Launch can
+/// start. Emulators whose launch adapter does not assess installations keep
+/// the existing behaviour.
+fn lifecycle_choice_is_launchable(
+    support: &archivefs_core::launch::installation_support::LaunchSupport,
+) -> bool {
+    !matches!(
+        support,
+        archivefs_core::launch::installation_support::LaunchSupport::NotLaunchableYet { .. }
+    )
 }
 
 fn lifecycle_selection_notice(
@@ -4809,6 +5711,92 @@ mod lifecycle_selection_tests {
     }
 }
 
+/// Saved scan history for the Sources page, loaded off the UI thread.
+#[derive(Default)]
+enum SavedSourceHistory {
+    #[default]
+    NotStarted,
+    Loading(Receiver<Option<SavedSources>>),
+    Loaded(SavedSources, std::time::Instant),
+    Unavailable,
+}
+
+/// The saved per-source state the Sources page needs while the full library
+/// snapshot is absent: scan history and the backend's catalogue health.
+#[derive(Debug, Default)]
+struct SavedSources {
+    views: Vec<SourceFolderView>,
+    health: Vec<archivefs_core::catalogue_health::SourceHealth>,
+}
+
+impl SavedSourceHistory {
+    fn views(&self) -> Option<&[SourceFolderView]> {
+        match self {
+            Self::Loaded(saved, _) => Some(saved.views.as_slice()),
+            _ => None,
+        }
+    }
+
+    fn health(&self) -> Option<&[archivefs_core::catalogue_health::SourceHealth]> {
+        match self {
+            Self::Loaded(saved, _) => Some(saved.health.as_slice()),
+            _ => None,
+        }
+    }
+}
+
+/// Reads configured sources joined with their saved scan history, plus the
+/// backend's catalogue health for them. Read-only; `None` when the config or
+/// database cannot be read. Without the health, Blue's Sources page would
+/// show "Checking" forever whenever the full snapshot was never loaded.
+fn load_saved_source_views() -> Option<SavedSources> {
+    let config = archivefs_core::default_config_path().ok()?;
+    let sources = archivefs_core::load_source_folder_configs_from(config).ok()?;
+    let database =
+        archivefs_core::Database::open_read_only(archivefs_core::default_database_path().ok()?)
+            .ok()?;
+    saved_sources_from(&database, &sources)
+}
+
+fn saved_sources_from(
+    database: &archivefs_core::Database,
+    sources: &[archivefs_core::SourceFolderConfig],
+) -> Option<SavedSources> {
+    let records = database.list_source_folders().ok()?;
+    let roots: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
+    Some(SavedSources {
+        views: archivefs_core::build_source_folder_views(sources, &records),
+        // Same call and same fallback as the full snapshot load.
+        health: database.source_health(&roots).unwrap_or_default(),
+    })
+}
+
+/// Only checks still running keep a pending Play waiting. Anything that needs
+/// the player (a choice, "Try anyway", setup) or refuses is a definite answer:
+/// the pending Play ends and the Launch page shows what is needed.
+fn still_checking(kind: launch_readiness_page::GamerBlockerKind) -> bool {
+    use launch_readiness_page::GamerBlockerKind::{CheckingGame, EmulatorNotChecked};
+    matches!(kind, CheckingGame | EmulatorNotChecked)
+}
+
+/// A pending Play is live for its own game while its Launch page is drawn
+/// without a break: `seen` is the last pass it was drawn in (or Play was
+/// pressed in; the page follows within a pass). There is no clock, so slow
+/// readiness never expires it, and only a definite answer (started or
+/// blocked), another game, or leaving the page (Back, another page, the
+/// controller leaving Launch) ends it. A page left and opened again later
+/// therefore never starts a game by itself.
+fn pending_play_is_live(pending: Option<(i64, u64)>, game: i64, pass: u64) -> bool {
+    pending.is_some_and(|(pending_game, seen)| pending_game == game && pass <= seen + 2)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PlayOutcome {
+    Started,
+    Waiting,
+    Blocked,
+}
+
 /// Where each readiness action goes. Identity problems always go to the one
 /// Review Identity screen.
 pub(super) fn route_for_action(action: ReadinessAction, game_id: i64) -> Option<Route> {
@@ -4816,10 +5804,12 @@ pub(super) fn route_for_action(action: ReadinessAction, game_id: i64) -> Option<
         ReadinessAction::RecheckReadiness | ReadinessAction::LookUpOnline => None,
         ReadinessAction::ReviewDiscSet => Some(Route::Section(Section::MultiDisc)),
         ReadinessAction::OpenActivity => Some(Route::Section(Section::Activity)),
-        ReadinessAction::Play | ReadinessAction::ChooseEmulator => Some(Route::Task {
-            section: Section::Launch,
-            game: game_id,
-        }),
+        ReadinessAction::Play | ReadinessAction::ChooseEmulator | ReadinessAction::TryAnyway => {
+            Some(Route::Task {
+                section: Section::Launch,
+                game: game_id,
+            })
+        }
         ReadinessAction::SetUpEmulator => Some(Route::Section(Section::Emulators)),
         ReadinessAction::CheckFirmware => Some(Route::Section(Section::Firmware)),
         ReadinessAction::ReviewIdentity

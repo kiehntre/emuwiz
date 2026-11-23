@@ -45,8 +45,7 @@ const T64_SIGNATURE: &[u8; 20] = b"C64S tape image file";
 const T64_VERSIONS: &[u16] = &[0x0100, 0x0101, 0x0200];
 
 /// The machine byte from a Commodore TAP header. C16/Plus4 is represented so
-/// a valid TAP is not mislabelled as C64, even though EmuWiz has no canonical
-/// C16 platform entry in this release.
+/// a valid TAP is never mislabelled as C64.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommodoreTapeMachine {
     C64,
@@ -63,13 +62,13 @@ impl CommodoreTapeMachine {
         }
     }
 
-    /// The canonical platform ids that exist in this build. C16/Plus4 is
-    /// intentionally absent because it has no registry entry yet.
+    /// The canonical platform id. One C16/Plus4 machine byte covers both TED
+    /// machines; `Commodore 16` and `Commodore Plus-4` are declared equivalent.
     pub fn platform_id(self) -> Option<&'static str> {
         match self {
             Self::C64 => Some("Commodore 64"),
             Self::Vic20 => Some("VIC-20"),
-            Self::C16Plus4 => None,
+            Self::C16Plus4 => Some("Commodore 16"),
         }
     }
 }

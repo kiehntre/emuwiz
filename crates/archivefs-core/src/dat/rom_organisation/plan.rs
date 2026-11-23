@@ -50,6 +50,41 @@ pub struct OrganisationPlanRequest<'a> {
     /// Bumped by the caller on every plan (re)build; a plan is stale the
     /// moment its generation no longer matches the caller's current one.
     pub generation: u64,
+    /// Where checked games whose platform is genuinely unknown go when the
+    /// person approves (relative to `master_root`, for example
+    /// `Unnamed/Unknown`). `None` keeps every Unknown game Blocked. Platform
+    /// conflicts are always Blocked.
+    pub unknown_folder: Option<&'a Path>,
+}
+
+/// The folder under `master_root` that holds `platform_id` games: an existing
+/// direct sub-folder whose name the scanner already reads as that platform
+/// (for example `nes`), else the canonical registry folder. Several existing
+/// candidates are only accepted when one is the canonical name. Read-only.
+pub fn layout_folder_in(master_root: &Path, platform_id: &str) -> Result<String, String> {
+    let canonical = crate::platform::canonical_layout_folder(platform_id)
+        .ok_or("the resolved platform has no safe canonical EmuWiz folder name")?;
+    let mut existing: Vec<String> = std::fs::read_dir(master_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| {
+            crate::platform::detect::platform_for_folder_name(name)
+                .is_some_and(|platform| platform.id == platform_id)
+        })
+        .collect();
+    existing.sort();
+    match existing.as_slice() {
+        [] => Ok(canonical),
+        [only] => Ok(only.clone()),
+        several if several.contains(&canonical) => Ok(canonical),
+        several => Err(format!(
+            "several existing folders could hold these games ({}); choose one first",
+            several.join(", ")
+        )),
+    }
 }
 
 /// Builds a read-only organisation plan. Never mutates the filesystem.
@@ -243,7 +278,16 @@ fn plan_entry(
     // Platform resolution gates the rest.
     let (platform, display_name, platform_source) = match &candidate.resolution {
         PlatformIdentityResolution::Unknown { .. } => {
-            return blocked("no platform identity could be resolved for this game");
+            return match (request.unknown_folder, mode) {
+                (Some(folder), OrganisationMode::MoveRealFile) => unknown_entry(
+                    request,
+                    candidate,
+                    folder,
+                    &source_basename,
+                    source_identity,
+                ),
+                _ => blocked("no platform identity could be resolved for this game"),
+            };
         }
         PlatformIdentityResolution::Conflict { .. } => {
             return blocked(
@@ -282,12 +326,10 @@ fn plan_entry(
     // platform folder at all.
     let layout_folder = match mode {
         OrganisationMode::RenameInPlace => None,
-        _ => {
-            let Some(folder) = crate::platform::canonical_layout_folder(&platform) else {
-                return blocked("the resolved platform has no safe canonical EmuWiz folder name");
-            };
-            Some(folder)
-        }
+        _ => match layout_folder_in(request.master_root, &platform) {
+            Ok(folder) => Some(folder),
+            Err(reason) => return blocked(&reason),
+        },
     };
 
     // Canonical filename: reuse the rename planner's derivation, never a
@@ -355,6 +397,58 @@ fn plan_entry(
             OrganisationStatus::Suggested
         },
         reason: None,
+    }
+}
+
+/// A checked game with no identifiable platform, placed under the approved
+/// Unknown folder with its name unchanged (provenance is the journal entry).
+fn unknown_entry(
+    request: &OrganisationPlanRequest<'_>,
+    candidate: &OrganisationCandidate,
+    folder: &Path,
+    source_basename: &str,
+    source_identity: Option<crate::dat::rename_apply::model::ObjectIdentity>,
+) -> OrganisationPlanEntry {
+    let safe_folder = !folder.as_os_str().is_empty()
+        && folder.is_relative()
+        && folder
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)));
+    let target_dir = request.master_root.join(folder);
+    let (status, destination_path, reason) = if !safe_folder || !is_safe_basename(source_basename) {
+        (
+            OrganisationStatus::Blocked,
+            PathBuf::new(),
+            Some("the Unknown folder or the file name is not a safe path".to_string()),
+        )
+    } else if candidate.source_path.parent() == Some(target_dir.as_path()) {
+        (
+            OrganisationStatus::AlreadyOrganised,
+            candidate.source_path.clone(),
+            None,
+        )
+    } else {
+        (
+            OrganisationStatus::Suggested,
+            target_dir.join(source_basename),
+            None,
+        )
+    };
+    OrganisationPlanEntry {
+        source_identity,
+        catalogue_binding: None,
+        source_path: candidate.source_path.clone(),
+        destination_path,
+        platform: None,
+        platform_display_name: "Unknown system".to_string(),
+        platform_source: "Checked: no platform evidence".to_string(),
+        slug: None,
+        layout_folder: Some(folder.to_string_lossy().into_owned()),
+        mode: request.mode,
+        content_classification: candidate.content_classification.clone(),
+        original_metadata: candidate.original_metadata.clone(),
+        status,
+        reason,
     }
 }
 

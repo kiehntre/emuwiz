@@ -309,6 +309,13 @@ fn checked_in_document_matches_the_registry() {
         return;
     }
     let current = fs::read_to_string(&path).unwrap_or_default();
+    if current != rendered {
+        // The full expected document, so a stale copy can be refreshed from
+        // a CI log when no local build is available.
+        eprintln!(
+            "----- BEGIN EXPECTED {DOCUMENT_PATH} -----\n{rendered}\n----- END EXPECTED -----"
+        );
+    }
     assert!(
         current == rendered,
         "{DOCUMENT_PATH} is stale: regenerate with EMUWIZ_WRITE_COVERAGE_MATRIX=1 \

@@ -216,6 +216,7 @@ pub(super) fn show_controls(
         // A launch-only file-hash key is not a stable game identity, so it is
         // never written as a per-game default (use once / system stay available).
         if chosen != Some(LaunchChoiceSource::Game)
+            && !archivefs_core::launch::unverified_media::is_unverified_key(game_key)
             && super::azahar::game_default_allowed(game_key)
             && super::vita3k::game_default_allowed(game_key)
             && ui.button("Default for this game").clicked()

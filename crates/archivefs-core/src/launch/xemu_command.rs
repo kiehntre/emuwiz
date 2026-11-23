@@ -286,10 +286,11 @@ pub fn build_xemu_command_plan(
         content_path.expect("a resolved content path is required when no blockers exist");
     let binding = binding.expect("a launch binding is required when no blockers exist");
 
-    let arguments = vec![
+    let mut arguments = binding.launcher_arguments.clone();
+    arguments.extend([
         OsString::from(XEMU_DVD_PATH_FLAG),
         content_path.clone().into_os_string(),
-    ];
+    ]);
 
     XemuCommandPlan {
         command: Some(XemuCommand {

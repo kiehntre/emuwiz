@@ -345,7 +345,11 @@ impl App {
                         == Some(archivefs_core::MANUAL_PLATFORM_SOURCE);
                     ui.small(system_source_note(game.archive.platform_source.as_deref()));
                     ui.horizontal(|ui| {
-                        if ui.button("Change system").clicked() {
+                        if ui
+                            .button(super::native_workflows::CHANGE_SYSTEM_PERMANENTLY)
+                            .on_hover_text("A lasting change for this game: your choice outranks later automatic detection until you choose \"Use the detected system again\". To try a launch once without saving anything, use Try anyway on the Launch page.")
+                            .clicked()
+                        {
                             choose_system = true;
                         }
                         if manual
@@ -470,6 +474,7 @@ impl App {
         };
         let name = file_name(game);
         let current_system = game.platform.clone();
+        let archive_path = game.archive.absolute_path.clone();
         let source_code = game.archive.platform_source.clone();
         let source_note = system_source_note(source_code.as_deref());
         let suggestion = self.folder_check.finding_for(id).cloned();
@@ -515,7 +520,7 @@ impl App {
                         "Assign {} to {name}?",
                         archivefs_core::platform::display_name_for(selected)
                     ));
-                    ui.label("This records your choice for this one game. No game file is changed.");
+                    ui.label("This is a lasting change for this one game: it outranks later automatic detection until you choose \"Use the detected system again\". No game file is changed. To try a launch once without saving anything, use Try anyway on the Launch page.");
                     for line in super::folder_check::system_change_preview(
                         &current_system,
                         source_note,
@@ -524,6 +529,14 @@ impl App {
                         suggestion.as_ref(),
                     ) {
                         ui.small(line);
+                    }
+                    if let Some(warning) =
+                        crate::emulator_setup::unverified_media::manual_choice_warning(
+                            &archive_path,
+                            selected,
+                        )
+                    {
+                        ui.colored_label(ui.visuals().warn_fg_color, warning);
                     }
                 }
                 ui.horizontal(|ui| {

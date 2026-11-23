@@ -48,11 +48,13 @@ use crate::media_set::{
 };
 use crate::platform::identity::{PlatformIdentityResolution, PlatformIdentitySource};
 
+#[cfg(test)]
+use crate::revalidate_archive_for_catalogue;
 use crate::{
     ARCHIVE_PARSER_VERSION, Archive, ArchiveFsError, ArchiveKind, ArchiveScanner, Config,
     IngestionFingerprint, PlatformProvenance, Result, SCAN_CACHE_VERSION, SCANNER_VERSION,
     ScanFingerprint, canonical_platform_names, detect_platform_with_details, nested_source_roots,
-    normalize_path_segment, revalidate_archive_for_catalogue, validate_configured_source_roots,
+    normalize_path_segment, validate_configured_source_roots,
 };
 
 mod attention;
@@ -65,12 +67,29 @@ mod backup_ownership;
 #[path = "database/backup_ownership_tests.rs"]
 mod backup_ownership_tests;
 mod bounded_import;
+mod collections;
+#[cfg(test)]
+#[path = "database/collections_tests.rs"]
+mod collections_tests;
+#[cfg(test)]
+#[path = "database/collections_upgrade_tests.rs"]
+mod collections_upgrade_tests;
 mod discovery_import;
+mod skip_counts;
+#[cfg(test)]
+#[path = "database/skip_counts_tests.rs"]
+mod skip_counts_tests;
+pub use collections::{
+    CollectionItemKey, CollectionReanchor, GameCollection, GameCollectionItem, GameCollectionKind,
+    JournalledMoves, MAX_COLLECTION_NAME_CHARS, validate_collection_name,
+};
 pub use discovery_import::{
     DiscoveryImportExclusion, DiscoveryImportItem, DiscoveryImportOperation,
     DiscoveryImportUndoPreview, DiscoveryImportUndoResult,
 };
 mod catalogue_health;
+mod nested_scan;
+pub use nested_scan::{NestedMountOutcome, NestedMountState};
 mod cue_revalidation;
 pub(crate) mod organisation_paths;
 pub use cue_revalidation::{CueDiscCatalogue, CueDiscRevalidation};
@@ -89,7 +108,12 @@ mod gdi_disc_tests;
 mod preservation_fingerprint;
 pub use preservation_fingerprint::PreservationFreshness;
 mod disc_order;
-pub use dat_current::CurrentLibraryDatEvidence;
+pub use dat_current::{
+    CatalogueSet, CurrentLibraryDatEvidence, DatRecheckAttempt, SavedDatEvidenceRow,
+    SavedDatEvidenceStatus, VerifiedDatName,
+};
+#[cfg(test)]
+pub(crate) use dat_current::{SavedDatNameRow, decide_verified_dat_name};
 pub use disc_order::DatDiscOrderOutcome;
 #[cfg(test)]
 #[path = "database/catalogue_health_tests.rs"]
@@ -100,7 +124,18 @@ mod disc_order_tests;
 pub(crate) mod forget_missing;
 mod missing_cleanup;
 pub use missing_cleanup::MissingCleanupTarget;
+#[cfg(test)]
+#[path = "database/dat_evidence_history_tests.rs"]
+mod dat_evidence_history_tests;
+mod journal_recovery;
+#[cfg(test)]
+#[path = "database/journal_recovery_tests.rs"]
+mod journal_recovery_tests;
 mod journal_state;
+pub use journal_recovery::{
+    JournalRecoveryReceipt, JournalRecoveryState, PreservedFile, apply_journal_recovery,
+    prepare_journal_recovery, read_journal_recovery_receipt,
+};
 #[cfg(test)]
 #[path = "database/migration_protection_tests.rs"]
 mod migration_protection_tests;
@@ -109,6 +144,8 @@ mod migration_protection_tests;
 mod negative_dat_platform_tests;
 pub(crate) mod reconciliation;
 mod restore;
+mod scan_history;
+pub use scan_history::{MAX_SCAN_HISTORY_RUNS, RecordedScanCounts, ScanRunCoverage, ScanRunRecord};
 #[cfg(test)]
 #[path = "database/topology_evidence_tests.rs"]
 mod topology_evidence_tests;
@@ -394,7 +431,75 @@ const MIGRATIONS: &[Migration] = &[
         description: "bind DAT inventories to exact catalogue bytes",
         sql: include_str!("migrations/0026_dat_inventory_digest.sql"),
     },
+    Migration {
+        version: 27,
+        description: "keep replaced DAT evidence and unfinished re-check reasons",
+        sql: include_str!("migrations/0027_dat_evidence_history.sql"),
+    },
+    Migration {
+        version: 28,
+        description: "game collections: Favourites and user-created collections",
+        sql: include_str!("migrations/0028_game_collections.sql"),
+    },
+    Migration {
+        version: 29,
+        description: "remember games no catalogue in their system's catalogue set lists",
+        sql: include_str!("migrations/0029_dat_catalogue_set_no_match.sql"),
+    },
+    Migration {
+        version: 30,
+        description: "exact skipped-file totals per scan run, source and reason",
+        sql: include_str!("migrations/0030_scan_run_skip_counts.sql"),
+    },
 ];
+
+/// From this version on, a migration's description is part of its identity
+/// and must never be edited: [`verify_migration_lineage`] compares it with
+/// what the database recorded when that version was applied.
+const LINEAGE_CHECKED_FROM_VERSION: i64 = 27;
+
+/// Refuses a database whose recorded migrations are not this build's.
+///
+/// `user_version` alone cannot tell two different migrations that were both
+/// numbered N apart (two branches each adding "the next" migration). Such a
+/// database has the right number and the wrong tables. Every applied version
+/// from [`LINEAGE_CHECKED_FROM_VERSION`] on must therefore be recorded, with
+/// the description this build has for it. Read-only.
+fn verify_migration_lineage(connection: &Connection, migrations: &[Migration]) -> Result<()> {
+    let current = schema_version(connection)?;
+    if current < LINEAGE_CHECKED_FROM_VERSION {
+        return Ok(());
+    }
+    let mut statement = connection
+        .prepare("SELECT version, description FROM schema_migrations WHERE version >= ?1")
+        .map_err(|error| db_error("failed to read the applied migrations", error))?;
+    let recorded: HashMap<i64, String> = statement
+        .query_map([LINEAGE_CHECKED_FROM_VERSION], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .and_then(|rows| rows.collect())
+        .map_err(|error| db_error("failed to read the applied migrations", error))?;
+    for migration in migrations.iter().filter(|migration| {
+        migration.version >= LINEAGE_CHECKED_FROM_VERSION && migration.version <= current
+    }) {
+        match recorded.get(&migration.version) {
+            Some(description) if description == migration.description => {}
+            Some(description) => {
+                return Err(ArchiveFsError::Database(format!(
+                    "this library database was taken to schema {} by a different EmuWiz build (it recorded \"{description}\"; this build's schema {} is \"{}\"). The two are not compatible. Refusing to use or migrate it. Nothing was changed.",
+                    migration.version, migration.version, migration.description
+                )));
+            }
+            None => {
+                return Err(ArchiveFsError::Database(format!(
+                    "this library database reports schema {current} but has no record of schema {} being applied. Refusing to use or migrate it. Nothing was changed.",
+                    migration.version
+                )));
+            }
+        }
+    }
+    Ok(())
+}
 
 fn latest_known_version(migrations: &[Migration]) -> i64 {
     migrations
@@ -524,8 +629,12 @@ fn topology_source_fingerprint(
 /// What one topology persistence call wrote and what it refused to replace.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TopologyPersistOutcome {
+    /// Sets accepted as the saved evidence, including the unchanged ones.
     pub written: usize,
     pub conflicts_kept: usize,
+    /// Accepted sets whose saved row was already byte-identical, so no row
+    /// was written for them at all.
+    pub unchanged: usize,
 }
 
 /// Two claims about one release agree when no source moves to another
@@ -927,6 +1036,14 @@ impl Database {
                 )
             })?;
             for evidence in batch {
+                // A folder the DAT does not describe (artwork, manuals,
+                // screenshots, or a set from another MAME release) has no
+                // expected members, so it would read as a complete,
+                // satisfied set. It is not a DAT set: no audit or expected
+                // rows. Its catalogue row still has any earlier identity
+                // cleared below, since this DAT no longer supports one.
+                let not_in_dat =
+                    evidence.class == crate::dat::mame_arcade_join::ArcadeJoinClass::NotFound;
                 let encoded = serde_json::to_string(evidence).map_err(|error| {
                     ArchiveFsError::Database(format!(
                         "failed to encode MAME Arcade join evidence for {} in batch {batch_start}..{batch_end}; {committed} rows already committed: {error}",
@@ -953,7 +1070,8 @@ impl Database {
                                 evidence.logical_set_name
                             ))
                         })?;
-                tx.execute(
+                if !not_in_dat {
+                    tx.execute(
                     "INSERT INTO dat_expected_entries
                  (dat_source_id, canonical_identity, display_name, source_revision,
                   ecosystem, metadata_json, created_at, updated_at)
@@ -985,7 +1103,7 @@ impl Database {
                         error,
                     )
                 })?;
-                tx.execute(
+                    tx.execute(
                     "INSERT INTO dat_set_audit_results
                  (archive_id, archive_path, source_id, game_name, platform,
                   set_state_json, dependency_state_json, ecosystem, dat_revision,
@@ -1035,6 +1153,7 @@ impl Database {
                         error,
                     )
                 })?;
+                }
                 if let Some(archive_id) = archive_id {
                     tx.execute(
                         "UPDATE archives SET identity_report_json = ?2,
@@ -1068,13 +1187,19 @@ impl Database {
                     error,
                 )
             })?;
-            committed += batch.len();
+            let persisted_sets = batch
+                .iter()
+                .filter(|evidence| {
+                    evidence.class != crate::dat::mame_arcade_join::ArcadeJoinClass::NotFound
+                })
+                .count();
+            committed += persisted_sets;
             log::info!(
                 "MAME Arcade audit committed batch {}..{} ({} sets, {} audit/inventory rows plus logical-set identity updates, {} sets total) in {:?}",
                 batch_start,
                 batch_end,
-                batch.len(),
-                batch.len() * 2,
+                persisted_sets,
+                persisted_sets * 2,
                 committed,
                 transaction_started.elapsed()
             );
@@ -1396,6 +1521,7 @@ impl Database {
                 "library database schema version {current_version} is not the required current version {expected_version}; refusing to migrate or repair it during a read-only operation"
             )));
         }
+        verify_migration_lineage(&connection, MIGRATIONS)?;
 
         Ok(Self {
             connection,
@@ -1481,8 +1607,8 @@ impl Database {
                 )
                 .optional()
                 .map_err(|e| db_error("failed to read saved topology evidence", e))?;
-            if let Some((saved_fingerprint, saved_json)) = saved
-                && let Ok(saved_set) = serde_json::from_slice::<MediaSet>(&saved_json)
+            if let Some((saved_fingerprint, saved_json)) = &saved
+                && let Ok(saved_set) = serde_json::from_slice::<MediaSet>(saved_json)
                 && !topology_claims_agree(&saved_set, &set)
                 && topology_source_fingerprint(&saved_set, None).as_deref()
                     == Some(saved_fingerprint.as_str())
@@ -1493,6 +1619,22 @@ impl Database {
             let json = serde_json::to_vec(&set).map_err(|e| {
                 ArchiveFsError::Database(format!("failed to serialize topology evidence: {e}"))
             })?;
+            // A refresh that would store the very same evidence writes
+            // nothing. Rewriting an identical row is still a row change: it
+            // fires the Discovery import triggers, which then mark every
+            // untouched import in the library as modified and refuse its
+            // Undo, although nothing about any game changed. A new or
+            // different row is still written, and still marks them.
+            if saved
+                .as_ref()
+                .is_some_and(|(saved_fingerprint, saved_json)| {
+                    *saved_fingerprint == fingerprint && *saved_json == json
+                })
+            {
+                outcome.written += 1;
+                outcome.unchanged += 1;
+                continue;
+            }
             tx.execute(
                 "INSERT INTO media_topology_evidence
                  (set_namespace,set_value,producer,producer_version,producer_schema,source_fingerprint,generation,created_at,refreshed_at,evidence_json)
@@ -1833,6 +1975,9 @@ fn classify_existing_database(path: &Path, migrations: &[Migration]) -> Result<E
     let connection = open_read_only_connection(path)?;
     let version = schema_version(&connection)?;
     let latest = latest_known_version(migrations);
+    if version <= latest {
+        verify_migration_lineage(&connection, migrations)?;
+    }
     if version == latest {
         return Ok(ExistingDatabase::Current);
     }
@@ -1863,7 +2008,8 @@ fn classify_existing_database(path: &Path, migrations: &[Migration]) -> Result<E
     }
     Err(ArchiveFsError::Database(format!(
         "The library database at {} uses schema {version}, but this build requires schema \
-         {latest}. It has not been changed. Upgrade it with \"Scan and upgrade library\" (the \
+         {latest}. It has not been changed. Upgrade it with \"Scan and upgrade library\", or \
+         with `emuwiz-cli library-upgrade --confirm`, which does not scan (both are the \
          protected upgrade that takes a verified backup first); ordinary opens never migrate.",
         path.display()
     )))
@@ -1882,6 +2028,7 @@ fn open_existing_current(path: &Path, migrations: &[Migration]) -> Result<Databa
             path.display()
         )));
     }
+    verify_migration_lineage(&connection, migrations)?;
     Ok(Database {
         connection,
         path: path.to_path_buf(),
@@ -2057,7 +2204,11 @@ fn upgrade_library_database_with_migrations(
         &source_identity,
     )?;
     let backup_path = reservation.backup_path.clone();
-    if let Err(error) = source.backup(MAIN_DB, &backup_path, None) {
+    if let Err(error) = source.backup(
+        MAIN_DB,
+        &backup_path,
+        None::<fn(rusqlite::backup::Progress)>,
+    ) {
         reservation.discard();
         return Err(ArchiveFsError::Database(format!(
             "Could not create a safe pre-upgrade database backup. The library database was not \
@@ -2863,6 +3014,8 @@ fn apply_migrations_checked(
         )));
     }
 
+    verify_migration_lineage(connection, migrations)?;
+
     for migration in migrations {
         if migration.version <= current_version {
             continue;
@@ -3345,6 +3498,10 @@ pub struct ScanRunCounts {
     pub skipped_unsupported_extension: i64,
     pub skipped_ambiguous_platform: i64,
     pub errors_count: i64,
+    /// Exact totals per skip reason, as stored for this run (schema 30) and
+    /// read back after the scan; `None` when the run recorded no breakdown.
+    /// Reports use these, never the coarse columns above, whenever present.
+    pub skip_reasons: Option<crate::SkipReasonCounts>,
 }
 
 /// What the ScummVM folder discovery did during one scan, so a person can be
@@ -3370,6 +3527,14 @@ pub struct ScummVmScanReport {
     /// Recognised library media that sat inside a confirmed ScummVM game
     /// folder and so became part of that game instead of separate rows.
     pub contained_media: Vec<PathBuf>,
+    /// One ScummVM game recognised in several folders that are not identical
+    /// copies (editions, or folders catalogued before): all catalogued, listed
+    /// so a person can decide about spare copies.
+    pub same_game: Vec<(String, Vec<PathBuf>)>,
+    /// `(copy, kept)`: a new folder byte-identical to another folder of the
+    /// same verified game was not catalogued as a second game. Both folders
+    /// are untouched; this is where the copy's path is kept.
+    pub identical_copies: Vec<(PathBuf, PathBuf)>,
     /// `(source, error)` where the detector could not be run or read.
     pub errors: Vec<(PathBuf, String)>,
     pub cache_hits: usize,
@@ -3377,7 +3542,7 @@ pub struct ScummVmScanReport {
 }
 
 /// The outcome of one [`scan_and_persist`] call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanPersistSummary {
     pub scummvm: ScummVmScanReport,
     pub scan_run_id: i64,
@@ -3431,6 +3596,10 @@ pub struct ScanPersistSummary {
     pub ingestion_recognised_sample: Vec<crate::ingestion::GameDiscovery>,
     /// Role-aware arcade aggregation and support-material diagnostics.
     pub arcade_ingestion: crate::ingestion::ArcadeIngestionDiagnostics,
+    /// One entry per nested mount met (or remembered) inside a scanned
+    /// source: whether its games were indexed and whether missing games
+    /// were reconciled there this run, with the reason when not.
+    pub nested_mounts: Vec<NestedMountOutcome>,
 }
 
 impl ScanPersistSummary {
@@ -4127,6 +4296,35 @@ fn persist_library_dat_identity_row(
         LibraryDatIdentityPersistOutcome::Inserted
     };
 
+    // Evidence about to be replaced is kept, in this same transaction, unless
+    // this check re-confirmed the same proof-bearing conclusion (same verdict,
+    // catalogue bytes and content hashes): only then is nothing lost.
+    let reconfirmed = existing.as_ref().is_some_and(|prior| {
+        (prior.audit_file.is_some() || !prior.disc_members.is_empty())
+            && prior.source.catalogue_sha256.is_some()
+            && prior.source.catalogue_sha256 == persisted.source.catalogue_sha256
+            && prior.verification_state == persisted.verification_state
+            && prior.audited_hashes == persisted.audited_hashes
+    });
+    if existing.is_some() && !reconfirmed {
+        conn.execute(
+            "INSERT INTO library_dat_identity_history \
+             (archive_id, archive_path, dat_source_id, verification_state, completeness, audited_at, \
+              revision_marked_stale, facts_json, row_created_at, row_updated_at, replaced_at, replaced_by_state) \
+             SELECT d.archive_id, (SELECT absolute_path_cached FROM archives WHERE id = d.archive_id), \
+                    d.dat_source_id, d.verification_state, d.completeness, d.audited_at, \
+                    d.revision_marked_stale, d.facts_json, d.created_at, d.updated_at, ?3, ?4 \
+             FROM library_dat_identities d WHERE d.archive_id = ?1 AND d.dat_source_id = ?2",
+            params![archive_id, source_id, now, state],
+        )
+        .map_err(|error| db_error("failed to keep replaced library DAT identity", error))?;
+    }
+    conn.execute(
+        "DELETE FROM dat_recheck_attempts WHERE archive_id = ?1 AND dat_source_id = ?2",
+        params![archive_id, source_id],
+    )
+    .map_err(|error| db_error("failed to clear a finished DAT re-check note", error))?;
+
     conn.execute(
         "INSERT INTO library_dat_identities \
          (archive_id, dat_source_id, dat_ecosystem, source_revision, verification_state, \
@@ -4269,6 +4467,27 @@ pub enum PlatformIdentityApplyOutcome {
     UnknownIgnored,
 }
 
+/// Archive ids by stored path; see [`Database::archive_path_lookup`].
+#[derive(Debug, Default)]
+pub struct ArchivePathLookup {
+    ids: HashMap<Vec<u8>, Vec<i64>>,
+}
+
+impl ArchivePathLookup {
+    /// Same answer as [`Database::find_archive_id_by_absolute_path`] at the
+    /// time the lookup was read.
+    pub fn find(&self, path: &Path) -> Result<Option<i64>> {
+        match self.ids.get(path.as_os_str().as_bytes()).map(Vec::as_slice) {
+            None | Some([]) => Ok(None),
+            Some([id]) => Ok(Some(*id)),
+            Some(_) => Err(ArchiveFsError::Database(format!(
+                "{} matches more than one archive row - this indicates a data inconsistency",
+                path.display()
+            ))),
+        }
+    }
+}
+
 /// Counts from enriching a catalogue with one current provider snapshot.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct PlatformIdentityEnrichmentSummary {
@@ -4281,6 +4500,39 @@ pub struct PlatformIdentityEnrichmentSummary {
     pub stale_ignored: usize,
     pub unknown_ignored: usize,
     pub conflict_details: Vec<PlatformIdentityConflictDetail>,
+    /// RomM records whose platform differs from a current, exact DAT
+    /// verification. Shown for review; the verified platform stays current.
+    pub romm_disagreements: usize,
+    pub romm_disagreement_details: Vec<PlatformIdentityConflictDetail>,
+    /// RomM records whose platform differs from the current one, whoever set
+    /// it (a scan, a manual choice, or RomM itself earlier). Shown for review;
+    /// the current platform and its provenance stay as they are.
+    pub romm_suggestions: usize,
+    pub romm_suggestion_details: Vec<RommPlatformSuggestion>,
+}
+
+/// A platform RomM proposes for a game that already has a different one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RommPlatformSuggestion {
+    pub archive_id: i64,
+    /// The current platform, kept.
+    pub current_platform: String,
+    /// Where the current platform came from (its stored source).
+    pub current_source: String,
+    /// RomM's platform, not applied.
+    pub proposed_platform: String,
+    /// Why it needs review rather than being applied.
+    pub reason: &'static str,
+}
+
+impl RommPlatformSuggestion {
+    fn reason_for(current_source: &str) -> &'static str {
+        match current_source {
+            MANUAL_PLATFORM_SOURCE => "RomM disagrees with a platform you chose",
+            ROMM_PLATFORM_SOURCE => "RomM now reports a different platform than it gave before",
+            _ => "RomM disagrees with the platform EmuWiz found from the game's folder or files",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -4289,7 +4541,96 @@ pub struct PlatformIdentityConflictDetail {
     pub evidence: Vec<crate::platform::identity::PlatformIdentityEvidence>,
 }
 
+/// One platform question an import left for a person: the platform kept,
+/// where it came from, the platform RomM proposed, and why it was not applied.
+/// Nothing here is ever written to the library.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PlatformReviewItem {
+    pub archive_id: i64,
+    /// The platform the game keeps (`None` when the conflict leaves it
+    /// without one).
+    pub current_platform: Option<String>,
+    /// Where the kept platform came from, in words.
+    pub current_source: String,
+    /// The platform RomM proposed.
+    pub proposed_platform: String,
+    pub reason: String,
+}
+
+/// Where a stored platform came from, in words.
+pub fn platform_source_words(source: &str) -> &'static str {
+    match source {
+        MANUAL_PLATFORM_SOURCE => "your choice",
+        ROMM_PLATFORM_SOURCE => "from RomM earlier",
+        VERIFIED_DAT_PLATFORM_SOURCE | DAT_ROMM_AGREEMENT_SOURCE => "a verified DAT match",
+        "header_identity" => "from the game's header",
+        "folder_alias" => "from its folder",
+        _ => "found by EmuWiz",
+    }
+}
+
 impl PlatformIdentityEnrichmentSummary {
+    /// Every item this import left for review, in import order: conflicts,
+    /// then RomM disagreeing with a verified DAT match, then RomM suggestions.
+    pub fn review_items(&self) -> Vec<PlatformReviewItem> {
+        use crate::platform::identity::PlatformIdentitySource as Source;
+        fn split(
+            evidence: &[crate::platform::identity::PlatformIdentityEvidence],
+        ) -> (
+            Option<&crate::platform::identity::PlatformIdentityEvidence>,
+            String,
+        ) {
+            let kept = evidence.iter().find(|item| item.source != Source::Romm);
+            let proposed = evidence
+                .iter()
+                .rev()
+                .find(|item| item.source == Source::Romm)
+                .map(|item| item.platform.clone())
+                .unwrap_or_default();
+            (kept, proposed)
+        }
+        let mut items = Vec::new();
+        for conflict in &self.conflict_details {
+            let (kept, proposed) = split(&conflict.evidence);
+            items.push(PlatformReviewItem {
+                archive_id: conflict.archive_id,
+                current_platform: kept.map(|item| item.platform.clone()),
+                current_source: kept
+                    .map(|item| match item.source {
+                        Source::ExistingStrongIdentity => "from the game's header",
+                        Source::VerifiedDat => "a verified DAT match",
+                        Source::Manual => "your choice",
+                        _ => "found by EmuWiz",
+                    })
+                    .unwrap_or("none")
+                    .to_string(),
+                proposed_platform: proposed,
+                reason: "RomM disagrees with the platform EmuWiz read from the game itself"
+                    .to_string(),
+            });
+        }
+        for disagreement in &self.romm_disagreement_details {
+            let (kept, proposed) = split(&disagreement.evidence);
+            items.push(PlatformReviewItem {
+                archive_id: disagreement.archive_id,
+                current_platform: kept.map(|item| item.platform.clone()),
+                current_source: "a verified DAT match".to_string(),
+                proposed_platform: proposed,
+                reason: "RomM disagrees with a verified DAT match".to_string(),
+            });
+        }
+        for suggestion in &self.romm_suggestion_details {
+            items.push(PlatformReviewItem {
+                archive_id: suggestion.archive_id,
+                current_platform: Some(suggestion.current_platform.clone()),
+                current_source: platform_source_words(&suggestion.current_source).to_string(),
+                proposed_platform: suggestion.proposed_platform.clone(),
+                reason: suggestion.reason.to_string(),
+            });
+        }
+        items
+    }
+
     fn note(&mut self, outcome: PlatformIdentityApplyOutcome) {
         match outcome {
             PlatformIdentityApplyOutcome::Applied => self.applied += 1,
@@ -4764,12 +5105,43 @@ impl Database {
             None => {
                 // Discovery ownership rows retain deleted IDs permanently. This
                 // keeps delayed verification/metadata workers from targeting a
-                // different record after selective Undo. Legacy schemas have
-                // no import tombstones and retain their former allocation.
-                let has_import_history: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='discovery_import_records')", [], |r|r.get(0)).map_err(|e|db_error("check retained import identities",e))?;
-                let max_id: i64 = if has_import_history {
-                    tx.query_row("SELECT max(value) FROM (SELECT coalesce(max(id),0) AS value FROM archives UNION ALL SELECT coalesce(max(archive_id),0) AS value FROM discovery_import_records)",[],|r|r.get(0))
-                } else { tx.query_row("SELECT coalesce(max(id),0) FROM archives",[],|r|r.get(0)) }.map_err(|e|db_error("reserve new archive identity",e))?;
+                // different record after selective Undo. Kept DAT evidence and
+                // re-check notes (schema 27) also outlive their game and are
+                // keyed by its id, so those ids are never handed out again
+                // either: a new game must not inherit another game's records
+                // (which would, among other things, refuse its import's Undo
+                // for good). Favourites and collection memberships (schema 28)
+                // outlive their game in the same way. Legacy schemas without
+                // these tables keep their former allocation.
+                let mut sources =
+                    vec!["SELECT coalesce(max(id),0) AS value FROM archives".to_string()];
+                for table in [
+                    "discovery_import_records",
+                    "library_dat_identity_history",
+                    "dat_recheck_attempts",
+                    "game_collection_items",
+                    "dat_catalogue_set_no_matches",
+                ] {
+                    let exists: bool = tx
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+                            [table],
+                            |r| r.get(0),
+                        )
+                        .map_err(|e| db_error("check retained archive identities", e))?;
+                    if exists {
+                        sources.push(format!(
+                            "SELECT coalesce(max(archive_id),0) AS value FROM {table}"
+                        ));
+                    }
+                }
+                let max_id: i64 = tx
+                    .query_row(
+                        &format!("SELECT max(value) FROM ({})", sources.join(" UNION ALL ")),
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| db_error("reserve new archive identity", e))?;
                 let new_id = max_id.checked_add(1).ok_or_else(|| {
                     ArchiveFsError::Database(
                         "Archive identity space exhausted; insertion refused".into(),
@@ -5113,7 +5485,17 @@ impl Database {
                 return Ok(());
             }
         }
+        self.replace_current_platform(archive_id, platform, source)
+    }
 
+    /// Makes `platform` from `source` the current assignment, keeping the
+    /// previous one as history. No precedence checks: callers decide.
+    fn replace_current_platform(
+        &mut self,
+        archive_id: i64,
+        platform: &str,
+        source: &str,
+    ) -> Result<()> {
         let tx = self
             .connection
             .savepoint()
@@ -5223,6 +5605,24 @@ impl Database {
                 {
                     return Ok(PlatformIdentityApplyOutcome::Unchanged);
                 }
+                // Same platform, but the DAT/RomM provenance changed (RomM
+                // started or stopped agreeing with the DAT verification):
+                // store the new provenance so the label is never stale.
+                if current
+                    .as_ref()
+                    .is_some_and(|(current_platform, current_source)| {
+                        current_platform == platform
+                            && matches!(
+                                current_source.as_str(),
+                                ROMM_PLATFORM_SOURCE
+                                    | VERIFIED_DAT_PLATFORM_SOURCE
+                                    | DAT_ROMM_AGREEMENT_SOURCE
+                            )
+                    })
+                {
+                    self.replace_current_platform(archive_id, platform, source)?;
+                    return Ok(PlatformIdentityApplyOutcome::Applied);
+                }
                 self.assign_platform(archive_id, Some(platform), source)?;
                 Ok(PlatformIdentityApplyOutcome::Applied)
             }
@@ -5238,6 +5638,8 @@ impl Database {
         generation: u64,
     ) -> Result<PlatformIdentityEnrichmentSummary> {
         let mut summary = PlatformIdentityEnrichmentSummary::default();
+        // Enrichment never adds or moves archives, so one read serves the run.
+        let archives = self.archive_path_lookup()?;
         for record in &cache.records {
             let Some(provider) =
                 crate::platform::identity::PlatformIdentityEvidence::from_romm(record, generation)
@@ -5248,20 +5650,95 @@ impl Database {
             let Some(path) = record.archivefs_path.as_deref() else {
                 continue;
             };
-            let Some(archive_id) = self.find_archive_id_by_absolute_path(path)? else {
+            let Some(archive_id) = archives.find(path)? else {
                 continue;
             };
             summary.archives_matched += 1;
             let mut evidence = self.current_platform_identity_evidence(archive_id, generation)?;
-            evidence.push(provider);
+            // Beside a DAT verification, this import is RomM's current word:
+            // it replaces the RomM half of a stored DAT/RomM agreement, so a
+            // RomM that now disagrees no longer reads as "Verified by DAT and
+            // RomM" (and one that agrees again restores it).
+            if evidence
+                .iter()
+                .any(|item| item.source == PlatformIdentitySource::VerifiedDat)
+            {
+                evidence.retain(|item| item.source != PlatformIdentitySource::Romm);
+            }
+            evidence.push(provider.clone());
             let resolution =
                 crate::platform::identity::resolve_platform_identity(generation, evidence);
+            // RomM is outside metadata. It fills a platform only where the game
+            // has none. Beside any current platform (a scan's, a manual
+            // choice, or RomM's own earlier answer) agreeing writes nothing,
+            // and disagreeing is shown for review and never applied: a header
+            // identity as a conflict, anything else as a suggestion. A current
+            // DAT verification is handled by the resolver above (RomM's
+            // agreement or disagreement only adjusts its DAT/RomM label).
+            if let Some((current_platform, current_source)) =
+                self.current_platform_assignment(archive_id)?
+                && !matches!(
+                    current_source.as_str(),
+                    VERIFIED_DAT_PLATFORM_SOURCE | DAT_ROMM_AGREEMENT_SOURCE
+                )
+            {
+                let manual = current_source == MANUAL_PLATFORM_SOURCE;
+                if current_platform == provider.platform {
+                    if manual {
+                        summary.manual_preserved += 1;
+                    } else {
+                        summary.unchanged += 1;
+                    }
+                    continue;
+                }
+                // A header identity against RomM is the resolver's conflict;
+                // its apply step writes nothing for a scan-owned row.
+                let header_conflict =
+                    matches!(resolution, PlatformIdentityResolution::Conflict { .. })
+                        && !manual
+                        && current_source != ROMM_PLATFORM_SOURCE;
+                if !header_conflict {
+                    if manual {
+                        summary.manual_preserved += 1;
+                    }
+                    summary.romm_suggestions += 1;
+                    summary
+                        .romm_suggestion_details
+                        .push(RommPlatformSuggestion {
+                            archive_id,
+                            reason: RommPlatformSuggestion::reason_for(&current_source),
+                            current_platform,
+                            current_source,
+                            proposed_platform: provider.platform,
+                        });
+                    continue;
+                }
+            }
             if let PlatformIdentityResolution::Conflict { evidence, .. } = &resolution {
                 summary
                     .conflict_details
                     .push(PlatformIdentityConflictDetail {
                         archive_id,
                         evidence: evidence.clone(),
+                    });
+            }
+            // A verified DAT platform RomM disagrees with: kept, and reported.
+            if let PlatformIdentityResolution::Resolved {
+                platform, evidence, ..
+            } = &resolution
+                && *platform != provider.platform
+                && evidence
+                    .iter()
+                    .any(|item| item.source == PlatformIdentitySource::VerifiedDat)
+            {
+                summary.romm_disagreements += 1;
+                let mut shown = evidence.clone();
+                shown.push(provider.clone());
+                summary
+                    .romm_disagreement_details
+                    .push(PlatformIdentityConflictDetail {
+                        archive_id,
+                        evidence: shown,
                     });
             }
             summary.note(self.apply_platform_identity_resolution(
@@ -5779,6 +6256,63 @@ impl Database {
             .map_err(|error| db_error("failed to look up current platform assignment", error))
     }
 
+    /// Present games of exactly `size` bytes whose current platform is not a
+    /// manual choice, with their absolute paths. Used to restore remembered
+    /// manual choices after a rebuild without reading unrelated files.
+    pub fn archives_without_manual_platform_of_size(
+        &self,
+        size: u64,
+    ) -> Result<Vec<(i64, PathBuf)>> {
+        let size = i64::try_from(size).unwrap_or(i64::MAX);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT a.id, a.absolute_path_cached FROM archives a \
+                 WHERE a.size_bytes = ?1 AND a.last_verified_missing_at IS NULL \
+                 AND a.absolute_path_cached IS NOT NULL \
+                 AND NOT EXISTS (SELECT 1 FROM platform_assignments p WHERE p.archive_id = a.id \
+                 AND p.is_current = 1 AND p.source = ?2) ORDER BY a.id",
+            )
+            .map_err(|error| db_error("failed to prepare manual-choice lookup", error))?;
+        let rows = statement
+            .query_map(params![size, MANUAL_PLATFORM_SOURCE], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|error| db_error("failed to look up games by size", error))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, path) = row.map_err(|error| db_error("failed to read game path", error))?;
+            out.push((id, PathBuf::from(std::ffi::OsString::from_vec(path))));
+        }
+        Ok(out)
+    }
+
+    /// Present library files whose name starts with `<stem>.`: games whose
+    /// RetroArch save names could be confused with this stem's (the same
+    /// stem, or a longer one such as `Bros. 3` for `Bros`). Read-only.
+    pub fn present_archive_paths_named_after(&self, stem: &str) -> Result<Vec<PathBuf>> {
+        let prefix = format!("{stem}.");
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT absolute_path_cached FROM archives \
+                 WHERE last_verified_missing_at IS NULL \
+                 AND substr(CAST(file_name_cached AS BLOB), 1, ?2) = CAST(?1 AS BLOB)",
+            )
+            .map_err(|error| db_error("failed to prepare same-name lookup", error))?;
+        let paths: Vec<Vec<u8>> = stmt
+            .query_map(params![prefix.as_bytes(), prefix.len() as i64], |row| {
+                row.get(0)
+            })
+            .map_err(|error| db_error("failed to look up games with the same name", error))?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(|error| db_error("failed to read games with the same name", error))?;
+        Ok(paths
+            .into_iter()
+            .map(|bytes| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+            .collect())
+    }
+
     /// Looks up the current `archives.id` for the archive whose
     /// `absolute_path_cached` exactly matches `path` (exact bytes - never
     /// a lossy display string; see `Path::as_os_str`/`OsStrExt::as_bytes`).
@@ -5810,6 +6344,63 @@ impl Database {
                 path.display()
             ))),
         }
+    }
+
+    /// Display name and file name (no folder) of each archive in `ids`, for
+    /// listing games without printing where they live.
+    pub fn archive_names(&self, ids: &[i64]) -> Result<HashMap<i64, (String, String)>> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT display_name, file_name_cached FROM archives WHERE id = ?1")
+            .map_err(|error| db_error("failed to prepare archive name lookup", error))?;
+        let mut names = HashMap::new();
+        for &id in ids {
+            let row: Option<(Option<String>, Vec<u8>)> = stmt
+                .query_row(params![id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()
+                .map_err(|error| db_error("failed to read archive name", error))?;
+            if let Some((display, file)) = row {
+                let file = String::from_utf8_lossy(&file).into_owned();
+                let display = display
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| file.clone());
+                names.insert(id, (display, file));
+            }
+        }
+        Ok(names)
+    }
+
+    /// Every archive's path, read in one pass, for a caller that looks up
+    /// many paths in a row (a RomM import does one per record). Matches
+    /// exactly as [`Self::find_archive_id_by_absolute_path`] does: the same
+    /// bytes stored as a BLOB, and a path two archive rows share is an error
+    /// when it is looked up. `absolute_path_cached` has no index, so one
+    /// lookup per record would scan the whole table each time.
+    pub fn archive_path_lookup(&self) -> Result<ArchivePathLookup> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT id, absolute_path_cached FROM archives")
+            .map_err(|error| db_error("failed to prepare archive path list", error))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|error| db_error("failed to list archive paths", error))?;
+        let mut ids: HashMap<Vec<u8>, Vec<i64>> = HashMap::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| db_error("failed to read archive path list", error))?
+        {
+            // `= ?1` with a BLOB parameter only ever equals a BLOB.
+            if let rusqlite::types::ValueRef::Blob(bytes) = row
+                .get_ref(1)
+                .map_err(|error| db_error("failed to read archive path", error))?
+            {
+                let id: i64 = row
+                    .get(0)
+                    .map_err(|error| db_error("failed to read archive id", error))?;
+                ids.entry(bytes.to_vec()).or_default().push(id);
+            }
+        }
+        Ok(ArchivePathLookup { ids })
     }
 
     /// Sets `platform` as a manual, user-chosen platform assignment for
@@ -6571,6 +7162,7 @@ impl Database {
         scan_run_id: i64,
         source_folder_id: i64,
         seen_archive_ids: &[i64],
+        withheld_kinds: &[&str],
     ) -> Result<i64> {
         let status: Option<String> = self
             .connection
@@ -6612,8 +7204,13 @@ impl Database {
                 "source changed while opening missing authority".into(),
             ));
         }
+        // A remembered nested mount the coverage proof did not exclude must
+        // still be proven; one it excluded keeps its rows untouched.
         let unproven = self.unproven_nested_boundaries(source_folder_id, &source_guard)?;
-        if let Some((path, reason)) = unproven.first() {
+        if let Some((path, reason)) = unproven
+            .iter()
+            .find(|(path, _)| !coverage.excluded_roots.iter().any(|r| path.starts_with(r)))
+        {
             return Err(ArchiveFsError::Database(format!(
                 "nested filesystem boundary {} is not proven continuous ({reason}); missing reconciliation withheld",
                 path.display()
@@ -6629,7 +7226,20 @@ impl Database {
             })
             .map(|s| s.root.clone())
             .collect();
-        let mut recorded = coverage.excluded_roots.clone();
+        let areas = catalogue_health::missing_areas(
+            &self.connection,
+            source_folder_id,
+            &source_guard,
+            &coverage.excluded_roots,
+        )?;
+        // Nested mounts may be excluded too; every other exclusion must be
+        // exactly the configured child sources.
+        let mut recorded: Vec<_> = coverage
+            .excluded_roots
+            .iter()
+            .filter(|root| delegated.contains(root) || !areas.boundaries.contains(root))
+            .cloned()
+            .collect();
         delegated.sort();
         recorded.sort();
         if delegated != recorded {
@@ -6681,7 +7291,11 @@ impl Database {
             .into_iter()
             .filter_map(|(id, bytes, kind, current_source)| {
                 let path = PathBuf::from(OsString::from_vec(bytes));
+                // A kind this run could not enumerate (for example ScummVM
+                // folders when the detector failed) keeps its rows untouched;
+                // every other row of the source is still reconciled.
                 if seen.contains(&id)
+                    || withheld_kinds.contains(&kind.as_str())
                     || !path.starts_with(&coverage.root)
                     || coverage
                         .excluded_roots
@@ -6690,8 +7304,12 @@ impl Database {
                 {
                     return None;
                 }
-                let probe = source_guard
-                    .probe(&path, crate::archive_kind_is_directory_item(&kind))
+                let probe = areas
+                    .probe(
+                        &source_guard,
+                        &path,
+                        crate::archive_kind_is_directory_item(&kind),
+                    )
                     .probe;
                 if matches!(
                     probe,
@@ -6718,7 +7336,7 @@ impl Database {
                 "owned candidate could not be probed; missing reconciliation withheld".into(),
             ));
         }
-        if !source_guard.current() {
+        if !source_guard.current() || !areas.current(&source_guard) {
             return Err(ArchiveFsError::Database(
                 "source changed while probing missing candidates".into(),
             ));
@@ -6742,7 +7360,8 @@ impl Database {
                 source_folder_id,
                 &source_guard,
             )?
-            .first()
+            .iter()
+            .find(|(path, _)| !coverage.excluded_roots.iter().any(|r| path.starts_with(r)))
             {
                 return Err(ArchiveFsError::Database(format!(
                     "nested filesystem boundary {} is not proven continuous ({reason}); no missing evidence written",
@@ -6752,6 +7371,13 @@ impl Database {
             Ok(())
         };
         ensure_boundaries_hold(&tx)?;
+        // Nested mounts re-proven under the writer reservation.
+        let areas = catalogue_health::missing_areas(
+            &tx,
+            source_folder_id,
+            &source_guard,
+            &coverage.excluded_roots,
+        )?;
         // Re-checked inside the write transaction, not just before it.
         catalogue_health::assert_missing_authority(
             &tx,
@@ -6763,8 +7389,12 @@ impl Database {
         for archive_id in &missing {
             let (bytes,kind):(Vec<u8>,String)=tx.query_row("SELECT absolute_path_cached,archive_kind FROM archives WHERE id=?1 AND source_folder_id=?2",params![archive_id,source_folder_id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|db_error("revalidate missing row",e))?;
             let path = PathBuf::from(OsString::from_vec(bytes));
-            if source_guard
-                .probe(&path, crate::archive_kind_is_directory_item(&kind))
+            if areas
+                .probe(
+                    &source_guard,
+                    &path,
+                    crate::archive_kind_is_directory_item(&kind),
+                )
                 .probe
                 != crate::emulator_environment::FsProbe::Missing
             {
@@ -6792,8 +7422,12 @@ impl Database {
         }
         for (archive_id, path, kind) in &unseen_headers {
             if !matches!(
-                source_guard
-                    .probe(path, crate::archive_kind_is_directory_item(kind))
+                areas
+                    .probe(
+                        &source_guard,
+                        path,
+                        crate::archive_kind_is_directory_item(kind)
+                    )
                     .probe,
                 crate::emulator_environment::FsProbe::PresentFile
                     | crate::emulator_environment::FsProbe::PresentDirectory
@@ -6811,7 +7445,7 @@ impl Database {
             )
             .map_err(|error| db_error("failed to retire unseen header platform", error))?;
         }
-        if !source_guard.current() {
+        if !source_guard.current() || !areas.current(&source_guard) {
             return Err(ArchiveFsError::Database(
                 "source changed before missing commit".into(),
             ));
@@ -6922,7 +7556,7 @@ impl Database {
             .count();
         if missing > 0 {
             let marked =
-                self.mark_unseen_archives_missing(scan_run_id, source_folder_id, &seen_ids)?;
+                self.mark_unseen_archives_missing(scan_run_id, source_folder_id, &seen_ids, &[])?;
             let counts = ScanRunCounts {
                 archives_seen: archives.len() as i64,
                 archives_unchanged: archives.len() as i64,
@@ -7336,7 +7970,17 @@ impl Database {
         persisted: &crate::dat::library_identity_summary::PersistedLibraryDatIdentity,
     ) -> Result<LibraryDatIdentityPersistOutcome> {
         let now = now_utc_string();
-        persist_library_dat_identity_row(&self.connection, archive_id, persisted, &now)
+        // Keeping the replaced row, clearing its note and writing the new
+        // row are one change.
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| db_error("failed to start library DAT identity transaction", error))?;
+        let outcome = persist_library_dat_identity_row(&tx, archive_id, persisted, &now)?;
+        tx.commit().map_err(|error| {
+            db_error("failed to commit library DAT identity transaction", error)
+        })?;
+        Ok(outcome)
     }
 
     /// The stored DAT identity for one library item and one DAT source, if
@@ -7505,12 +8149,15 @@ impl Database {
         outcome: &crate::dat::sources::audit_run::DatAuditOutcome,
         scope: Option<&crate::dat::library_verification::VerificationScope>,
     ) -> Result<LibraryDatIdentityAuditPersistOutcome> {
-        // Reads and writes share one SQLite snapshot. Concurrent membership
-        // changes either precede validation or prevent upgrading this transaction.
-        let tx = self
-            .connection
-            .unchecked_transaction()
-            .map_err(|error| db_error("failed to start library DAT identity transaction", error))?;
+        // Reads and writes share one SQLite snapshot. The write lock is taken
+        // at the start (waiting out another writer for the busy timeout), so
+        // a membership change either precedes validation or waits for this
+        // save; a save is never refused only because it had read first.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|error| db_error("failed to start library DAT identity transaction", error))?;
         if let Some(scope) = scope {
             scope
                 .validate(&self.load_archives()?, outcome)
@@ -9507,6 +10154,15 @@ pub(crate) fn scan_and_persist_folders_with_skipped(
                 database.rollback_catalogue_refresh();
                 return Err(error);
             }
+            // Manual system choices outlive the database: restore any the
+            // catalogue lost (rebuild, restore, re-added folder). Best effort;
+            // only same-size files are read.
+            let store = crate::manual_platform_choices::store_path(database.path());
+            if store.exists()
+                && let Err(error) = crate::manual_platform_choices::restore(database, &store)
+            {
+                eprintln!("emuwiz: remembered system choices not restored: {error}");
+            }
             Ok(summary)
         }
         Err(error) => {
@@ -9544,6 +10200,7 @@ fn scan_and_persist_folders_transaction(
     let mut folder_errors = Vec::new();
     let mut platform_assignment_warnings = Vec::new();
     let mut preservation_fingerprint_warnings = Vec::new();
+    let mut nested_mounts = Vec::new();
     let mut scummvm_report = ScummVmScanReport::default();
     let mut skipped_files: Vec<crate::SkippedFile> = Vec::new();
     let mut ingestion_stats = crate::ingestion::DiscoveryStats::default();
@@ -9652,8 +10309,17 @@ fn scan_and_persist_folders_transaction(
             // the other systems sharing a mixed source root.
             excluded_roots.extend(sets.sets.iter().map(|set| set.path.clone()));
         }
+        // Remembered nested mounts: which are the same trusted mount as last
+        // time (only those may reuse cached observations).
+        let area_plans = match crate::catalogue_health::BoundRoot::open(&folder.path)
+            .filter(|root| Some(root.identity) == covered.root_identity)
+        {
+            Some(root) => nested_scan::plan_areas(database, folder.id, &root)?,
+            None => Vec::new(),
+        };
         let discovery_started = std::time::Instant::now();
         let discovery = match ArchiveScanner::new(&folder_config)
+            .with_trusted_nested_areas(nested_scan::trusted_paths(&area_plans))
             .scan_archives_with_cache_excluding(&fingerprint_refs, &excluded_roots)
         {
             Ok(discovery) => discovery,
@@ -9678,47 +10344,48 @@ fn scan_and_persist_folders_transaction(
                 continue;
             }
         };
-        // A nested filesystem seen on an earlier scan that has vanished or been
-        // replaced makes everything beneath it unprovable, not deleted.
-        let mut boundary_diagnostic = None;
+        #[cfg(test)]
+        nested_scan::test_hook::run();
+        // Every nested mount is its own ownership boundary, settled against
+        // the live filesystem: indexed through its own pinned root when it is
+        // still the mount discovery read, reconciled only when it is also the
+        // same trusted mount as last time. Anything else is excluded from
+        // Missing, so its existing entries are kept exactly as they were.
+        let mut settled_areas = nested_scan::SettledAreas::default();
         if let Some(root) = crate::catalogue_health::BoundRoot::open(&folder.path)
             && Some(root.identity) == covered.root_identity
         {
-            let mut unproven = database.unproven_nested_boundaries(folder.id, &root)?;
-            unproven.extend(database.record_nested_boundaries(
+            database.record_nested_boundaries(folder.id, &root, &discovery.nested_boundaries)?;
+            settled_areas = nested_scan::settle_areas(
+                database,
                 folder.id,
                 &root,
-                &discovery.nested_boundaries,
-            )?);
-            unproven.sort();
-            unproven.dedup_by(|a, b| a.0 == b.0);
-            if !unproven.is_empty() {
-                boundary_diagnostic = Some(
-                    unproven
-                        .iter()
-                        .map(|(path, reason)| {
-                            format!("nested filesystem boundary {} ({reason})", path.display())
-                        })
-                        .collect::<Vec<_>>()
-                        .join("; "),
+                &area_plans,
+                &discovery.nested_areas,
+            )?;
+        } else {
+            for area in &discovery.nested_areas {
+                settled_areas.dropped.push(area.path.clone());
+                settled_areas.excluded.push(area.path.clone());
+            }
+        }
+        for outcome in &settled_areas.outcomes {
+            if !outcome.state.reconciled() {
+                log::warn!(
+                    "nested mount {} {:?}: {}; its existing entries are not reconciled this scan",
+                    outcome.path.display(),
+                    outcome.state,
+                    outcome.detail.as_deref().unwrap_or("")
                 );
             }
         }
-        if let Some(detail) = &boundary_diagnostic {
-            log::warn!(
-                "{detail}; catalogue evidence preserved and missing reconciliation withheld"
-            );
-            counts.errors_count += 1;
-            folder_errors.push((
-                folder.path.clone(),
-                format!(
-                    "{detail} is not proven continuous; catalogue evidence preserved and missing reconciliation withheld"
-                ),
-            ));
-            covered.diagnostic = Some(detail.clone());
-        }
-        let discovery_complete =
-            discovery.is_complete() && arcade_complete && boundary_diagnostic.is_none();
+        nested_mounts.extend(settled_areas.outcomes.iter().cloned());
+        covered
+            .excluded_roots
+            .extend(settled_areas.excluded.iter().cloned());
+        covered.excluded_roots.sort();
+        covered.excluded_roots.dedup();
+        let discovery_complete = discovery.is_complete() && arcade_complete;
         covered.state = if discovery_complete {
             ScanCoverageState::Complete
         } else {
@@ -9778,6 +10445,7 @@ fn scan_and_persist_folders_transaction(
         );
         counts.skipped_unsupported_extension += discovery.skipped_unsupported_extension as i64;
         counts.skipped_ambiguous_platform += discovery.skipped_ambiguous_platform as i64;
+        database.record_scan_skip_counts(scan_run_id, folder.id, &discovery.skip_reason_counts)?;
         // Re-bounded across the whole multi-folder run, not just within one
         // folder's own `ArchiveScanDiscovery::skipped_files` (each of which
         // is already independently capped at `MAX_RETAINED_SKIPPED_FILES` -
@@ -9887,9 +10555,14 @@ fn scan_and_persist_folders_transaction(
             }
         }
         let mut archives = discovery.archives;
+        archives.retain(|archive| !settled_areas.is_dropped(&archive.path));
+        ingestion_evidence.retain(|evidence| !settled_areas.is_dropped(&evidence.path));
         if let Some(Ok(arcade_sets)) = arcade_sets {
             arcade_ingestion.merge(&arcade_sets.diagnostics);
             for set in arcade_sets.sets {
+                if settled_areas.is_dropped(&set.path) {
+                    continue;
+                }
                 if let Some(archive) = Archive::from_arcade_set_directory(&set.path, &folder.path) {
                     archives.retain(|candidate| !candidate.path.starts_with(&set.path));
                     archives.push(archive);
@@ -9901,8 +10574,9 @@ fn scan_and_persist_folders_transaction(
         // recognises; a failure leaves the rest of the scan untouched.
         scummvm_report.sources_considered += 1;
         // A discovery that could not run or be trusted is not evidence that
-        // ScummVM folders are gone: the source is then incomplete for the
-        // purpose of marking anything missing.
+        // ScummVM folders are gone: their rows (`scummvm_directory`) are then
+        // withheld from missing reconciliation. Every other row is still
+        // reconciled.
         let mut scummvm_incomplete = false;
         let scummvm_executable = crate::scummvm_detection::resolve_scummvm_executable();
         if scummvm_executable.is_some()
@@ -9920,56 +10594,116 @@ fn scan_and_persist_folders_transaction(
             scummvm_report.detector_available = true;
             let cache_path = scummvm_discovery_cache_path(database.path());
             let mut cache = load_scummvm_discovery_cache(&cache_path);
-            let cache_key = folder.path.display().to_string();
-            let started = std::time::Instant::now();
-            match crate::scummvm_detection::discover_scummvm_game_directories_cached(
+            let catalogued_games = catalogued_scummvm_game_folders(database, &folder.path);
+            // The budget covers choosing the roots too.
+            let budget = crate::scummvm_detection::source_discovery_budget();
+            let budget_started = std::time::Instant::now();
+            let (roots, truncated) = crate::scummvm_detection::discovery_roots_reporting(
                 &folder.path,
-                &executable,
-                cache.get(&cache_key),
-            ) {
-                Ok((found, entry)) => {
-                    let hit = entry
-                        .as_ref()
-                        .is_some_and(|e| cache.get(&cache_key) == Some(e));
-                    if hit {
-                        scummvm_report.cache_hits += 1;
-                    } else {
-                        scummvm_report.detector_runs += 1;
-                    }
-                    info!(
-                        "scummvm discovery for {} took {} ms (cache {})",
-                        folder.path.display(),
-                        started.elapsed().as_millis(),
-                        if hit { "hit" } else { "miss" }
-                    );
-                    match entry {
-                        Some(entry) => {
-                            cache.insert(cache_key, entry);
+                &catalogued_games,
+                Some(budget_started + budget),
+            );
+            if let Some(note) = truncated {
+                // Games past the bound were not searched: never evidence
+                // that ScummVM folders are gone.
+                scummvm_report.errors.push((folder.path.clone(), note));
+                scummvm_incomplete = true;
+            }
+            for (searched, detection_root) in roots.iter().cloned().enumerate() {
+                // Bounded per source: past the budget the remaining roots are
+                // not searched, so only ScummVM rows are withheld from
+                // missing reconciliation; nothing else waits on ScummVM.
+                if budget_started.elapsed() >= budget {
+                    scummvm_report.errors.push((
+                        detection_root.clone(),
+                        format!(
+                            "the ScummVM search time budget ({} s) was used up; {} of {} folders were not searched",
+                            budget.as_secs(),
+                            roots.len() - searched,
+                            roots.len()
+                        ),
+                    ));
+                    scummvm_incomplete = true;
+                    break;
+                }
+                let cache_key = detection_root.display().to_string();
+                let started = std::time::Instant::now();
+                match crate::scummvm_detection::discover_scummvm_game_directories_cached(
+                    &detection_root,
+                    &executable,
+                    cache.get(&cache_key),
+                ) {
+                    Ok((found, entry)) => {
+                        let hit = entry
+                            .as_ref()
+                            .is_some_and(|e| cache.get(&cache_key) == Some(e));
+                        if hit {
+                            scummvm_report.cache_hits += 1;
+                        } else {
+                            scummvm_report.detector_runs += 1;
                         }
-                        None => {
-                            cache.remove(&cache_key);
+                        info!(
+                            "scummvm discovery for {} took {} ms (cache {})",
+                            detection_root.display(),
+                            started.elapsed().as_millis(),
+                            if hit { "hit" } else { "miss" }
+                        );
+                        match entry {
+                            Some(entry) => {
+                                cache.insert(cache_key, entry);
+                            }
+                            None => {
+                                cache.remove(&cache_key);
+                            }
                         }
-                    }
-                    save_scummvm_discovery_cache(&cache_path, &cache);
-                    scummvm_report.ambiguous.extend(found.ambiguous);
-                    scummvm_report.rejected.extend(found.rejected);
-                    scummvm_report
-                        .unknown_variants
-                        .extend(found.unknown_variants.into_iter().map(|game| game.path));
-                    for game in found.games {
-                        if let Some(archive) = Archive::from_scummvm_directory(
-                            &game.path,
-                            &folder.path,
-                            game.game.description.as_deref(),
-                        ) {
-                            scummvm_report.games_found += 1;
-                            // The folder is one game; media the file scanner
-                            // recognised inside it is part of that game, not
-                            // separate rows - said so, never silently dropped.
+                        save_scummvm_discovery_cache(&cache_path, &cache);
+                        scummvm_report.ambiguous.extend(found.ambiguous);
+                        scummvm_report.rejected.extend(found.rejected);
+                        scummvm_report.rejected.extend(found.outside_root);
+                        // One game, one entry: a new byte-identical copy of a
+                        // folder with the same verified identity is reported,
+                        // not catalogued twice (owner decision 2026-11-19).
+                        // Folders that already have rows keep them.
+                        // The comparison stays inside this source's time budget;
+                        // a folder it could not finish is left undecided (not
+                        // catalogued, not called a copy) and the search is
+                        // incomplete, so no ScummVM row is called missing.
+                        let with_rows = scummvm_folders_with_rows(database, &folder.path);
+                        let verdicts = crate::scummvm_detection::identical_new_copies(
+                            &found.games,
+                            |path| with_rows.iter().any(|row| row == path),
+                            Some(budget_started + budget),
+                        );
+                        if !verdicts.undecided.is_empty() {
+                            scummvm_incomplete = true;
+                            scummvm_report.errors.push((
+                                detection_root.clone(),
+                                format!(
+                                    "the ScummVM search time budget ran out while comparing {} possible duplicate folder(s); they were not added and are checked again next scan",
+                                    verdicts.undecided.len()
+                                ),
+                            ));
+                        }
+                        let copies = verdicts.copies;
+                        let is_copy = |path: &Path| {
+                            copies.iter().any(|(copy, _)| copy == path)
+                                || verdicts.undecided.iter().any(|held| held == path)
+                        };
+                        // A copy is part of its game: recognised files inside
+                        // it do not become new loose rows. Files that already
+                        // have rows keep them exactly as they are (nothing
+                        // replaces them, so dropping them would call files on
+                        // disk missing).
+                        for (copy, _) in &copies {
+                            let recorded = rows_under(database, &folder.path, copy);
+                            let absorbed = |candidate: &Archive| {
+                                candidate.path.starts_with(copy)
+                                    && !recorded.iter().any(|row| row == &candidate.path)
+                            };
                             scummvm_report.contained_media.extend(
                                 archives
                                     .iter()
-                                    .filter(|candidate| candidate.path.starts_with(&game.path))
+                                    .filter(|candidate| absorbed(candidate))
                                     .filter(|candidate| {
                                         crate::ingestion::support_material_kind(
                                             &candidate.path,
@@ -9980,24 +10714,89 @@ fn scan_and_persist_folders_transaction(
                                     })
                                     .map(|candidate| candidate.path.clone()),
                             );
-                            archives.retain(|candidate| !candidate.path.starts_with(&game.path));
-                            archives.push(archive);
+                            archives.retain(|candidate| !absorbed(candidate));
+                        }
+                        scummvm_report.same_game.extend(
+                            found
+                                .same_game
+                                .into_iter()
+                                .map(|(id, paths)| {
+                                    (
+                                        id,
+                                        paths
+                                            .into_iter()
+                                            .filter(|p| !is_copy(p))
+                                            .collect::<Vec<_>>(),
+                                    )
+                                })
+                                .filter(|(_, paths)| paths.len() > 1),
+                        );
+                        let found_games: Vec<_> = found
+                            .games
+                            .into_iter()
+                            .filter(|game| !is_copy(&game.path))
+                            .collect();
+                        scummvm_report.identical_copies.extend(copies);
+                        // A row EmuWiz cannot read may be a game: said so, and
+                        // ScummVM rows of this source are kept from Missing.
+                        if !found.unreadable.is_empty() {
+                            scummvm_incomplete = true;
+                            for line in found.unreadable {
+                                scummvm_report.errors.push((
+                                    detection_root.clone(),
+                                    format!(
+                                        "ScummVM printed a result EmuWiz could not read: {line}"
+                                    ),
+                                ));
+                            }
+                        }
+                        scummvm_report
+                            .unknown_variants
+                            .extend(found.unknown_variants.into_iter().map(|game| game.path));
+                        for game in found_games {
+                            if let Some(archive) = Archive::from_scummvm_directory(
+                                &game.path,
+                                &folder.path,
+                                game.game.description.as_deref(),
+                            ) {
+                                scummvm_report.games_found += 1;
+                                // The folder is one game; media the file scanner
+                                // recognised inside it is part of that game, not
+                                // separate rows - said so, never silently dropped.
+                                scummvm_report.contained_media.extend(
+                                    archives
+                                        .iter()
+                                        .filter(|candidate| candidate.path.starts_with(&game.path))
+                                        .filter(|candidate| {
+                                            crate::ingestion::support_material_kind(
+                                                &candidate.path,
+                                                &folder.path,
+                                                folder.role,
+                                            )
+                                            .is_none()
+                                        })
+                                        .map(|candidate| candidate.path.clone()),
+                                );
+                                archives
+                                    .retain(|candidate| !candidate.path.starts_with(&game.path));
+                                archives.push(archive);
+                            }
                         }
                     }
-                }
-                Err(error) => {
-                    info!(
-                        "scummvm discovery skipped for {}: {error}",
-                        folder.path.display()
-                    );
-                    scummvm_report
-                        .errors
-                        .push((folder.path.clone(), error.to_string()));
-                    scummvm_incomplete = true;
-                    // A cached entry that was rejected (or any entry for a run
-                    // that failed) must not be consumed again: the next scan
-                    // asks ScummVM afresh. Other sources' entries are kept.
-                    evict_scummvm_discovery_entry(&cache_path, &mut cache, &cache_key);
+                    Err(error) => {
+                        info!(
+                            "scummvm discovery skipped for {}: {error}",
+                            detection_root.display()
+                        );
+                        scummvm_report
+                            .errors
+                            .push((detection_root.clone(), error.to_string()));
+                        scummvm_incomplete = true;
+                        // A cached entry that was rejected (or any entry for a run
+                        // that failed) must not be consumed again: the next scan
+                        // asks ScummVM afresh. Other sources' entries are kept.
+                        evict_scummvm_discovery_entry(&cache_path, &mut cache, &cache_key);
+                    }
                 }
             }
         }
@@ -10016,7 +10815,10 @@ fn scan_and_persist_folders_transaction(
         }
         archives.sort_by(|left, right| left.path.cmp(&right.path));
         archives.dedup_by(|left, right| left.path == right.path);
-        let non_archive_fingerprints = discovery.non_archive_fingerprints;
+        let mut non_archive_fingerprints = discovery.non_archive_fingerprints;
+        non_archive_fingerprints.retain(|fingerprint| {
+            !settled_areas.is_dropped(&folder.path.join(&fingerprint.relative_path))
+        });
         // An inspection the detector reports as incomplete keeps whatever
         // the row already says, is shown as needing a retry, and keeps no
         // fingerprint, so the next scan looks at the file again.
@@ -10060,24 +10862,62 @@ fn scan_and_persist_folders_transaction(
         }
         database.record_scan_coverage(scan_run_id, covered)?;
         database.begin_folder_refresh()?;
+        let identities_recorded = match crate::catalogue_health::BoundRoot::open(&folder.path)
+            .filter(|root| Some(root.identity) == covered.root_identity)
+        {
+            Some(root) => {
+                nested_scan::record_identities(database, folder.id, &root, &settled_areas)
+            }
+            None => Err(ArchiveFsError::Database(
+                "source changed before nested mount identities were saved".into(),
+            )),
+        };
+        #[cfg(test)]
+        nested_scan::test_hook::run_before_persist();
         let db_write_started = std::time::Instant::now();
-        let persist_complete = discovery_complete && !scummvm_incomplete;
+        // A ScummVM detector failure says nothing about the files the archive
+        // scanner enumerated: only ScummVM folder rows are withheld from
+        // missing reconciliation (run 210 lost all of it to one timeout).
+        let persist_complete = discovery_complete;
+        let withheld_missing_kinds: &[&str] = if scummvm_incomplete {
+            &["scummvm_directory"]
+        } else {
+            &[]
+        };
         let fully_reused = !arcade_specialist
             && persist_complete
+            && !scummvm_incomplete
             && discovery.timings.re_inspected == 0
             && non_archive_fingerprints.is_empty();
-        let persisted = if fully_reused {
-            database
+        let persisted = match identities_recorded {
+            Err(error) => Err(error),
+            Ok(()) if fully_reused => database
                 .reconcile_fully_reused_source(scan_run_id, folder, &archives)?
                 .map(Ok)
                 .unwrap_or_else(|| {
-                    persist_one_folder(database, scan_run_id, folder, &archives, persist_complete)
-                })
-        } else {
-            persist_one_folder(database, scan_run_id, folder, &archives, persist_complete)
+                    persist_one_folder(
+                        database,
+                        scan_run_id,
+                        folder,
+                        &archives,
+                        persist_complete,
+                        withheld_missing_kinds,
+                        &settled_areas,
+                    )
+                }),
+            Ok(()) => persist_one_folder(
+                database,
+                scan_run_id,
+                folder,
+                &archives,
+                persist_complete,
+                withheld_missing_kinds,
+                &settled_areas,
+            ),
         };
         let persisted = persisted.and_then(|result| {
             if crate::catalogue_health::source_root_identity(&folder.path) != covered.root_identity
+                || !settled_areas.owners_current()
                 || !database.source_binding_current(folder.id, &folder.path)?
             {
                 Err(ArchiveFsError::Database(
@@ -10230,6 +11070,9 @@ fn scan_and_persist_folders_transaction(
             )
             .map_err(|e| db_error("record incomplete scan", e))?;
     }
+    // Reports read the stored totals back, so the CLI, the scan report and
+    // Attention all show the same persisted figures.
+    counts.skip_reasons = database.scan_run_skip_counts(scan_run_id)?;
 
     Ok(ScanPersistSummary {
         scummvm: scummvm_report,
@@ -10245,6 +11088,7 @@ fn scan_and_persist_folders_transaction(
         ingestion_skipped,
         ingestion_recognised_sample,
         arcade_ingestion,
+        nested_mounts,
     })
 }
 
@@ -10255,6 +11099,79 @@ fn scummvm_discovery_cache_path(database: &Path) -> PathBuf {
     let mut name = database.as_os_str().to_os_string();
     name.push(".scummvm-discovery.json");
     PathBuf::from(name)
+}
+
+/// Present `scummvm_directory` rows of the source at `source_path`, so
+/// narrowed ScummVM discovery keeps covering games an earlier search found.
+/// A read failure yields none: discovery then covers the ScummVM folders only,
+/// and nothing is marked missing because of it.
+/// Rows of this source stored under `folder` (any kind, present or missing),
+/// spelled both as stored and canonically.
+fn rows_under(database: &Database, source_path: &Path, folder: &Path) -> Vec<PathBuf> {
+    let Ok(mut statement) = database.connection.prepare(
+        "SELECT a.absolute_path_cached FROM archives a
+           JOIN source_folders s ON s.id = a.source_folder_id
+          WHERE s.path = ?1",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = statement.query_map([source_path.as_os_str().as_bytes()], |row| {
+        row.get::<_, Vec<u8>>(0)
+    }) else {
+        return Vec::new();
+    };
+    rows.filter_map(|row| row.ok())
+        .map(|bytes| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+        .flat_map(|path| {
+            let canonical = path.canonicalize().ok();
+            std::iter::once(path).chain(canonical)
+        })
+        .filter(|path| path.starts_with(folder))
+        .collect()
+}
+
+/// Every ScummVM folder of this source that has a row, present or missing,
+/// spelled both as stored and canonically: a folder with any history is never
+/// treated as a new copy.
+fn scummvm_folders_with_rows(database: &Database, source_path: &Path) -> Vec<PathBuf> {
+    let Ok(mut statement) = database.connection.prepare(
+        "SELECT a.absolute_path_cached FROM archives a
+           JOIN source_folders s ON s.id = a.source_folder_id
+          WHERE s.path = ?1 AND a.archive_kind = 'scummvm_directory'",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = statement.query_map([source_path.as_os_str().as_bytes()], |row| {
+        row.get::<_, Vec<u8>>(0)
+    }) else {
+        return Vec::new();
+    };
+    rows.filter_map(|row| row.ok())
+        .map(|bytes| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+        .flat_map(|path| {
+            let canonical = path.canonicalize().ok();
+            std::iter::once(path).chain(canonical)
+        })
+        .collect()
+}
+
+fn catalogued_scummvm_game_folders(database: &Database, source_path: &Path) -> Vec<PathBuf> {
+    let Ok(mut statement) = database.connection.prepare(
+        "SELECT a.absolute_path_cached FROM archives a
+           JOIN source_folders s ON s.id = a.source_folder_id
+          WHERE s.path = ?1 AND a.archive_kind = 'scummvm_directory'
+            AND a.last_verified_missing_at IS NULL",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = statement.query_map([source_path.as_os_str().as_bytes()], |row| {
+        row.get::<_, Vec<u8>>(0)
+    }) else {
+        return Vec::new();
+    };
+    rows.filter_map(|row| row.ok())
+        .map(|bytes| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+        .collect()
 }
 
 const MAX_SCUMMVM_DISCOVERY_CACHE_BYTES: u64 = 16 * 1024 * 1024;
@@ -10323,19 +11240,30 @@ fn persist_one_folder(
     folder: &RegisteredSourceFolder,
     archives: &[Archive],
     complete: bool,
+    withheld_missing_kinds: &[&str],
+    areas: &nested_scan::SettledAreas,
 ) -> Result<ScanRunCounts> {
     let mut counts = ScanRunCounts::default();
     let mut seen_archive_ids = Vec::with_capacity(archives.len());
 
     let identity = crate::catalogue_health::source_root_identity(&folder.path);
     for archive in archives {
+        // Inside a nested mount, ownership is proven from that mount's own
+        // pinned root (still no crossing of any further mount); elsewhere
+        // from the source root. A game in an unsaved mount never gets here.
+        let owner = areas.owner_of(&archive.path);
+        let (owner_root, owner_identity) = match owner {
+            Some(owner) => (owner.root.as_path(), Some(owner.identity)),
+            None => (folder.path.as_path(), identity),
+        };
         if folder
             .excluded_source_roots
             .iter()
             .any(|root| archive.path.starts_with(root))
+            || areas.is_dropped(&archive.path)
             || !crate::catalogue_health::observe_owned(
-                &folder.path,
-                identity,
+                owner_root,
+                owner_identity,
                 &archive.path,
                 matches!(
                     archive.kind,
@@ -10348,7 +11276,10 @@ fn persist_one_folder(
                 "positive observation outside safe source ownership".into(),
             ));
         }
-        revalidate_archive_for_catalogue(archive)?;
+        crate::revalidate_archive_within(
+            archive,
+            owner.map(|owner| (owner.root.as_path(), owner.identity, owner.mount_id)),
+        )?;
         let outcome = database.upsert_archive(folder.id, &folder.path, archive)?;
         let incomplete = !archive.identity.inspection_problems.is_empty();
         database.set_inspection_retry_mark(outcome.archive_id, incomplete)?;
@@ -10423,8 +11354,12 @@ fn persist_one_folder(
     }
 
     if complete {
-        counts.archives_missing =
-            database.mark_unseen_archives_missing(scan_run_id, folder.id, &seen_archive_ids)?;
+        counts.archives_missing = database.mark_unseen_archives_missing(
+            scan_run_id,
+            folder.id,
+            &seen_archive_ids,
+            withheld_missing_kinds,
+        )?;
     }
 
     Ok(counts)
@@ -11107,21 +12042,21 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 16);
-        assert_eq!(report.to_version, 26);
+        assert_eq!(report.to_version, 30);
         assert_eq!(
             report.applied_versions,
-            vec![17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+            vec![17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
         );
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 26);
+        assert_eq!(upgraded.schema_version().unwrap(), 30);
         let source = upgraded.list_source_folders().unwrap();
         assert_eq!(source.len(), 1);
         assert_eq!(source[0].role, SourceRole::Games);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         assert_eq!(
             pending_schema_migration_versions(19).unwrap(),
-            vec![20, 21, 22, 23, 24, 25, 26]
+            vec![20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
         );
 
         let quick_check: String = upgraded
@@ -11141,11 +12076,14 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 20);
-        assert_eq!(report.to_version, 26);
-        assert_eq!(report.applied_versions, vec![21, 22, 23, 24, 25, 26]);
+        assert_eq!(report.to_version, 30);
+        assert_eq!(
+            report.applied_versions,
+            vec![21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
+        );
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 26);
+        assert_eq!(upgraded.schema_version().unwrap(), 30);
         assert_eq!(upgraded.list_source_folders().unwrap().len(), 1);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         let table_count: i64 = upgraded
@@ -11160,7 +12098,7 @@ mod tests {
         upgraded.close().unwrap();
 
         let reopened = Database::open_read_only(&database_path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 26);
+        assert_eq!(reopened.schema_version().unwrap(), 30);
         reopened.close().unwrap();
         let _ = fs::remove_dir_all(root);
     }
@@ -11658,6 +12596,7 @@ mod tests {
 
     fn captured(device: u64, inode: u64, size: u64, mtime: u64) -> CapturedFileIdentity {
         CapturedFileIdentity {
+            changed: None,
             device,
             inode,
             size,
@@ -12017,20 +12956,27 @@ mod tests {
                 "archive_scan_observations",
                 "archives",
                 "catalogue_health_epoch",
+                "dat_catalogue_set_no_matches",
+                "dat_catalogue_sets",
                 "dat_expected_entries",
                 "dat_expected_inventory_meta",
+                "dat_recheck_attempts",
                 "dat_set_audit_dependencies",
                 "dat_set_audit_results",
                 "discovery_details",
                 "discovery_import_operations",
                 "discovery_import_records",
+                "game_collection_items",
+                "game_collections",
                 "library_dat_identities",
+                "library_dat_identity_history",
                 "mame_member_evidence",
                 "media_topology_evidence",
                 "mod_catalogue_records",
                 "platform_aliases",
                 "platform_assignments",
                 "scan_fingerprints",
+                "scan_run_skip_counts",
                 "scan_runs",
                 "scan_source_coverage",
                 "schema_migrations",
@@ -12040,6 +12986,7 @@ mod tests {
                 "source_nested_boundaries",
                 "source_review_required",
                 "source_scan_bindings",
+                "sqlite_sequence",
                 "verified_identity_facts",
             ]
         );
@@ -13036,6 +13983,158 @@ mod tests {
             Some(new_contents.len() as u64)
         );
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Loose `.bin` cartridges (run 210: 1,592 ambiguous `.bin`) in a system's
+    /// own folder: an identical copy of a catalogued ZIP is reported, not
+    /// catalogued twice; a same-name different-content file and a new ROM
+    /// are catalogued; nested data is left alone; no file is touched, and a
+    /// rescan neither adds nor marks anything missing.
+    #[test]
+    fn loose_bin_cartridges_are_catalogued_without_duplicating_zipped_copies() {
+        use std::io::Write;
+        let root = temp_dir("loose-bin-cartridges");
+        let source = root.join("games");
+        let folder = source.join("atari2600");
+        fs::create_dir_all(folder.join("extras")).unwrap();
+        let rom = |seed: u8, size: usize| -> Vec<u8> {
+            (0..size)
+                .map(|i| (i as u8).wrapping_mul(13).wrapping_add(seed))
+                .collect()
+        };
+        let zip_with = |path: &Path, name: &str, bytes: &[u8]| {
+            let mut writer = zip::ZipWriter::new(fs::File::create(path).unwrap());
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+            writer.finish().unwrap();
+        };
+        let amidar = rom(1, 4096);
+        zip_with(&folder.join("Amidar.zip"), "Amidar (USA).bin", &amidar);
+        zip_with(
+            &folder.join("Combat.zip"),
+            "Combat (USA).bin",
+            &rom(2, 2048),
+        );
+        fs::write(folder.join("Amidar (USA).bin"), &amidar).unwrap();
+        fs::write(folder.join("Combat (USA).bin"), rom(3, 2048)).unwrap();
+        fs::write(folder.join("Homebrew.bin"), rom(4, 8192)).unwrap();
+        fs::write(folder.join("extras/data.bin"), rom(5, 4096)).unwrap();
+
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        let summary = scan_and_persist(&mut database, &config, "test").unwrap();
+        let mut catalogued: Vec<String> = database
+            .load_archives()
+            .unwrap()
+            .iter()
+            .map(|row| row.relative_path.display().to_string())
+            .collect();
+        catalogued.sort();
+        assert_eq!(
+            catalogued,
+            [
+                "atari2600/Amidar.zip",
+                "atari2600/Combat (USA).bin",
+                "atari2600/Combat.zip",
+                "atari2600/Homebrew.bin",
+            ]
+        );
+        assert!(
+            summary.skipped_files.iter().any(|skipped| {
+                skipped.path == folder.join("Amidar (USA).bin")
+                    && skipped.reason == crate::SkipReason::IdenticalCopy
+            }),
+            "{:?}",
+            summary.skipped_files
+        );
+        let platform: String = database
+            .connection
+            .query_row(
+                "SELECT p.platform FROM platform_assignments p JOIN archives a ON a.id = p.archive_id
+                  WHERE p.is_current = 1 AND CAST(a.relative_path AS TEXT) = 'atari2600/Homebrew.bin'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(platform, "Atari2600");
+
+        let again = scan_and_persist(&mut database, &config, "test").unwrap();
+        assert_eq!(again.counts.archives_added, 0, "{again:?}");
+        assert_eq!(again.counts.archives_missing, 0, "{again:?}");
+        // Attention: the identical copy is a recognised duplicate, not an
+        // unsupported format (the nested data file stays "ambiguous").
+        let attention = database.attention_snapshot().unwrap();
+        let discovery = |category: crate::attention::AttentionCategory| {
+            attention
+                .items()
+                .filter(|item| item.category == category && item.id.starts_with("discovery:"))
+                .map(|item| item.affected_count)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            discovery(crate::attention::AttentionCategory::Unsupported),
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            discovery(crate::attention::AttentionCategory::Duplicates),
+            [1]
+        );
+        assert_eq!(
+            discovery(crate::attention::AttentionCategory::Identity),
+            [1]
+        );
+        assert_eq!(fs::read(folder.join("Amidar (USA).bin")).unwrap(), amidar);
+        assert!(folder.join("extras/data.bin").is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Review C2 on #510: a loose cartridge already catalogued keeps its row
+    /// (identity and history) when an identical ZIP appears beside it later,
+    /// even after the loose file is touched and re-inspected.
+    #[test]
+    fn a_catalogued_loose_cartridge_keeps_its_row_when_an_identical_zip_appears() {
+        use std::io::Write;
+        let root = temp_dir("loose-bin-kept");
+        let source = root.join("games");
+        let folder = source.join("videopac");
+        fs::create_dir_all(&folder).unwrap();
+        let bytes: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
+        let loose = folder.join("Chess (Europe).bin");
+        fs::write(&loose, &bytes).unwrap();
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let before = database.load_archives().unwrap();
+        assert_eq!(before.len(), 1);
+        let id = before[0].id;
+
+        let mut writer = zip::ZipWriter::new(fs::File::create(folder.join("Chess.zip")).unwrap());
+        writer
+            .start_file(
+                "Chess (Europe).bin",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+        writer.finish().unwrap();
+        // Touch the loose file so its fingerprint no longer matches.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        fs::File::options()
+            .write(true)
+            .open(&loose)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let second = scan_and_persist(&mut database, &config, "test").unwrap();
+
+        let rows = database.load_archives().unwrap();
+        let kept = rows.iter().find(|row| row.absolute_path == loose).unwrap();
+        assert_eq!(kept.id, id);
+        assert!(kept.last_verified_missing_at.is_none());
+        assert_eq!(second.counts.archives_seen, 2, "{second:?}");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -15702,6 +16801,414 @@ echo "$out"
         exe
     }
 
+    /// Production run 210: ScummVM detection over a whole mixed library timed
+    /// out, which used to withhold missing reconciliation for the entire
+    /// source, so 40 renamed/removed ROM rows stayed "present". Detection is
+    /// now limited to ScummVM-named folders, and a detector failure withholds
+    /// only ScummVM folder rows.
+    #[cfg(unix)]
+    #[test]
+    fn scummvm_detector_failure_withholds_only_scummvm_rows_from_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_dir("scummvm-failure-missing");
+        let source = root.join("games");
+        let mount = root.join("mount");
+        let renamed = write_archive_file(&source, "atari2600/Amidar (USA).zip", b"amidar");
+        write_archive_file(&source, "atari2600/Basic Programming.zip", b"basic");
+        let beena = write_archive_file(&source, "beena/S/Soreike.zip", b"beena");
+        let game = source.join("scummvm/queen");
+        fs::create_dir_all(&game).unwrap();
+        fs::write(game.join("queen.1c"), b"synthetic game data").unwrap();
+        let log = root.join("detector-paths.log");
+        let real = fake_scummvm(&root);
+        let logging = root.join("scummvm-logging");
+        fs::write(
+            &logging,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --path=*) echo \"${{a#--path=}}\" >> '{}';; esac; done\nexec '{}' \"$@\"\n",
+                log.display(),
+                real.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&logging, fs::Permissions::from_mode(0o755)).unwrap();
+        let failing = root.join("scummvm-failing");
+        fs::write(&failing, "#!/bin/sh\necho 'detector crashed' >&2\nexit 3\n").unwrap();
+        fs::set_permissions(&failing, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = Some(logging));
+        let first = scan_and_persist(&mut database, &config, "test").unwrap();
+        assert!(first.folder_errors.is_empty(), "{:?}", first.folder_errors);
+        assert_eq!(database.load_archives().unwrap().len(), 4);
+        // The detector is only ever pointed inside the ScummVM folder (the
+        // folder itself, then each detected game), never at the library.
+        let asked = fs::read_to_string(&log).unwrap();
+        let canonical_scummvm = source.join("scummvm").canonicalize().unwrap();
+        assert!(
+            asked
+                .lines()
+                .any(|line| Path::new(line) == canonical_scummvm)
+                && asked
+                    .lines()
+                    .all(|line| Path::new(line).starts_with(&canonical_scummvm)),
+            "{asked}"
+        );
+
+        // The Atari ROM is renamed, a Beena ROM removed, the ScummVM folder
+        // removed, and the detector now fails.
+        fs::rename(&renamed, source.join("atari2600/Amidar.zip")).unwrap();
+        fs::remove_file(&beena).unwrap();
+        fs::remove_dir_all(source.join("scummvm/queen")).unwrap();
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = Some(failing));
+        let second = scan_and_persist(&mut database, &config, "test").unwrap();
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = None);
+
+        assert_eq!(second.counts.archives_missing, 2, "{second:?}");
+        let archives = database.load_archives().unwrap();
+        let missing = |name: &str| {
+            archives
+                .iter()
+                .find(|row| row.absolute_path.ends_with(name))
+                .unwrap_or_else(|| panic!("{name} row kept"))
+                .last_verified_missing_at
+                .is_some()
+        };
+        assert!(missing("atari2600/Amidar (USA).zip"));
+        assert!(missing("beena/S/Soreike.zip"));
+        assert!(!missing("atari2600/Basic Programming.zip"));
+        assert!(!missing("atari2600/Amidar.zip"));
+        // The ScummVM row could not be re-enumerated: kept, not called missing.
+        assert!(!missing("scummvm/queen"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Owner decision 2026-11-19: a byte-identical copy of a ScummVM game
+    /// folder is one game, not two. The copy is reported with the folder it
+    /// duplicates and left untouched; a different edition stays a separate
+    /// game; repeat scans keep the same choice and change nothing.
+    #[cfg(unix)]
+    #[test]
+    fn identical_scummvm_copies_are_one_game_and_editions_stay_apart() {
+        let root = temp_dir("scummvm-identical-copies");
+        let source = root.join("games");
+        let mount = root.join("mount");
+        for (dir, data) in [
+            ("scummvm/Queen", &b"same game data"[..]),
+            ("scummvm/queen-copy", b"same game data"),
+            ("scummvm/Queen German", b"other edition data"),
+        ] {
+            fs::create_dir_all(source.join(dir)).unwrap();
+            fs::write(source.join(dir).join("queen.1c"), data).unwrap();
+        }
+        fs::write(
+            source.join("scummvm/queen-copy/queen-copy.scummvm"),
+            b"marker",
+        )
+        .unwrap();
+        // Recognised media inside both copies: the kept folder absorbs its
+        // own, and the copy's must not turn up as loose rows either.
+        for dir in ["scummvm/Queen", "scummvm/queen-copy"] {
+            write_archive_file(&source, format!("{dir}/bonus.gba"), b"bonus");
+        }
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        crate::scummvm_detection::TEST_EXECUTABLE
+            .with(|c| *c.borrow_mut() = Some(fake_scummvm(&root)));
+        let scummvm_rows = |database: &Database| -> Vec<String> {
+            let mut rows: Vec<String> = database
+                .load_archives()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.last_verified_missing_at.is_none())
+                .map(|row| row.absolute_path.display().to_string())
+                .filter(|path| path.contains("/scummvm/"))
+                .collect();
+            rows.sort();
+            rows
+        };
+        for pass in ["first", "repeat"] {
+            let summary = scan_and_persist(&mut database, &config, "test").unwrap();
+            let report = &summary.scummvm;
+            assert_eq!(report.games_found, 2, "{pass}: {report:?}");
+            assert_eq!(report.identical_copies.len(), 1, "{pass}: {report:?}");
+            let (copy, kept) = &report.identical_copies[0];
+            assert!(copy.ends_with("scummvm/queen-copy"), "{pass}: {copy:?}");
+            assert!(kept.ends_with("scummvm/Queen"), "{pass}: {kept:?}");
+            // The two remaining folders are different editions of one game.
+            assert_eq!(report.same_game.len(), 1, "{pass}: {:?}", report.same_game);
+            assert_eq!(report.same_game[0].1.len(), 2);
+            let rows = scummvm_rows(&database);
+            assert_eq!(rows.len(), 2, "{pass}: {rows:?}");
+            assert!(rows.iter().any(|row| row.ends_with("scummvm/Queen")));
+            assert!(rows.iter().any(|row| row.ends_with("scummvm/Queen German")));
+            assert!(
+                report
+                    .contained_media
+                    .iter()
+                    .any(|path| path.ends_with("scummvm/queen-copy/bonus.gba")),
+                "{pass}: {:?}",
+                report.contained_media
+            );
+            assert_eq!(summary.counts.archives_missing, 0, "{pass}");
+        }
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = None);
+        // Nothing on disk was changed.
+        assert_eq!(
+            fs::read(source.join("scummvm/queen-copy/queen.1c")).unwrap(),
+            b"same game data"
+        );
+        assert!(
+            source
+                .join("scummvm/queen-copy/queen-copy.scummvm")
+                .is_file()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A copy found only now keeps the loose rows an earlier scan stored
+    /// inside it: they are not replaced by anything, so they stay as recorded.
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_found_later_keeps_its_already_catalogued_loose_rows() {
+        let root = temp_dir("scummvm-copy-keeps-rows");
+        let source = root.join("games");
+        let mount = root.join("mount");
+        for dir in ["scummvm/Queen", "scummvm/queen-copy"] {
+            fs::create_dir_all(source.join(dir)).unwrap();
+            fs::write(source.join(dir).join("queen.1c"), b"same game data").unwrap();
+            write_archive_file(&source, format!("{dir}/bonus.gba"), b"bonus");
+        }
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        // First scan without ScummVM: both bonus files are loose rows.
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = None);
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        crate::scummvm_detection::TEST_EXECUTABLE
+            .with(|c| *c.borrow_mut() = Some(fake_scummvm(&root)));
+        let summary = scan_and_persist(&mut database, &config, "test").unwrap();
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = None);
+        assert_eq!(
+            summary.scummvm.identical_copies.len(),
+            1,
+            "{:?}",
+            summary.scummvm
+        );
+        let copy_bonus = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.absolute_path.ends_with("scummvm/queen-copy/bonus.gba"))
+            .expect("the copy's catalogued file keeps its row");
+        assert!(
+            copy_bonus.last_verified_missing_at.is_none(),
+            "not called missing"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A detector row EmuWiz cannot read may be a game: the scan says so and
+    /// keeps every ScummVM row of the source from being called missing.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_scummvm_row_is_reported_and_withholds_scummvm_rows_from_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_dir("scummvm-unreadable-row");
+        let source = root.join("games");
+        let mount = root.join("mount");
+        let gone = write_archive_file(&source, "atari2600/Gone.zip", b"gone");
+        let game = source.join("scummvm/queen");
+        fs::create_dir_all(&game).unwrap();
+        fs::write(game.join("queen.1c"), b"synthetic game data").unwrap();
+        let real = fake_scummvm(&root);
+        let garbled = root.join("scummvm-garbled");
+        fs::write(
+            &garbled,
+            "#!/bin/sh\nprintf '%-30s %-58s %s\\n' GameID Description 'Full Path'\n\
+             printf '%-30s %-58s %s\\n' '------------------------------' '----------------------------------------------------------' '---------'\n\
+             echo 'a row EmuWiz cannot read'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&garbled, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = Some(real));
+        let first = scan_and_persist(&mut database, &config, "test").unwrap();
+        assert_eq!(first.scummvm.games_found, 1, "{:?}", first.scummvm);
+
+        fs::remove_file(&gone).unwrap();
+        fs::remove_dir_all(&game).unwrap();
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = Some(garbled));
+        let second = scan_and_persist(&mut database, &config, "test").unwrap();
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = None);
+
+        assert!(
+            second
+                .scummvm
+                .errors
+                .iter()
+                .any(|(_, error)| error.contains("could not read: a row EmuWiz cannot read")),
+            "{:?}",
+            second.scummvm.errors
+        );
+        let archives = database.load_archives().unwrap();
+        let missing = |name: &str| {
+            archives
+                .iter()
+                .find(|row| row.absolute_path.ends_with(name))
+                .unwrap_or_else(|| panic!("{name} row kept"))
+                .last_verified_missing_at
+                .is_some()
+        };
+        assert!(
+            missing("atari2600/Gone.zip"),
+            "other rows reconcile as usual"
+        );
+        assert!(
+            !missing("scummvm/queen"),
+            "the ScummVM row is kept, not called missing"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Follow-up to #509: ScummVM games in PC/DOS collections are found when
+    /// their folder carries a ScummVM data-file signature and the detector
+    /// confirms them; unsigned PC folders and folders of other systems are
+    /// never handed to the detector; an ambiguous folder is not catalogued;
+    /// one game folder is one row however many files it holds.
+    #[cfg(unix)]
+    #[test]
+    fn scummvm_games_are_found_inside_and_outside_scummvm_folders_without_duplicates() {
+        let root = temp_dir("scummvm-coverage");
+        let source = root.join("games");
+        let mount = root.join("mount");
+        for (dir, files) in [
+            ("scummvm/Queen Inside", &["queen.1c"][..]),
+            ("dos/Queen Outside", &["queen.1c", "readme.txt"]),
+            ("dos/Two Games", &["queen.1c", "hypno.dat"]),
+            ("dos/Doom", &["doom.wad"]),
+            ("snes/Not ScummVM", &["queen.1c"]),
+        ] {
+            fs::create_dir_all(source.join(dir)).unwrap();
+            for file in files {
+                fs::write(source.join(dir).join(file), b"synthetic").unwrap();
+            }
+        }
+        // Media the file scanner would catalogue on its own, inside the game.
+        write_archive_file(&source, "dos/Queen Outside/extras/music.zip", b"music");
+        let exe = fake_scummvm(&root);
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = Some(exe));
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        let summary = scan_and_persist(&mut database, &config, "test").unwrap();
+        let again = scan_and_persist(&mut database, &config, "test").unwrap();
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = None);
+
+        let mut rows: Vec<(String, String)> = database
+            .load_archives()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row.archive_kind.clone(),
+                    row.relative_path.display().to_string(),
+                )
+            })
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            [
+                (
+                    "scummvm_directory".to_string(),
+                    "dos/Queen Outside".to_string()
+                ),
+                (
+                    "scummvm_directory".to_string(),
+                    "scummvm/Queen Inside".to_string()
+                ),
+            ],
+            "{:?}",
+            summary.scummvm
+        );
+        assert!(
+            summary
+                .scummvm
+                .contained_media
+                .iter()
+                .any(|path| path.ends_with("extras/music.zip")),
+            "{:?}",
+            summary.scummvm
+        );
+        assert!(
+            summary
+                .scummvm
+                .ambiguous
+                .iter()
+                .any(|item| format!("{item:?}").contains("Two Games")),
+            "{:?}",
+            summary.scummvm
+        );
+        assert_eq!(again.counts.archives_added, 0);
+        assert_eq!(again.counts.archives_missing, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The per-source ScummVM time budget: once used up, the remaining
+    /// folders are not searched, ScummVM rows are withheld, and every other
+    /// row is still reconciled.
+    #[cfg(unix)]
+    #[test]
+    fn scummvm_time_budget_never_blocks_missing_reconciliation() {
+        let root = temp_dir("scummvm-budget");
+        let source = root.join("games");
+        let mount = root.join("mount");
+        let game = source.join("scummvm/queen");
+        fs::create_dir_all(&game).unwrap();
+        fs::write(game.join("queen.1c"), b"synthetic").unwrap();
+        let doomed = write_archive_file(&source, "atari2600/Gone.zip", b"gone");
+        write_archive_file(&source, "atari2600/Kept.zip", b"kept");
+        let exe = fake_scummvm(&root);
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = Some(exe));
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        assert_eq!(database.load_archives().unwrap().len(), 3);
+
+        fs::remove_file(&doomed).unwrap();
+        fs::remove_dir_all(&game).unwrap();
+        crate::scummvm_detection::TEST_SOURCE_BUDGET
+            .with(|budget| budget.set(Some(std::time::Duration::ZERO)));
+        let second = scan_and_persist(&mut database, &config, "test").unwrap();
+        crate::scummvm_detection::TEST_SOURCE_BUDGET.with(|budget| budget.set(None));
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = None);
+
+        assert!(
+            second
+                .scummvm
+                .errors
+                .iter()
+                .any(|(_, error)| error.contains("time budget")),
+            "{:?}",
+            second.scummvm
+        );
+        assert_eq!(second.counts.archives_missing, 1, "{second:?}");
+        let archives = database.load_archives().unwrap();
+        let missing = |name: &str| {
+            archives
+                .iter()
+                .find(|row| row.absolute_path.ends_with(name))
+                .unwrap()
+                .last_verified_missing_at
+                .is_some()
+        };
+        assert!(missing("atari2600/Gone.zip"));
+        assert!(!missing("atari2600/Kept.zip"));
+        assert!(!missing("scummvm/queen"), "withheld, not called missing");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn scanning_a_scummvm_game_folder_catalogues_it_without_manual_rows() {
@@ -18113,7 +19620,7 @@ echo "$out"
     }
 
     #[test]
-    fn conflict_retires_an_earlier_provider_winner_instead_of_choosing_it() {
+    fn a_dat_verification_replaces_a_romm_winner_and_a_real_conflict_retires_it() {
         let (root, mut database, archive_id) =
             unknown_archive_database("conflicting-platform-enrichment");
         let generation = 6;
@@ -18128,10 +19635,38 @@ echo "$out"
         database
             .apply_platform_identity_resolution(archive_id, &romm_only, generation)
             .unwrap();
-        let conflict = crate::platform::identity::resolve_platform_identity(
+        // A DAT verification disagreeing with that RomM-only platform is not
+        // a conflict: EmuWiz's own exact evidence replaces the RomM winner.
+        let dat_over_romm = crate::platform::identity::resolve_platform_identity(
             generation,
             [
                 provider_evidence("PSP", PlatformIdentitySource::Romm, generation),
+                provider_evidence("PSX", PlatformIdentitySource::VerifiedDat, generation),
+            ],
+        );
+        assert_eq!(
+            database
+                .apply_platform_identity_resolution(archive_id, &dat_over_romm, generation)
+                .unwrap(),
+            PlatformIdentityApplyOutcome::Applied
+        );
+        let archive = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        assert_eq!(archive.platform.as_deref(), Some("PSX"));
+        assert_eq!(
+            archive.platform_source.as_deref(),
+            Some(VERIFIED_DAT_PLATFORM_SOURCE)
+        );
+        // A genuine conflict (two DAT verifications disagreeing) still
+        // retires the earlier provider winner rather than choosing one.
+        let conflict = crate::platform::identity::resolve_platform_identity(
+            generation,
+            [
+                provider_evidence("PSP", PlatformIdentitySource::VerifiedDat, generation),
                 provider_evidence("PSX", PlatformIdentitySource::VerifiedDat, generation),
             ],
         );
@@ -18181,23 +19716,17 @@ echo "$out"
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn published_romm_cache_enriches_matching_unknown_archive_without_reading_it() {
+    /// A published RomM cache with one StrongExternal record for `archive`
+    /// on `platform`.
+    fn romm_cache_for(
+        archive: &PersistedArchive,
+        platform: &str,
+    ) -> crate::identity_source::cache::IdentityCache {
         use crate::identity_source::cache::{CACHE_FORMAT_VERSION, IdentityCache};
         use crate::identity_source::model::{
             ExternalIdentityRecord, ExternalVerification, IdentityProvider,
         };
-
-        let (root, mut database, archive_id) =
-            unknown_archive_database("romm-cache-platform-enrichment");
-        let archive = database
-            .load_archives()
-            .unwrap()
-            .into_iter()
-            .find(|archive| archive.id == archive_id)
-            .unwrap();
-        let before = fs::read(&archive.absolute_path).unwrap();
-        let cache = IdentityCache {
+        IdentityCache {
             format_version: CACHE_FORMAT_VERSION,
             provider: IdentityProvider::Romm,
             server_id: "https://romm.example".to_string(),
@@ -18214,7 +19743,7 @@ echo "$out"
                 provider_path: "roms/psp/Mystery.zip".to_string(),
                 archivefs_path: Some(archive.absolute_path.clone()),
                 title: Some("Mystery".to_string()),
-                platform_candidate: Some("PSP".to_string()),
+                platform_candidate: Some(platform.to_string()),
                 provider_platform_name: Some("psp".to_string()),
                 regions: Vec::new(),
                 revision: None,
@@ -18239,7 +19768,392 @@ echo "$out"
             rejected_hashes: Vec::new(),
             unknown_platforms: Vec::new(),
             server_reported_total: Some(1),
-        };
+        }
+    }
+
+    fn platform_rows(database: &Database, archive_id: i64) -> i64 {
+        database
+            .connection
+            .query_row(
+                "SELECT count(*) FROM platform_assignments WHERE archive_id = ?1",
+                params![archive_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn romm_agreeing_with_a_platform_emuwiz_found_keeps_it_and_its_provenance() {
+        for source in [
+            "folder_alias",
+            "header_identity",
+            ARCHIVE_MEMBER_PLATFORM_SOURCE,
+        ] {
+            let (root, mut database, archive_id) =
+                unknown_archive_database(&format!("romm-agrees-{source}"));
+            database
+                .assign_platform(archive_id, Some("PSP"), source)
+                .unwrap();
+            let rows = platform_rows(&database, archive_id);
+            let archive = load_archive(&database, archive_id);
+            // Imported twice: nothing is written either time.
+            for import in 0..2 {
+                let summary = database
+                    .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "PSP"), 10)
+                    .unwrap();
+                assert_eq!(
+                    (summary.applied, summary.unchanged),
+                    (0, 1),
+                    "{source} {import}"
+                );
+                assert_eq!(summary.romm_suggestions, 0, "{source}");
+                let after = load_archive(&database, archive_id);
+                assert_eq!(after.platform.as_deref(), Some("PSP"), "{source}");
+                assert_eq!(after.platform_source.as_deref(), Some(source), "{source}");
+                assert_eq!(platform_rows(&database, archive_id), rows, "{source}");
+            }
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn romm_disagreeing_with_a_folder_platform_is_only_a_suggestion() {
+        let (root, mut database, archive_id) = unknown_archive_database("romm-suggests");
+        database
+            .assign_platform(archive_id, Some("PSX"), "folder_alias")
+            .unwrap();
+        let rows = platform_rows(&database, archive_id);
+        let archive = load_archive(&database, archive_id);
+        for import in 0..2 {
+            let summary = database
+                .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "PSP"), 10)
+                .unwrap();
+            assert_eq!(summary.applied, 0, "{import}");
+            assert_eq!(summary.conflicts, 0, "{import}");
+            assert_eq!(summary.romm_suggestions, 1, "{import}");
+            assert_eq!(
+                summary.romm_suggestion_details,
+                [RommPlatformSuggestion {
+                    archive_id,
+                    current_platform: "PSX".into(),
+                    current_source: "folder_alias".into(),
+                    proposed_platform: "PSP".into(),
+                    reason: "RomM disagrees with the platform EmuWiz found from the game's folder or files",
+                }],
+                "{import}"
+            );
+            let after = load_archive(&database, archive_id);
+            assert_eq!(after.platform.as_deref(), Some("PSX"));
+            assert_eq!(after.platform_source.as_deref(), Some("folder_alias"));
+            assert_eq!(platform_rows(&database, archive_id), rows);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn romm_disagreeing_with_a_header_platform_stays_a_conflict_for_review() {
+        // The production case: WHDLoad installs read as Amiga, RomM says CD32.
+        let (root, mut database, archive_id) = unknown_archive_database("romm-vs-header");
+        database
+            .assign_platform(archive_id, Some("Amiga"), "header_identity")
+            .unwrap();
+        let rows = platform_rows(&database, archive_id);
+        let archive = load_archive(&database, archive_id);
+        for import in 0..2 {
+            let summary = database
+                .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "AmigaCD32"), 10)
+                .unwrap();
+            assert_eq!((summary.applied, summary.conflicts), (0, 1), "{import}");
+            assert_eq!(summary.romm_suggestions, 0, "{import}");
+            let after = load_archive(&database, archive_id);
+            assert_eq!(after.platform.as_deref(), Some("Amiga"));
+            assert_eq!(after.platform_source.as_deref(), Some("header_identity"));
+            assert_eq!(platform_rows(&database, archive_id), rows);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_review_list_names_every_kept_platform_its_source_and_romms_platform() {
+        // A header conflict and a folder suggestion, each from its own library.
+        let (root, mut database, archive_id) = unknown_archive_database("romm-review-header");
+        database
+            .assign_platform(archive_id, Some("Amiga"), "header_identity")
+            .unwrap();
+        let rows = platform_rows(&database, archive_id);
+        let archive = load_archive(&database, archive_id);
+        let summary = database
+            .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "AmigaCD32"), 10)
+            .unwrap();
+        assert_eq!(
+            summary.review_items(),
+            vec![PlatformReviewItem {
+                archive_id,
+                current_platform: Some("Amiga".into()),
+                current_source: "from the game's header".into(),
+                proposed_platform: "AmigaCD32".into(),
+                reason: "RomM disagrees with the platform EmuWiz read from the game itself".into(),
+            }]
+        );
+        assert_eq!(platform_rows(&database, archive_id), rows);
+        let names = database
+            .archive_names(&[archive_id, archive_id + 999])
+            .unwrap();
+        assert_eq!(names.len(), 1);
+        let (display, file) = &names[&archive_id];
+        assert!(!display.is_empty());
+        assert!(!file.contains('/'), "{file}");
+        let _ = fs::remove_dir_all(root);
+
+        let (root, mut database, archive_id) = unknown_archive_database("romm-review-folder");
+        database
+            .assign_platform(archive_id, Some("PSX"), "folder_alias")
+            .unwrap();
+        let archive = load_archive(&database, archive_id);
+        let summary = database
+            .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "PSP"), 10)
+            .unwrap();
+        let items = summary.review_items();
+        assert_eq!(items.len(), summary.romm_suggestions);
+        assert_eq!(items[0].current_platform.as_deref(), Some("PSX"));
+        assert_eq!(items[0].current_source, "from its folder");
+        assert_eq!(items[0].proposed_platform, "PSP");
+        assert_eq!(
+            load_archive(&database, archive_id)
+                .platform_source
+                .as_deref(),
+            Some("folder_alias")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_unknown_romm_platform_never_replaces_a_known_one() {
+        let (root, mut database, archive_id) = unknown_archive_database("romm-unknown-platform");
+        database
+            .assign_platform(archive_id, Some("PSX"), "folder_alias")
+            .unwrap();
+        let archive = load_archive(&database, archive_id);
+        let summary = database
+            .enrich_platforms_from_romm_cache(
+                &romm_cache_for(&archive, "Not A Platform EmuWiz Knows"),
+                10,
+            )
+            .unwrap();
+        assert_eq!(summary.evidence_considered, 0);
+        assert_eq!(summary.applied + summary.romm_suggestions, 0);
+        assert_eq!(
+            load_archive(&database, archive_id)
+                .platform_source
+                .as_deref(),
+            Some("folder_alias")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn romm_fills_a_missing_platform_then_only_suggests_changing_it() {
+        // RomM A fills the gap; RomM B (twice) is held for review each time;
+        // RomM A again changes nothing.
+        let (root, mut database, archive_id) = unknown_archive_database("romm-a-b-b");
+        let archive = load_archive(&database, archive_id);
+        assert_eq!(archive.platform, None);
+        let first = database
+            .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "PSX"), 10)
+            .unwrap();
+        assert_eq!(first.applied, 1);
+        let rows = platform_rows(&database, archive_id);
+        for import in 0..2 {
+            let summary = database
+                .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "PSP"), 10)
+                .unwrap();
+            assert_eq!((summary.applied, summary.conflicts), (0, 0), "{import}");
+            assert_eq!(
+                summary.romm_suggestion_details,
+                [RommPlatformSuggestion {
+                    archive_id,
+                    current_platform: "PSX".into(),
+                    current_source: ROMM_PLATFORM_SOURCE.into(),
+                    proposed_platform: "PSP".into(),
+                    reason: "RomM now reports a different platform than it gave before",
+                }],
+                "{import}"
+            );
+            let after = load_archive(&database, archive_id);
+            assert_eq!(after.platform.as_deref(), Some("PSX"), "{import}");
+            assert_eq!(after.platform_source.as_deref(), Some(ROMM_PLATFORM_SOURCE));
+            assert_eq!(platform_rows(&database, archive_id), rows, "{import}");
+        }
+        let again = database
+            .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "PSX"), 10)
+            .unwrap();
+        assert_eq!(
+            (again.applied, again.unchanged, again.romm_suggestions),
+            (0, 1, 0)
+        );
+        assert_eq!(platform_rows(&database, archive_id), rows);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn romm_disagreeing_with_a_manual_choice_is_only_a_suggestion() {
+        let (root, mut database, archive_id) = unknown_archive_database("romm-vs-manual");
+        database.set_manual_platform(archive_id, "PSX").unwrap();
+        let rows = platform_rows(&database, archive_id);
+        let archive = load_archive(&database, archive_id);
+        let summary = database
+            .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "PSP"), 10)
+            .unwrap();
+        assert_eq!((summary.applied, summary.manual_preserved), (0, 1));
+        assert_eq!(summary.romm_suggestions, 1);
+        assert_eq!(
+            summary.romm_suggestion_details[0].reason,
+            "RomM disagrees with a platform you chose"
+        );
+        let agreeing = database
+            .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "PSX"), 10)
+            .unwrap();
+        assert_eq!(
+            (agreeing.manual_preserved, agreeing.romm_suggestions),
+            (1, 0)
+        );
+        let after = load_archive(&database, archive_id);
+        assert_eq!(after.platform.as_deref(), Some("PSX"));
+        assert_eq!(
+            after.platform_source.as_deref(),
+            Some(MANUAL_PLATFORM_SOURCE)
+        );
+        assert_eq!(platform_rows(&database, archive_id), rows);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Adds archive rows that copy `template`'s columns, with `relative`
+    /// as their relative path and `absolute` as their stored path.
+    fn copy_archive_row(
+        database: &Database,
+        template: i64,
+        relative: &str,
+        absolute: rusqlite::types::Value,
+    ) -> i64 {
+        database
+            .connection
+            .execute(
+                "INSERT INTO archives (source_folder_id, relative_path, absolute_path_cached, \
+                 file_name_cached, archive_kind, display_name, normalized_name, first_seen_at, \
+                 last_seen_at, created_at, updated_at) \
+                 SELECT source_folder_id, CAST(?1 AS BLOB), ?2, file_name_cached, archive_kind, \
+                 display_name, normalized_name, first_seen_at, last_seen_at, created_at, updated_at \
+                 FROM archives WHERE id = ?3",
+                params![relative, absolute, template],
+            )
+            .unwrap();
+        database.connection.last_insert_rowid()
+    }
+
+    #[test]
+    fn archive_path_lookup_answers_exactly_like_the_single_path_lookup() {
+        use rusqlite::types::Value;
+        let (root, database, archive_id) = unknown_archive_database("archive-path-lookup");
+        let real = load_archive(&database, archive_id).absolute_path;
+        // Two rows sharing one stored path, and a path stored as TEXT (which
+        // the BLOB comparison never matches).
+        let shared = PathBuf::from("/fixture/shared.zip");
+        let text = PathBuf::from("/fixture/text.zip");
+        for (relative, value) in [
+            (
+                "shared-1.zip",
+                Value::Blob(shared.as_os_str().as_bytes().to_vec()),
+            ),
+            (
+                "shared-2.zip",
+                Value::Blob(shared.as_os_str().as_bytes().to_vec()),
+            ),
+            ("text.zip", Value::Text(text.display().to_string())),
+        ] {
+            copy_archive_row(&database, archive_id, relative, value);
+        }
+        let lookup = database.archive_path_lookup().unwrap();
+        for path in [
+            real.as_path(),
+            &shared,
+            &text,
+            Path::new("/fixture/missing.zip"),
+        ] {
+            let single = database.find_archive_id_by_absolute_path(path);
+            let batch = lookup.find(path);
+            match (&single, &batch) {
+                (Ok(single), Ok(batch)) => assert_eq!(single, batch, "{}", path.display()),
+                (Err(single), Err(batch)) => {
+                    assert_eq!(single.to_string(), batch.to_string(), "{}", path.display())
+                }
+                _ => panic!("{}: {single:?} vs {batch:?}", path.display()),
+            }
+        }
+        assert_eq!(lookup.find(&real).unwrap(), Some(archive_id));
+        assert!(lookup.find(&shared).is_err());
+        assert_eq!(lookup.find(&text).unwrap(), None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_romm_import_reads_the_archive_paths_once_not_once_per_record() {
+        // A library-sized catalogue: one full scan per record made a real
+        // import (95,000 records, 163,000 archives) take well over an hour.
+        const ROWS: usize = 30_000;
+        let (root, mut database, archive_id) = unknown_archive_database("romm-import-scale");
+        database
+            .connection
+            .execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?1) \
+                 INSERT INTO archives (source_folder_id, relative_path, absolute_path_cached, \
+                 file_name_cached, archive_kind, display_name, normalized_name, first_seen_at, \
+                 last_seen_at, created_at, updated_at) \
+                 SELECT a.source_folder_id, CAST('bulk/' || n.i || '.zip' AS BLOB), \
+                 CAST('/fixture/bulk/' || n.i || '.zip' AS BLOB), a.file_name_cached, \
+                 a.archive_kind, a.display_name, a.normalized_name, a.first_seen_at, \
+                 a.last_seen_at, a.created_at, a.updated_at FROM n, archives a WHERE a.id = ?2",
+                params![ROWS as i64, archive_id],
+            )
+            .unwrap();
+        let archive = load_archive(&database, archive_id);
+        let mut cache = romm_cache_for(&archive, "PSP");
+        let template = cache.records[0].clone();
+        // Records for paths EmuWiz has not scanned: each is looked up, none
+        // is written, so the time measured is the lookups.
+        cache.records.extend((0..ROWS).map(|i| {
+            let mut record = template.clone();
+            record.provider_game_id = format!("bulk-{i}");
+            record.archivefs_path = Some(PathBuf::from(format!("/fixture/elsewhere/{i}.zip")));
+            record
+        }));
+
+        let started = std::time::Instant::now();
+        let summary = database
+            .enrich_platforms_from_romm_cache(&cache, 10)
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(summary.evidence_considered, ROWS + 1);
+        assert_eq!(summary.archives_matched, 1);
+        assert_eq!(summary.applied, 1);
+        // One scan per record measured over a minute here; one read is well
+        // under a second even unoptimised.
+        assert!(elapsed < Duration::from_secs(15), "took {elapsed:?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn published_romm_cache_enriches_matching_unknown_archive_without_reading_it() {
+        let (root, mut database, archive_id) =
+            unknown_archive_database("romm-cache-platform-enrichment");
+        let archive = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        let before = fs::read(&archive.absolute_path).unwrap();
+        let cache = romm_cache_for(&archive, "PSP");
 
         let summary = database
             .enrich_platforms_from_romm_cache(&cache, 10)
@@ -18258,6 +20172,126 @@ echo "$out"
             Some(ROMM_PLATFORM_SOURCE)
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_conflicting_romm_import_leaves_the_dat_verified_platform_current() {
+        // Starting from a DAT-only verification and from a stored DAT/RomM
+        // agreement: RomM saying another platform never retires the verified
+        // one, and never leaves an "agree" label behind.
+        for (case, source) in [
+            ("dat-only", VERIFIED_DAT_PLATFORM_SOURCE),
+            ("agreement", DAT_ROMM_AGREEMENT_SOURCE),
+        ] {
+            let (root, mut database, archive_id) =
+                unknown_archive_database(&format!("romm-vs-dat-{case}"));
+            database
+                .assign_platform(archive_id, Some("PSX"), source)
+                .unwrap();
+            let archive = load_archive(&database, archive_id);
+
+            let summary = database
+                .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "PSP"), 10)
+                .unwrap();
+
+            assert_eq!(summary.conflicts, 0, "{case}");
+            assert!(summary.conflict_details.is_empty(), "{case}");
+            // Recorded for review, with both sides.
+            assert_eq!(summary.romm_disagreements, 1, "{case}");
+            let shown = &summary.romm_disagreement_details[0].evidence;
+            assert!(
+                shown
+                    .iter()
+                    .any(|item| item.source == PlatformIdentitySource::VerifiedDat
+                        && item.platform == "PSX")
+            );
+            assert!(
+                shown
+                    .iter()
+                    .any(|item| item.source == PlatformIdentitySource::Romm
+                        && item.platform == "PSP")
+            );
+            let after = load_archive(&database, archive_id);
+            assert_eq!(after.platform.as_deref(), Some("PSX"), "{case}");
+            assert_eq!(
+                after.platform_source.as_deref(),
+                Some(VERIFIED_DAT_PLATFORM_SOURCE),
+                "{case}: the DAT verification stays, any agreement is gone"
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn romm_agreement_then_disagreement_then_agreement_again_updates_the_label() {
+        let (root, mut database, archive_id) =
+            unknown_archive_database("romm-agree-disagree-agree");
+        database
+            .assign_platform(archive_id, Some("PSX"), VERIFIED_DAT_PLATFORM_SOURCE)
+            .unwrap();
+        let archive = load_archive(&database, archive_id);
+        let stored = |database: &Database| {
+            let archive = load_archive(database, archive_id);
+            (archive.platform, archive.platform_source)
+        };
+        let import = |database: &mut Database, romm: &str, generation: u64| {
+            database
+                .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, romm), generation)
+                .unwrap()
+        };
+
+        // 1. RomM agrees: "Verified by DAT and RomM".
+        let summary = import(&mut database, "PSX", 10);
+        assert_eq!((summary.applied, summary.romm_disagreements), (1, 0));
+        assert_eq!(
+            stored(&database),
+            (Some("PSX".into()), Some(DAT_ROMM_AGREEMENT_SOURCE.into()))
+        );
+        // 2. RomM now disagrees: the DAT platform stays, agreement is dropped.
+        let summary = import(&mut database, "PSP", 11);
+        assert_eq!(
+            (
+                summary.applied,
+                summary.conflicts,
+                summary.romm_disagreements
+            ),
+            (1, 0, 1)
+        );
+        assert_eq!(
+            stored(&database),
+            (
+                Some("PSX".into()),
+                Some(VERIFIED_DAT_PLATFORM_SOURCE.into())
+            )
+        );
+        // The same disagreement again changes nothing further.
+        let summary = import(&mut database, "PSP", 12);
+        assert_eq!((summary.unchanged, summary.romm_disagreements), (1, 1));
+        // 3. RomM agrees again: the agreement label returns.
+        let summary = import(&mut database, "PSX", 13);
+        assert_eq!((summary.applied, summary.romm_disagreements), (1, 0));
+        assert_eq!(
+            stored(&database),
+            (Some("PSX".into()), Some(DAT_ROMM_AGREEMENT_SOURCE.into()))
+        );
+        // A manual choice outranks all of it.
+        database.set_manual_platform(archive_id, "PSP").unwrap();
+        let summary = import(&mut database, "PSX", 14);
+        assert_eq!(summary.manual_preserved, 1);
+        assert_eq!(
+            stored(&database),
+            (Some("PSP".into()), Some(MANUAL_PLATFORM_SOURCE.into()))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn load_archive(database: &Database, archive_id: i64) -> PersistedArchive {
+        database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap()
     }
 
     #[test]
@@ -19136,6 +21170,65 @@ echo "$out"
         assert_eq!(archives.len(), 1);
         assert_eq!(archives[0].archive_kind, "arcade_set_directory");
         assert_eq!(archives[0].relative_path, Path::new("pacman"));
+    }
+
+    /// Run 210: 30 legacy one-row-per-file records (chip images such as
+    /// `bnzabros/ds3-5000-07d.img`) sit inside arcade set folders that are
+    /// catalogued as one game each. A scan keeps the folder as the one game,
+    /// never rediscovers a component file as a separate game, and leaves the
+    /// legacy row as it is (missing), neither restored nor deleted.
+    #[test]
+    fn legacy_arcade_component_rows_stay_missing_and_are_not_rediscovered() {
+        let root = temp_dir("arcade-legacy-component");
+        let source = root.join("games");
+        let set = source.join("arcade/bnzabros");
+        fs::create_dir_all(&set).unwrap();
+        fs::write(set.join("ds3-5000-07d.img"), vec![0u8; 4096]).unwrap();
+        fs::write(set.join("bnzabros.u1"), b"chip").unwrap();
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let source_id: i64 = database
+            .connection
+            .query_row("SELECT id FROM source_folders", [], |row| row.get(0))
+            .unwrap();
+        let component = set.join("ds3-5000-07d.img");
+        database
+            .connection
+            .execute(
+                "INSERT INTO archives (source_folder_id, relative_path, absolute_path_cached, file_name_cached, archive_kind, display_name, normalized_name, size_bytes, first_seen_at, last_seen_at, last_verified_missing_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, 'direct_game_image', 'ds3-5000-07d', 'ds3-5000-07d', 4096, '2026-09-18T00:51:59Z', '2026-09-20T11:03:25Z', '2026-09-22T16:18:04Z', '2026-09-18T00:51:59Z', '2026-09-22T16:18:04Z')",
+                params![
+                    source_id,
+                    b"arcade/bnzabros/ds3-5000-07d.img".to_vec(),
+                    component.as_os_str().as_bytes().to_vec(),
+                    b"ds3-5000-07d.img".to_vec(),
+                ],
+            )
+            .unwrap();
+
+        let summary = scan_and_persist(&mut database, &config, "test").unwrap();
+
+        assert_eq!(summary.counts.archives_added, 0, "{summary:?}");
+        assert_eq!(summary.counts.archives_restored, 0, "{summary:?}");
+        let archives = database.load_archives().unwrap();
+        let present: Vec<_> = archives
+            .iter()
+            .filter(|row| row.last_verified_missing_at.is_none())
+            .map(|row| (row.archive_kind.as_str(), row.relative_path.clone()))
+            .collect();
+        assert_eq!(
+            present,
+            [("arcade_set_directory", PathBuf::from("arcade/bnzabros"))]
+        );
+        let legacy = archives
+            .iter()
+            .find(|row| row.absolute_path == component)
+            .expect("legacy row is kept");
+        assert_eq!(
+            legacy.last_verified_missing_at.as_deref(),
+            Some("2026-09-22T16:18:04Z")
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -22134,7 +24227,7 @@ echo "$out"
 
         #[test]
         fn migrations_0011_and_0012_are_registered() {
-            assert_eq!(latest_known_version(MIGRATIONS), 26);
+            assert_eq!(latest_known_version(MIGRATIONS), 30);
             assert!(MIGRATIONS.iter().any(|migration| {
                 migration.version == 11
                     && migration.sql.contains("CREATE TABLE dat_expected_entries")

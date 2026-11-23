@@ -98,7 +98,7 @@ zip = { version = "9.0", default-features = false, features = ["deflate"] }
 [dev-dependencies]
 zip = { version = "9.0", features = ["deflate"] }
 archivefs-core = { path = "../archivefs-core", features = ["test-support"] }
-rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.41.1", default-features = false, features = ["bundled"] }
 # Test fixtures only: a few-hundred-byte synthetic RAR5 CBR (see archivefs-core).
 rars = { version = "=0.10.2", default-features = false, features = ["write"] }
 

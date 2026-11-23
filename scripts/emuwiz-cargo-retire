@@ -97,9 +97,12 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import json
+import math
 import re
 import signal
+import socket
 import subprocess
+import tempfile
 import time
 
 CARGO_LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
@@ -273,7 +276,7 @@ class Journal:
 
     @classmethod
     def create(cls, directory, exec_id):
-        os.makedirs(directory, mode=0o700, exist_ok=True)
+        makedirs_private(directory)
         path = os.path.join(directory, f"retire-{exec_id}{JOURNAL_SUFFIX}")
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
@@ -587,17 +590,33 @@ def remove_entry(dir_fd, name, expect, root_dev, counters, top=True, snap=None, 
 # -------------------------------------------------------------- evaluation
 
 
+def profile_parent_ok(first):
+    """A directory that may hold profiles one level down: a target triple."""
+    return bool(re.fullmatch(r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+){2,}", first))
+
+
+def strip_ra(rel_parts):
+    """Paths inside the rust-analyzer sub-target (cargo-iso --rust-analyzer) are classified
+    exactly like paths in the target itself (one level only), as in F.select_artifacts."""
+    if len(rel_parts) >= 2 and rel_parts[0] == F.RA_SUBTARGET:
+        rest = list(rel_parts[1:])
+        # one level only, as the selector: a nested rust-analyzer/rust-analyzer is not output
+        return ["..", *rest] if rest[0] == F.RA_SUBTARGET and len(rest) > 1 else rest
+    return rel_parts
+
+
 def residue_layout(rel_parts, profile):
     """True for a path directly in a markerless `debug` (or <triple>/debug) profile: the only
     class accepted there is post-retirement binary residue (Fix B)."""
     return (len(rel_parts) in (2, 3) and os.path.basename(profile) == F.RESIDUE_PROFILE
             and rel_parts[-2] == F.RESIDUE_PROFILE
-            and (len(rel_parts) == 2 or re.fullmatch(r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+){2,}", rel_parts[0]))
+            and (len(rel_parts) == 2 or profile_parent_ok(rel_parts[0]))
             and F.markerless_profile(profile))
 
 
 def entry_class_problem(rel_parts, parent_path):
     """Why a manifest path is not an enumerated compiler artifact, else None."""
+    rel_parts = strip_ra(rel_parts) if rel_parts and not any(p in ("", ".", "..") for p in rel_parts) else rel_parts
     if not rel_parts or any(p in ("", ".", "..") for p in rel_parts):
         return "PATH_OUTSIDE_TARGET"
     name = rel_parts[-1]
@@ -622,7 +641,7 @@ def entry_class_problem(rel_parts, parent_path):
         for marker in (".fingerprint", "deps")
     )
     orphan = (name == "incremental" and os.path.basename(profile) in ("debug", "release")
-              and (len(rel_parts) == 2 or re.fullmatch(r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+){2,}", rel_parts[0])))
+              and (len(rel_parts) == 2 or profile_parent_ok(rel_parts[0])))
     if not has_marker and not orphan:
         return "NOT_A_COMPILER_ARTIFACT"
     if name in F.ARTIFACT_DIRS:
@@ -663,6 +682,568 @@ def load_manifest(path, approved):
         sources = json.loads(group.get("associated_source_paths") or "[]")
         groups.append({"group": group, "paths": paths, "sources": sources})
     return data, actual, groups
+
+
+# ------------------------------------------- scoped-run record + owner signature
+#
+# Two separate things gate --execute.
+#
+# 1. A SCOPED-RUN RECORD (accident protection, NOT proof of consent).  A file in the
+#    instance's `scoped-runs/` directory naming the operation, the cache root, the exact
+#    canonical cache directories with their identities (device, inode), the manifest
+#    digest, a short expiry and a one-time nonce.  Its name is its content hash.  The
+#    executor refuses unless the manifest equals it exactly, and consumes it (O_EXCL
+#    marker) before the journal begins.  Any process running as this account can write
+#    one, so on its own it proves nothing about who wanted the deletion.
+#
+# 2. An OWNER SIGNATURE over the record's exact bytes: `ssh-keygen -Y sign` with
+#    namespace SIGNATURE_NAMESPACE by a key whose public half is listed for principal
+#    OWNER_PRINCIPAL in OWNER_SIGNERS, a root-owned allowed-signers file.  The private key
+#    is meant to live off this machine (ideally a FIDO security key needing a touch).
+#
+# LIMITATION (documented, not hidden): while the agent account has `NOPASSWD: ALL`, it
+# can become root and replace OWNER_SIGNERS or this script.  The signature then makes a
+# forged authorisation DETECTABLE (each receipt records the signer fingerprint and the
+# signers-file digest; compare them with your own key) but not impossible.  Genuine
+# enforcement needs the agent to run as an account that cannot become root and cannot
+# write OWNER_SIGNERS, this script or the protected cache roots (see OPERATIONS notes).
+
+SCOPED_KIND = "SCOPED_RUN_RECORD"
+SCOPED_SCHEMA = 1
+SCOPED_OPERATION = "cargo-retire-execute"
+SCOPED_MAX_SECONDS = 6 * 3600
+SCOPED_NAME = re.compile(r"scoped-([0-9a-f]{16})\.json")
+NONCE_RE = re.compile(r"[0-9a-f]{32}")
+INSTANCE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+OWNER_SIGNERS = "/etc/emuwiz/cargo-retire-allowed-signers"
+OWNER_PRINCIPAL = "emuwiz-owner"
+SIGNATURE_NAMESPACE = "emuwiz-cargo-retire@1"
+SSH_KEYGEN = "/usr/bin/ssh-keygen"
+# The account that must own OWNER_SIGNERS and SSH_KEYGEN.  Only an in-process test may
+# change it; there is deliberately no command-line or environment override.
+TRUST_ANCHOR_UID = 0
+LIMITATION = ("same-machine trust anchor: tamper-evident only while the agent account can become root")
+
+
+def maintenance_dir():
+    """The maintenance state directory of the selected instance (as emuwiz-cargo-maintain)."""
+    raw = os.environ.get("EMUWIZ_MAINTENANCE_INSTANCE", "")
+    if raw in ("", "default"):
+        name = "maintenance"
+    elif INSTANCE_NAME_RE.fullmatch(raw):
+        name = f"maintenance-{raw}"
+    else:
+        raise Refusal("SCOPED_RUN_INVALID", f"EMUWIZ_MAINTENANCE_INSTANCE={raw!r} is not a plain instance name")
+    return os.path.join(F.registry_dir(), name)
+
+
+def scoped_runs_dir():
+    return os.path.join(maintenance_dir(), "scoped-runs")
+
+
+def trusted_uids():
+    """The effective user and the registry owner (as emuwiz-cargo-maintain)."""
+    uids = {os.geteuid()}
+    try:
+        uids.add(os.lstat(F.registry_dir()).st_uid)
+    except OSError:
+        pass
+    return uids
+
+
+def makedirs_private(path):
+    """os.makedirs, but every directory it creates (not only the leaf) is 0700 whatever
+    the umask: a dry run creating the receipts directory must not leave a group-writable
+    maintenance directory that later fails the scoped-run safety check."""
+    path = os.path.abspath(path)
+    missing = []
+    while not os.path.lexists(path):
+        missing.append(path)
+        path = os.path.dirname(path)
+    for directory in reversed(missing):
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:
+            continue
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            os.fchmod(fd, 0o700)
+        finally:
+            os.close(fd)
+
+
+def _owned_safe(st, want_dir=False, uids=None, writable_ok=False):
+    kind = stat.S_ISDIR(st.st_mode) if want_dir else stat.S_ISREG(st.st_mode)
+    return kind and st.st_uid in (uids or trusted_uids()) and (writable_ok or not st.st_mode & 0o022)
+
+
+def read_owned_bytes(path, limit=1 << 22, uids=None, code="SCOPED_RUN_INVALID", writable_ok=False):
+    """Bytes of a regular file owned by a trusted account and not group/world writable,
+    read without following symlinks; the identity must not change during the read."""
+    before = os.lstat(path)
+    if not _owned_safe(before, uids=uids, writable_ok=writable_ok):
+        raise Refusal(code, f"{path} is not a safe file owned by a trusted account")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) != (before.st_dev, before.st_ino) or st.st_size > limit:
+            raise Refusal(code, f"{path} changed while being read or is too large")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
+    if len(data) > limit:
+        raise Refusal(code, f"{path} is too large")
+    return data
+
+
+def anchored_file_problem(path):
+    """Why `path` is not a trust-anchor file, or None.  Every component is owned by root
+    (or TRUST_ANCHOR_UID, which is root outside in-process tests); nothing is group/world
+    writable except root-owned sticky ancestors above the file's own directory; no symlink."""
+    if not os.path.isabs(path) or os.path.normpath(path) != path:
+        return f"{path} is not a canonical absolute path"
+    parts = path.split("/")[1:]
+    current = "/"
+    for index, part in enumerate(parts):
+        current = os.path.join(current, part)
+        try:
+            st = os.lstat(current)
+        except OSError:
+            return f"{current} is missing"
+        last = index == len(parts) - 1
+        if stat.S_ISLNK(st.st_mode):
+            return f"{current} is a symlink"
+        if last and not stat.S_ISREG(st.st_mode):
+            return f"{current} is not a regular file"
+        if not last and not stat.S_ISDIR(st.st_mode):
+            return f"{current} is not a directory"
+        near = index >= len(parts) - 2
+        if st.st_uid not in (0, TRUST_ANCHOR_UID):
+            return f"{current} is owned by uid {st.st_uid}, not by root"
+        if st.st_mode & 0o022 and not (st.st_mode & stat.S_ISVTX and st.st_uid == 0 and not near):
+            return f"{current} is group/world writable"
+    # ancestors of the root itself
+    st = os.lstat("/")
+    if st.st_uid != 0 or st.st_mode & 0o022:
+        return "/ is not root-owned"
+    return None
+
+
+# read while still root: a privileged run drops to the owner before it verifies anything
+_ROOT_SIGNERS_OVERRIDE = os.environ.get("EMUWIZ_OWNER_SIGNERS") or None if os.geteuid() == 0 else None
+
+
+def owner_signers_path():
+    """The allowed-signers file.  A run STARTED as root may name a different file in
+    EMUWIZ_OWNER_SIGNERS (captured at start, before the drop to the owner); it must pass the
+    same root-ownership checks (the privileged tests use one), and the receipt records which
+    file was used and its digest.  An unprivileged run always uses OWNER_SIGNERS."""
+    override = _ROOT_SIGNERS_OVERRIDE or (os.geteuid() == 0 and os.environ.get("EMUWIZ_OWNER_SIGNERS"))
+    return override or OWNER_SIGNERS
+
+
+def verify_owner_signature(record_path, raw, namespace=SIGNATURE_NAMESPACE):
+    """{signer_fingerprint, signature_sha256, signers_path, signers_sha256} for a valid owner
+    signature over exactly `raw` in `namespace`, or Refusal."""
+    sig_path = record_path + ".sig"
+    signers = owner_signers_path()
+    for path in (signers, SSH_KEYGEN):
+        problem = anchored_file_problem(path)
+        if problem:
+            raise Refusal("OWNER_SIGNERS_UNAVAILABLE", f"no trusted owner verification is installed ({problem}); "
+                          "a scoped-run record alone is accident protection, not owner authorisation")
+    if not os.path.lexists(sig_path):
+        raise Refusal("OWNER_SIGNATURE_REQUIRED", f"{sig_path} is missing: the owner must sign the scoped-run "
+                      f"record off this machine (ssh-keygen -Y sign -n {SIGNATURE_NAMESPACE})")
+    try:
+        # the signature authenticates itself (it is verified over the record bytes read once),
+        # so its file mode does not matter; it is read once and verified from a private copy
+        sig = read_owned_bytes(sig_path, limit=1 << 14, code="OWNER_SIGNATURE_INVALID", writable_ok=True)
+        signers_raw = read_owned_bytes(signers, limit=1 << 20, uids={0, TRUST_ANCHOR_UID},
+                                       code="OWNER_SIGNERS_UNAVAILABLE")
+    except OSError as error:
+        raise Refusal("OWNER_SIGNATURE_INVALID", f"signature unreadable ({error})") from None
+    # ssh-keygen reads the ANCHORED signers file itself (the agent cannot write it) and the
+    # signature through a pipe (no file in an agent-writable directory can be swapped);
+    # the record bytes go on stdin.  The anchor is re-hashed afterwards.
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, sig)             # <= 16 KiB, well inside the pipe buffer
+        os.close(write_fd)
+        write_fd = None
+        try:
+            done = subprocess.run(
+                [SSH_KEYGEN, "-Y", "verify", "-f", signers, "-I", OWNER_PRINCIPAL,
+                 "-n", namespace, "-s", f"/dev/fd/{read_fd}"],
+                input=raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, cwd="/", pass_fds=(read_fd,))
+        except (OSError, subprocess.SubprocessError) as error:
+            raise Refusal("OWNER_SIGNATURE_INVALID", f"ssh-keygen could not run ({error})") from None
+    finally:
+        os.close(read_fd)
+        if write_fd is not None:
+            os.close(write_fd)
+    try:
+        after = read_owned_bytes(signers, limit=1 << 20, uids={0, TRUST_ANCHOR_UID}, code="OWNER_SIGNERS_UNAVAILABLE")
+    except OSError:
+        after = None
+    if after != signers_raw or anchored_file_problem(signers):
+        raise Refusal("OWNER_SIGNERS_UNAVAILABLE", "the allowed-signers file changed during verification")
+    text = done.stdout.decode("utf-8", "replace").strip()
+    prefix = f'Good "{namespace}" signature for {OWNER_PRINCIPAL} with '
+    match = re.search(r" key (SHA256:[A-Za-z0-9+/=]+)$", text)
+    if done.returncode != 0 or not text.startswith(prefix) or not match:
+        raise Refusal("OWNER_SIGNATURE_INVALID", "the signature does not verify for the owner's key, "
+                      "this namespace and these exact bytes")
+    return {"owner_signature": "VERIFIED", "signer_fingerprint": match.group(1),
+            "signature_sha256": hashlib.sha256(sig).hexdigest(), "signers_path": signers,
+            "signers_sha256": hashlib.sha256(signers_raw).hexdigest(), "limitation": LIMITATION}
+
+
+def split_signers_line(line):
+    """Whitespace-separated fields, keeping double-quoted runs (option values) intact."""
+    fields, current, quoted = [], "", False
+    for ch in line:
+        if ch == '"':
+            quoted = not quoted
+            current += ch
+        elif ch.isspace() and not quoted:
+            if current:
+                fields.append(current)
+                current = ""
+        else:
+            current += ch
+    if current:
+        fields.append(current)
+    return fields
+
+
+SELFTEST_NAMESPACE = "emuwiz-cargo-retire-selftest@1"
+
+
+def verify_hold_release(path, raw):
+    """F.HOLD_RELEASE_VERIFIER: owner-signature facts for a HOLD release record, or None."""
+    try:
+        return verify_owner_signature(path, raw, F.HOLD_RELEASE_NAMESPACE)
+    except Refusal:
+        return None
+
+
+F.HOLD_RELEASE_VERIFIER = verify_hold_release
+SELFTEST_HEADER = b"EMUWIZ OWNER SIGNING SELF-TEST\n"
+
+
+def owner_signing_status(selftest=None):
+    """Read-only check that owner-signature verification is installed and usable: the
+    allowed-signers file and ssh-keygen are trust anchors, every key line parses, and at
+    least one key is listed for OWNER_PRINCIPAL restricted to SIGNATURE_NAMESPACE.  With
+    `selftest` (a file starting with SELFTEST_HEADER and its .sig made in the separate
+    SELFTEST_NAMESPACE, which the executor never accepts for retirement), also verify one
+    real signature end to end.  Deletes and changes nothing.  Returns (ok, report)."""
+    signers = owner_signers_path()
+    if signers != OWNER_SIGNERS:
+        return False, {"signers_path": signers, "problems": [
+            "EMUWIZ_OWNER_SIGNERS overrides the production allowed-signers file; unset it"]}
+    report = {"signers_path": signers, "principal": OWNER_PRINCIPAL, "namespace": SIGNATURE_NAMESPACE,
+              "limitation": LIMITATION, "keys": [], "problems": []}
+    for path in (signers, SSH_KEYGEN):
+        problem = anchored_file_problem(path)
+        if problem:
+            report["problems"].append(problem)
+    if report["problems"]:
+        return False, report
+    try:
+        raw = read_owned_bytes(signers, limit=1 << 20, uids={0, TRUST_ANCHOR_UID}, code="OWNER_SIGNERS_UNAVAILABLE")
+        report["signers_sha256"] = hashlib.sha256(raw).hexdigest()
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError, Refusal) as error:
+        report["problems"].append(f"allowed-signers unreadable ({error})")
+        return False, report
+    usable = 0
+    for number, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = split_signers_line(line)
+        principals = parts[0].split(",") if parts else []
+        keyat = next((i for i, f in enumerate(parts[1:3], 1) if f.startswith(("ssh-", "sk-", "ecdsa-"))), None)
+        options = parts[1] if keyat == 2 else ""
+        key = parts[keyat:keyat + 2] if keyat else []
+        work = tempfile.mkdtemp(prefix="emuwiz-keycheck-")
+        try:
+            kfile = os.path.join(work, "k.pub")
+            with open(kfile, "w") as handle:
+                handle.write(" ".join(key) + "\n")
+            done = subprocess.run([SSH_KEYGEN, "-l", "-f", kfile], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  timeout=30, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+        finally:
+            for name in os.listdir(work):
+                os.unlink(os.path.join(work, name))
+            os.rmdir(work)
+        fingerprint = re.search(r"(SHA256:[A-Za-z0-9+/=]+)", done.stdout.decode("utf-8", "replace"))
+        if done.returncode != 0 or not fingerprint:
+            report["problems"].append(f"line {number}: the key does not parse")
+            continue
+        restricted = re.search(r'namespaces="([^"]*)"', options)
+        entry = {"line": number, "fingerprint": fingerprint.group(1), "principals": principals,
+                 "namespaces": restricted.group(1).split(",") if restricted else None}
+        report["keys"].append(entry)
+        if OWNER_PRINCIPAL in principals and entry["namespaces"] and SIGNATURE_NAMESPACE in entry["namespaces"]:
+            usable += 1
+    if not usable:
+        report["problems"].append(f"no key is listed for {OWNER_PRINCIPAL} with namespaces=\"{SIGNATURE_NAMESPACE}...\"")
+    if selftest:
+        try:
+            data = read_owned_bytes(os.path.realpath(selftest), limit=1 << 16, code="SELFTEST_INVALID", writable_ok=True)
+            if not data.startswith(SELFTEST_HEADER):
+                raise Refusal("SELFTEST_INVALID", "the self-test file must start with " + SELFTEST_HEADER.decode().strip())
+            facts = verify_owner_signature(os.path.realpath(selftest), data, namespace=SELFTEST_NAMESPACE)
+            report["selftest"] = {"verified": True, "signer_fingerprint": facts["signer_fingerprint"]}
+        except (Refusal, OSError) as error:
+            report["selftest"] = {"verified": False}
+            report["problems"].append(f"self-test signature: {error}")
+    return not report["problems"], report
+
+
+def approval_targets(groups):
+    return sorted((g["group"].get("directory"), g["group"].get("device"), g["group"].get("inode")) for g in groups)
+
+
+def consumed_path(record_path):
+    return record_path[: -len(".json")] + ".consumed"
+
+
+def _number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def nonce_used_in(receipt_dir, nonce):
+    """True if any execution journal in `receipt_dir` began under this nonce."""
+    try:
+        names = os.listdir(receipt_dir)
+    except OSError:
+        return False
+    for name in names:
+        if not name.endswith(".journal.jsonl"):
+            continue
+        try:
+            with open(os.path.join(receipt_dir, name), "rb") as handle:
+                first = json.loads(handle.readline() or b"{}")
+        except (OSError, ValueError):
+            continue
+        if isinstance(first, dict) and (first.get("scoped_run") or {}).get("nonce") == nonce:
+            return True
+    return False
+
+
+def check_scoped_run(path, groups, digest, manifest_path, now_ts, receipt_dir=None, signature=True):
+    """(record, sha256, signature-facts) when `path` is a valid, unexpired, unused scoped-run
+    record for exactly these manifest groups, this manifest and this root, carrying a valid
+    owner signature; otherwise Refusal.  signature=False checks the record alone (used only
+    to explain a refusal early, never to authorise)."""
+    if not path:
+        raise Refusal("SCOPED_RUN_REQUIRED", "--execute needs --routine (a routine maintain cycle) or --scoped-run "
+                      "(an owner-signed exceptional retirement: request-retirement, then the owner's signature)")
+    path = os.path.normpath(os.path.abspath(path))
+    directory = scoped_runs_dir()
+    name = SCOPED_NAME.fullmatch(os.path.basename(path))
+    if os.path.dirname(path) != directory or not name:
+        raise Refusal("SCOPED_RUN_INVALID", f"a scoped-run record must be scoped-<id>.json directly inside {directory}")
+    try:
+        if not _owned_safe(os.lstat(directory), want_dir=True) or not _owned_safe(
+                os.lstat(os.path.dirname(directory)), want_dir=True):
+            raise Refusal("SCOPED_RUN_INVALID", f"{directory} is not a safe directory owned by a trusted account")
+        raw = read_owned_bytes(path)
+        record = json.loads(raw)
+    except (OSError, ValueError) as error:
+        raise Refusal("SCOPED_RUN_INVALID", f"scoped-run record unreadable ({error})") from None
+    sha = hashlib.sha256(raw).hexdigest()
+    if sha[:16] != name.group(1):
+        raise Refusal("SCOPED_RUN_INVALID", "the record's name is not its content hash")
+    root = os.path.realpath(F.target_root())
+    if not isinstance(record, dict) or record.get("kind") != SCOPED_KIND or record.get("schema") != SCOPED_SCHEMA \
+            or record.get("operation") != SCOPED_OPERATION:
+        raise Refusal("SCOPED_RUN_INVALID", "not a scoped-run record for cargo retirement")
+    if record.get("target_root") != root or record.get("state_dir") != maintenance_dir():
+        raise Refusal("SCOPED_RUN_WRONG_ROOT", f"record is for {record.get('target_root')}, this run retires in {root}")
+    if record.get("host") != socket.gethostname():
+        raise Refusal("SCOPED_RUN_WRONG_ROOT", "record was made for another host")
+    at, until = record.get("created_at"), record.get("expires_at")
+    if not (_number(at) and _number(until)) or not (at <= now_ts < until) or until - at > SCOPED_MAX_SECONDS:
+        raise Refusal("SCOPED_RUN_EXPIRED", "record is expired, not yet valid or longer than 6 hours")
+    if not isinstance(record.get("nonce"), str) or not NONCE_RE.fullmatch(record["nonce"]):
+        raise Refusal("SCOPED_RUN_INVALID", "record has no one-time nonce")
+    if record.get("manifest_sha256") != digest:
+        raise Refusal("SCOPED_RUN_MISMATCH", "record names a different manifest digest")
+    if not isinstance(record.get("manifest_path"), str) or \
+            os.path.realpath(record["manifest_path"]) != os.path.realpath(manifest_path):
+        raise Refusal("SCOPED_RUN_MISMATCH", "record names a different manifest file")
+    targets = record.get("targets")
+    if not isinstance(targets, list) or not targets:
+        raise Refusal("SCOPED_RUN_INVALID", "record names no targets")
+    approved = sorted((t.get("directory"), t.get("device"), t.get("inode")) for t in targets if isinstance(t, dict))
+    if len(approved) != len(targets) or len(set(approved)) != len(approved):
+        raise Refusal("SCOPED_RUN_INVALID", "record targets are malformed or repeated")
+    for directory_, _, _ in approved:
+        if not isinstance(directory_, str) or os.path.dirname(directory_) != root or \
+                os.path.realpath(directory_) != directory_:
+            raise Refusal("SCOPED_RUN_WRONG_ROOT", f"{directory_} is not a canonical cache directory in {root}")
+    if approved != approval_targets(groups):
+        raise Refusal("SCOPED_RUN_MISMATCH", "manifest targets (directory, device, inode) differ from the record: "
+                      "no substitute, extra or missing target is allowed")
+    for directory_, dev, ino in approved:
+        try:
+            st = os.lstat(directory_)
+        except OSError:
+            raise Refusal("SCOPED_RUN_IDENTITY_CHANGED", f"{directory_} is missing") from None
+        if (st.st_dev, st.st_ino) != (dev, ino):
+            raise Refusal("SCOPED_RUN_IDENTITY_CHANGED", f"{directory_} is not the directory that was recorded")
+    if os.path.lexists(consumed_path(path)):
+        raise Refusal("SCOPED_RUN_REPLAYED", "scoped-run records are single-use")
+    canonical = os.path.join(maintenance_dir(), "receipts")
+    if receipt_dir is not None and os.path.realpath(receipt_dir) != os.path.realpath(canonical):
+        raise Refusal("SCOPED_RUN_INVALID", f"a signed execution writes its receipt and journal in {canonical} "
+                      "(the instance's receipts directory), so a replay is always visible there")
+    if any(nonce_used_in(d, record["nonce"]) for d in {receipt_dir or canonical, canonical}) \
+            or record["nonce"] in used_nonces():
+        raise Refusal("SCOPED_RUN_REPLAYED", "an execution already ran under this nonce")
+    registry = F.Registry(create=False)
+    for directory_, _, _ in approved:
+        _, rec = registry.read_checked("targets", F.key_for(directory_), F.valid_target_record)
+        if rec and (rec.get("last_retired") or {}).get("scoped_run_sha256") == sha:
+            raise Refusal("SCOPED_RUN_REPLAYED", f"{directory_} was already retired under this record")
+    facts = verify_owner_signature(path, raw) if signature else None
+    return record, sha, facts
+
+
+def used_nonces():
+    try:
+        with open(os.path.join(scoped_runs_dir(), "used-nonces.log")) as handle:
+            return {line.split()[0] for line in handle if line.strip()}
+    except OSError:
+        return set()
+
+
+ROUTINE_MAX_TARGETS = 10
+# Set in-process by emuwiz-cargo-maintain's routine cycle (never from the command line):
+# callable(group) -> None, or why this target is no longer routine-eligible (policy scope,
+# merged and preserved source, unchanged HEAD).  Without it --routine refuses.
+ROUTINE_AUTHORITY = None
+
+
+def routine_authority_problem(group):
+    if ROUTINE_AUTHORITY is None:
+        return "no routine authority (routine retirement runs only inside emuwiz-cargo-maintain run)"
+    try:
+        return ROUTINE_AUTHORITY(group)
+    except Exception as error:  # noqa: BLE001 - any doubt holds the target
+        return f"routine re-check failed ({type(error).__name__}: {error})"
+
+
+def routine_check(args, groups):
+    """ROUTINE execution: no owner signature, so only what every safety gate accepts for a
+    participating cargo-iso cache with a live source checkout.  Everything exceptional
+    (maintenance window, adoption, journal resume, orphan routes, larger batches) needs
+    an owner-signed scoped run instead.  Every per-group gate still runs as usual."""
+    if args.scoped_run:
+        raise Refusal("ROUTINE_REFUSED", "--routine and --scoped-run are exclusive")
+    if ROUTINE_AUTHORITY is None:
+        raise Refusal("ROUTINE_REFUSED", "routine retirement runs only inside `emuwiz-cargo-maintain run` (which "
+                      "re-checks policy scope and merged, preserved sources); anything else needs an owner-signed "
+                      "scoped run")
+    for flag, name in ((args.maintenance_window_attested, "--maintenance-window-attested"),
+                       (args.resume_journal, "--resume-journal"), (args.assume_adopted, "--assume-adopted")):
+        if flag:
+            raise Refusal("ROUTINE_REFUSED", f"{name} is an exceptional operation: it needs an owner-signed scoped run")
+    if not groups or len(groups) > ROUTINE_MAX_TARGETS:
+        raise Refusal("ROUTINE_REFUSED", f"a routine cycle retires 1 to {ROUTINE_MAX_TARGETS} targets")
+    root = os.path.realpath(F.target_root())
+    for entry in groups:
+        g = entry["group"]
+        if g.get("orphan_route") or g.get("source_exists") is not True or not entry["sources"]:
+            raise Refusal("ROUTINE_REFUSED", f"{g.get('directory')}: orphan or source-less caches need an owner-signed "
+                          "scoped run")
+        if not isinstance(g.get("directory"), str) or os.path.dirname(g["directory"]) != root:
+            raise Refusal("ROUTINE_REFUSED", f"{g.get('directory')} is not a cache in {root}")
+        if not isinstance(g.get("source_head"), str) or not re.fullmatch(r"[0-9a-f]{40}", g["source_head"]):
+            raise Refusal("ROUTINE_REFUSED", f"{g.get('directory')}: a routine manifest must pin the source HEAD")
+
+
+def consume_scoped_run(path, exec_id):
+    """Atomically mark the record used (before any mutation).  A second run fails here.
+    The nonce is also appended to scoped-runs/used-nonces.log (defence in depth; like all
+    same-account state it is tamper-evident only, see LIMITATION)."""
+    marker = consumed_path(os.path.normpath(os.path.abspath(path)))
+    try:
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except FileExistsError:
+        raise Refusal("SCOPED_RUN_REPLAYED", "scoped-run records are single-use") from None
+    try:
+        os.write(fd, (json.dumps({"exec_id": exec_id, "pid": os.getpid(), "at": real_now()}) + "\n").encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        nonce = json.loads(read_owned_bytes(os.path.normpath(os.path.abspath(path))))["nonce"]
+        ledger = os.open(os.path.join(os.path.dirname(marker), "used-nonces.log"),
+                         os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            os.write(ledger, f"{nonce} {exec_id}\n".encode())
+            os.fsync(ledger)
+        finally:
+            os.close(ledger)
+    except (OSError, ValueError, KeyError, Refusal) as error:
+        raise Refusal("SCOPED_RUN_UNUSABLE", f"the nonce could not be recorded ({error}); nothing was changed") from None
+    fsync_dir(os.path.dirname(marker))
+
+
+def record_signed_retirements(receipt):
+    """After an owner-signed execution, record `last_retired` (route OWNER_SIGNED) for every
+    fully RETIRED target, so the worktree gate can verify it.  Only when the receipt is in
+    the instance's own receipts directory; returns the problems."""
+    problems = []
+    receipts = os.path.join(maintenance_dir(), "receipts")
+    rfile, jfile = receipt.get("receipt_file"), receipt.get("journal_file")
+    if not rfile or os.path.dirname(rfile) != receipts or not jfile or os.path.dirname(jfile) != receipts:
+        return [f"evidence not recorded: receipts are outside {receipts}"]
+    scoped = receipt["scoped_run"]
+    registry = F.Registry(create=True)
+    try:
+        receipt_sha, journal_sha = sha256_file(rfile), sha256_file(jfile)
+    except OSError as error:
+        return [f"evidence not recorded: {error}"]
+    for g in receipt.get("groups", []):
+        if g.get("outcome") != "RETIRED":
+            continue
+        target = g["directory"]
+        key = F.key_for(target)
+        try:
+            st = os.lstat(target)
+            meta = registry.meta_lock()
+            try:
+                state, record = registry.read_checked("targets", key, F.valid_target_record)
+                if state != "ok":
+                    problems.append(f"{target}: no valid lifecycle record")
+                    continue
+                record["last_retired"] = {
+                    "at": real_now(), "bytes": g.get("accounted_freed_bytes", 0), "route": "OWNER_SIGNED",
+                    "receipt": rfile, "receipt_sha256": receipt_sha, "journal": jfile, "journal_sha256": journal_sha,
+                    "manifest_sha256": receipt.get("manifest_sha256"), "identity": {"dev": st.st_dev, "ino": st.st_ino},
+                    "scoped_run": scoped["path"], "scoped_run_sha256": scoped["sha256"],
+                    "signer_fingerprint": scoped.get("signer_fingerprint"),
+                }
+                F.atomic_write(registry.path("targets", key), record)
+            finally:
+                meta.close()
+        except OSError as error:
+            problems.append(f"{target}: {error}")
+    return problems
 
 
 ORPHAN_ROUTE = "GIT_PRESERVED"
@@ -1076,6 +1657,11 @@ def evaluate_group(entry, registry, args, census, now_ts, execute, own_lock=Fals
         hold("PIN_STATE_UNKNOWN", "the pin record is unreadable or malformed; a corrupt pin is never 'no pin'")
     elif pins:
         hold("PINNED", ",".join(sorted({p["reason"] for p in pins})))
+    listed = F.hold_listed(target, *(sources or []), (record or {}).get("worktree"),
+                           heads=(group.get("source_head"), (record or {}).get("head"),
+                                  ((record or {}).get("released") or {}).get("head")))
+    if listed:
+        hold(listed, "the owner's HOLD list protects this checkout/cache unconditionally")
     locked = False if own_lock else registry.probe_lock(key)
     if locked:
         hold("BUILD_LOCK_HELD")
@@ -1156,7 +1742,7 @@ def evaluate_entry(entry_path, group, dev_expect):
         return "UNREADABLE", rel
     if (st.st_dev, st.st_ino, st.st_mode) != dev_expect:
         return "PATH_IDENTITY_MISMATCH", rel
-    if residue_layout(rel, parent) and not F.residue_executable(norm, st):
+    if residue_layout(strip_ra(rel), parent) and not F.residue_executable(norm, st):
         # same stat that matched the manifest: a reappeared, relinked or swapped file is held
         return "NOT_A_COMPILER_ARTIFACT", rel
     if stat.S_ISLNK(st.st_mode):
@@ -1209,6 +1795,7 @@ def run(args):
         finish(args, receipt)
         return 3
     receipt["manifest_sha256"] = digest
+    scoped = None
     RESIDUE.clear()
     if args.resume_journal:
         try:
@@ -1230,6 +1817,24 @@ def run(args):
             receipt["refused"] = refusal
             finish(args, receipt)
             return refusal.get("rc", 4)
+        # authorisation, after the receipt-directory and fencing checks above (so a refusal
+        # never writes into a cache) and before anything is created or changed
+        try:
+            if args.routine:
+                routine_check(args, groups)
+                receipt["authorisation"] = "ROUTINE_SAFETY_GATES"
+            else:
+                scoped, scoped_sha, facts = check_scoped_run(args.scoped_run, groups, digest, args.manifest,
+                                                             real_now(), receipt_dir=args.receipt_dir)
+                receipt["authorisation"] = "OWNER_SIGNED"
+                receipt["scoped_run"] = dict(facts, path=os.path.normpath(os.path.abspath(args.scoped_run)),
+                                             sha256=scoped_sha, nonce=scoped["nonce"],
+                                             recorded_by=scoped.get("recorded_by"),
+                                             created_at=scoped.get("created_at"), expires_at=scoped.get("expires_at"))
+        except Refusal as refusal:
+            receipt["refused"] = {"code": refusal.code, "detail": refusal.detail}
+            finish(args, receipt)
+            return 4
         exec_id = time.strftime("%Y%m%dT%H%M%S") + f"-{time.time_ns() % 10**9:09d}-{os.getpid()}"
         backlog = journal_backlog(args.receipt_dir)
         if backlog[0] and not args.acknowledge_incomplete_journals:
@@ -1239,10 +1844,29 @@ def run(args):
             return 6
         receipt["reconciled_interrupted"] = backlog[1]
         try:
+            # re-check record AND signature immediately before consuming the record, then
+            # consume it before the journal (and so before any mutation): a second run fails here
+            if scoped is not None:
+                _, sha_again, facts_again = check_scoped_run(args.scoped_run, groups, digest, args.manifest,
+                                                             real_now(), receipt_dir=args.receipt_dir)
+                if sha_again != receipt["scoped_run"]["sha256"] or \
+                        facts_again["signature_sha256"] != receipt["scoped_run"]["signature_sha256"]:
+                    raise Refusal("SCOPED_RUN_MISMATCH", "the record or its signature changed during preparation")
+                consume_scoped_run(args.scoped_run, exec_id)
+        except Refusal as refusal:
+            receipt["refused"] = {"code": refusal.code, "detail": refusal.detail}
+            finish(args, receipt)
+            return 4
+        except OSError as error:
+            receipt["refused"] = {"code": "SCOPED_RUN_UNUSABLE", "detail": f"{error}; nothing was changed"}
+            finish(args, receipt)
+            return 4
+        try:
             journal = Journal.create(args.receipt_dir, exec_id)
             journal.write({
                 "event": "begin", "exec_id": exec_id, "manifest": receipt["manifest"],
                 "manifest_sha256": digest, "approved_sha256": args.approved_sha256,
+                "authorisation": receipt["authorisation"], "scoped_run": receipt.get("scoped_run"),
                 "host": receipt["host"], "pid": os.getpid(), "policy": receipt["policy"],
                 "acknowledged_incomplete": sorted(backlog[0]),
                 "reconciled_interrupted": backlog[1],
@@ -1274,6 +1898,20 @@ def run(args):
     status = 0
     try:
         for entry in groups:
+            stop = any(r.get("outcome") == "ABORTED" for r in receipt["groups"]) or (
+                execute and args.routine and any(r.get("outcome") != "RETIRED" for r in receipt["groups"]))
+            if stop and not any(r.get("outcome") == "ABORTED" for r in receipt["groups"]):
+                # routine mode: the plan selected only eligible targets, so anything not fully
+                # RETIRED at execution time is uncertain: stop and report, touch nothing more
+                receipt["groups"].append({
+                    "directory": entry["group"]["directory"], "outcome": "NOT_STARTED_ROUTINE_STOPPED", "holds": [],
+                    "paths": [{"path": i["path"], "outcome": "UNTOUCHED", "reason": "ROUTINE_STOPPED"}
+                              for i in entry["paths"]],
+                    "paths_selected": 0, "paths_held": 0, "paths_partial": 0, "estimated_recoverable_bytes": 0,
+                    "paths_individually_eligible": 0, "accounted_freed_bytes": 0, "retained_hardlink_bytes": 0,
+                })
+                receipt["routine_stopped"] = True
+                continue
             if any(r.get("outcome") == "ABORTED" for r in receipt["groups"]):
                 receipt["groups"].append({
                     "directory": entry["group"]["directory"], "outcome": "NOT_STARTED_RUN_ABORTED", "holds": [],
@@ -1338,6 +1976,14 @@ def run(args):
         status = status or 5
     if journal is not None:
         journal.close()
+    if execute and scoped is not None and receipt.get("receipt_file") and os.path.isfile(receipt["receipt_file"]) \
+            and not receipt.get("interrupted") and status != 5:
+        try:
+            problems = record_signed_retirements(receipt)
+        except OSError as error:
+            problems = [f"evidence not recorded: {error}"]
+        for problem in problems:
+            print(f"emuwiz-cargo-retire: {problem}", file=sys.stderr)
     return status
 
 
@@ -1352,7 +1998,7 @@ def prepare_execution(args, groups, directories, sources):
         if receipt_dir == root or receipt_dir.startswith(root + os.sep):
             return {"code": "RECEIPT_DIR_INSIDE_CACHE", "detail": f"{receipt_dir} is inside {root}", "rc": 4}
     try:
-        os.makedirs(args.receipt_dir, mode=0o700, exist_ok=True)
+        makedirs_private(args.receipt_dir)
         rst = os.lstat(args.receipt_dir)
     except OSError as error:
         return {"code": "RECEIPT_DIR_UNSAFE", "detail": f"{args.receipt_dir}: {error.strerror or error}", "rc": 4}
@@ -2105,6 +2751,11 @@ def process_group(entry, registry, args, census, now_ts, execute, journal=None):
                 else:
                     fresh = F.Census([target] + entry["sources"])
                     holds, final_ctx = evaluate_group(entry, registry, args, fresh, F.now(), True, own_lock=True)
+                    if not holds and getattr(args, "routine", False):
+                        # under the lifecycle lock and fence, immediately before deletion
+                        problem = routine_authority_problem(group)
+                        if problem:
+                            holds = [{"code": "ROUTINE_CONDITION_CHANGED", "detail": problem}]
                 if holds:
                     out["holds"] = holds
                     for path in out["paths"]:
@@ -2436,7 +3087,7 @@ def finish(args, receipt):
     # A receipt directory inside a cache is refused: never write the refusal there.
     inside = (receipt.get("refused") or {}).get("code") == "RECEIPT_DIR_INSIDE_CACHE"
     if args.receipt_dir and not inside:
-        os.makedirs(args.receipt_dir, mode=0o700, exist_ok=True)
+        makedirs_private(args.receipt_dir)
         name = "retire-%s-%s.json" % ("execute" if args.execute else "dryrun", time.strftime("%Y%m%dT%H%M%S"))
         F.atomic_write(os.path.join(args.receipt_dir, name), receipt)
         fsync_dir(args.receipt_dir)
@@ -2500,6 +3151,12 @@ def main(argv=None):
     p.add_argument("--acknowledge-incomplete-journals", action="store_true",
                    help="allow --execute although earlier incomplete journals exist (they are kept)")
     p.add_argument("--execute", action="store_true", help="actually delete (default is a dry run)")
+    p.add_argument("--routine", action="store_true",
+                   help="with --execute: a routine cycle of participating, released caches with live sources "
+                        "(emuwiz-cargo-maintain run); refuses every exceptional option")
+    p.add_argument("--scoped-run", metavar="FILE",
+                   help="with --execute: the scoped-run record naming exactly this manifest's targets, plus its "
+                        "owner signature FILE.sig; a finished task or the record alone never authorises deletion")
     p.add_argument("--resume-journal", metavar="FILE",
                    help="journal of an earlier PARTIAL run of THIS approved manifest: lets its incremental "
                         "directory be recognised despite the lock/session residue that run left (see "
@@ -2510,10 +3167,21 @@ def main(argv=None):
     p.add_argument("--assume-adopted", action="store_true",
                    help="DRY RUN ONLY: pretend verified ownership exists, to size the remaining holds")
     p.add_argument("--min-idle-hours", type=float, default=F.MIN_IDLE_HOURS)
+    p.add_argument("--verify-scoped-run", action="store_true",
+                   help="read-only: with --manifest, --approved-sha256 and --scoped-run, check the record and its owner "
+                        "signature exactly as --execute would, then exit (0 valid, 4 refused); consumes and deletes nothing")
+    p.add_argument("--check-owner-signing", action="store_true",
+                   help="read-only: is owner-signature verification installed and usable? (exit 0 yes, 8 no)")
+    p.add_argument("--selftest", metavar="FILE",
+                   help=f"with --check-owner-signing: also verify FILE.sig, made with -n {SELFTEST_NAMESPACE}")
     p.add_argument("--json", action="store_true")
     p.add_argument("--as-user", metavar="OWNER",
                    help="required when started as root: do all file work as OWNER (root is kept only for the process census)")
     args = p.parse_args(argv)
+    if args.check_owner_signing:
+        ok, report = owner_signing_status(args.selftest)
+        print(json.dumps(report, indent=1, sort_keys=True))
+        return 0 if ok else 8
     enter_privileged(args.as_user)
     if args.inspect_journal:
         print(json.dumps(inspect_journal(args.inspect_journal), indent=1, sort_keys=True))
@@ -2524,6 +3192,19 @@ def main(argv=None):
         return status
     if not args.manifest or not args.approved_sha256:
         p.error("--manifest and --approved-sha256 are required")
+    if args.verify_scoped_run:
+        if args.execute:
+            p.error("--verify-scoped-run never executes")
+        try:
+            _, digest, groups = load_manifest(args.manifest, args.approved_sha256)
+            record, sha, facts = check_scoped_run(args.scoped_run, groups, digest, args.manifest, real_now(),
+                                                  receipt_dir=args.receipt_dir)
+        except Refusal as refusal:
+            print(json.dumps({"valid": False, "code": refusal.code, "detail": refusal.detail}, indent=1, sort_keys=True))
+            return 4
+        print(json.dumps(dict(facts, valid=True, sha256=sha, targets=len(record["targets"]),
+                              expires_at=record["expires_at"]), indent=1, sort_keys=True))
+        return 0
     return run(args)
 
 

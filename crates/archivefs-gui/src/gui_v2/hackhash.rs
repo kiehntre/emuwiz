@@ -50,6 +50,9 @@ pub(super) struct HackHashPageState {
     confirmation: String,
     error: Option<String>,
     remote_url: String,
+    /// HackHash exports already sitting in the Downloads folder, found by
+    /// name only (nothing is read or imported until the user picks one).
+    downloaded_exports: Vec<PathBuf>,
     update: Option<UpdateCheck>,
     fetch_state: Option<HackHashFetchState>,
 }
@@ -74,17 +77,32 @@ impl HackHashPageState {
         }
         state.store = Some(store);
         state.remote_url = String::new();
+        state.downloaded_exports = default_downloads_dir()
+            .map(|dir| find_hackhash_exports_in(&dir))
+            .unwrap_or_default();
         state
     }
 
     fn choose_and_validate(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .set_title("Choose HackHash detailed JSON export")
-            .add_filter("JSON", &["json"])
+            .set_title("Choose the HackHash file you downloaded")
+            .add_filter("HackHash export", &["json"])
             .pick_file()
         else {
             return;
         };
+        self.import_file_from(path);
+    }
+
+    fn refresh_downloaded_exports(&mut self) {
+        self.downloaded_exports = default_downloads_dir()
+            .map(|dir| find_hackhash_exports_in(&dir))
+            .unwrap_or_default();
+    }
+
+    /// Validates a chosen or found export into the review stage. Nothing is
+    /// used until the user reviews it and confirms.
+    fn import_file_from(&mut self, path: PathBuf) {
         let Some(store) = self.store.as_ref() else {
             self.error = Some("HackHash snapshot storage is unavailable.".into());
             return;
@@ -314,8 +332,8 @@ impl HackHashPageState {
 
     pub(super) fn show(&mut self, ui: &mut egui::Ui) {
         ui.heading("ROM hack identification (HackHash)");
-        ui.label("HackHash is a community list of known ROM hacks. EmuWiz uses it only as extra evidence to help recognise hacked games; it never replaces your verified identification.");
-        ui.label("EmuWiz only downloads the list. It never uploads your games, file names or file fingerprints.");
+        ui.label("Optional. HackHash is a community list of known ROM hacks that helps EmuWiz recognise hacked games. Your library, scanning and Play all work without it, so you can skip this.");
+        ui.label("EmuWiz never uploads your games, file names or file fingerprints.");
         // Status, in plain words.
         if let Some(active) = &self.active {
             let hacks = active.record_count.unwrap_or(0);
@@ -334,15 +352,44 @@ impl HackHashPageState {
                 None => format!("Installed list: {hacks} known hacks."),
             });
         } else {
-            ui.label("No HackHash list is installed yet. Hacked games are simply not recognised until one is.");
+            ui.label("No HackHash list added yet. That is fine: hacked games are simply not recognised until you add one.");
+            ui.label("To add it: download the HackHash \"detailed\" export in your web browser, then press \"Add HackHash list\" below (EmuWiz shows you what it contains before anything is used).");
+        }
+        // One-click shortcut for a file that is already in Downloads.
+        let mut chosen_download = None;
+        for path in &self.downloaded_exports {
+            let name = path
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            if ui
+                .button(format!("Use {name} from your Downloads folder"))
+                .on_hover_text("Checks the file first and shows you what it contains. Nothing is used until you confirm.")
+                .clicked()
+            {
+                chosen_download = Some(path.clone());
+            }
+        }
+        if ui
+            .small_button("Look in Downloads again")
+            .on_hover_text("Checks your Downloads folder for a HackHash file.")
+            .clicked()
+        {
+            self.refresh_downloaded_exports();
+        }
+        if let Some(path) = chosen_download {
+            if path.is_file() {
+                self.import_file_from(path);
+            } else {
+                // The file went away since it was listed: say so, and relist.
+                self.error = Some("That file is no longer in your Downloads folder.".into());
+                self.refresh_downloaded_exports();
+            }
         }
         if let Some(path) = &self.selected_path {
             ui.label(format!("Chosen file: {}", path.display()));
         }
-        // Where the list comes from.
-        if self.remote_url.trim().is_empty() {
-            ui.label("Download address: not set. Enter the address of a HackHash export under Advanced details, or load a copy you already downloaded.");
-        } else {
+        // The web address is an advanced option; most people just add the file.
+        if !self.remote_url.trim().is_empty() {
             ui.label(format!("Downloads from: {}", self.remote_url.trim()));
         }
         if let Some(staged) = &self.staged {
@@ -385,25 +432,30 @@ impl HackHashPageState {
         }
         ui.horizontal_wrapped(|ui| {
             if ui
-                .button("Check for a newer list")
-                .on_hover_text("Asks the download address whether a newer list exists. Nothing is downloaded.")
-                .clicked()
-            {
-                self.check_for_update();
-            }
-            if ui
-                .button("Download list")
-                .on_hover_text("Downloads the list from the address shown above. It is not used until you review it and confirm.")
-                .clicked()
-            {
-                self.fetch_candidate();
-            }
-            if ui
-                .button("Load list from a file…")
-                .on_hover_text("Use a HackHash export you already downloaded (a .json file).")
+                .button("Add HackHash list…")
+                .on_hover_text("Pick the HackHash file you downloaded. EmuWiz checks it and shows what it contains first.")
                 .clicked()
             {
                 self.choose_and_validate();
+            }
+            // Web-address features only appear once an address is set under
+            // Advanced details, so the normal path never asks for a URL.
+            let has_address = !self.remote_url.trim().is_empty();
+            if has_address
+                && ui
+                    .button("Check for a newer list")
+                    .on_hover_text("Asks the download address whether a newer list exists. Nothing is downloaded.")
+                    .clicked()
+            {
+                self.check_for_update();
+            }
+            if has_address
+                && ui
+                    .button("Download list")
+                    .on_hover_text("Downloads the list from the address shown above. It is not used until you review it and confirm.")
+                    .clicked()
+            {
+                self.fetch_candidate();
             }
             if ui
                 .add_enabled(self.staged.is_some(), egui::Button::new("Review downloaded list"))
@@ -433,7 +485,7 @@ impl HackHashPageState {
         ui.collapsing("Advanced details", |ui| {
             ui.label(format!("Parser schema: {HACKHASH_PARSER_SCHEMA_VERSION}"));
             ui.horizontal_wrapped(|ui| {
-                ui.label("Export address (detailed JSON URL):");
+                ui.label("Optional web address to download the list from automatically:");
                 ui.add(egui::TextEdit::singleline(&mut self.remote_url).desired_width(360.0));
             });
             if let Some(active) = &self.active {
@@ -705,6 +757,65 @@ fn show_apply_status(ui: &mut egui::Ui, result: &archivefs_core::patch_manager::
     crate::shared_apply_warnings::show(ui, &crate::shared_apply_warnings::lines(result));
 }
 
+/// The user's Downloads folder: the environment override, then the desktop's
+/// own `~/.config/user-dirs.dirs` (where a localized or relocated folder is
+/// actually recorded), then `~/Downloads`.
+fn default_downloads_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    if let Some(dir) = std::env::var_os("XDG_DOWNLOAD_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        return Some(dir);
+    }
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    std::fs::read_to_string(config.join("user-dirs.dirs"))
+        .ok()
+        .and_then(|text| downloads_dir_from_user_dirs(&text, &home))
+        .or_else(|| Some(home.join("Downloads")))
+}
+
+/// Parses `XDG_DOWNLOAD_DIR="$HOME/Downloads"` from `user-dirs.dirs` text.
+fn downloads_dir_from_user_dirs(text: &str, home: &std::path::Path) -> Option<PathBuf> {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("XDG_DOWNLOAD_DIR="))?;
+    let value = line.split_once('=')?.1.trim().trim_matches('"');
+    let resolved = match value.strip_prefix("$HOME") {
+        Some(rest) => home.join(rest.trim_start_matches('/')),
+        None => PathBuf::from(value),
+    };
+    resolved.is_absolute().then_some(resolved)
+}
+
+/// Lists likely HackHash exports directly inside `dir` (no recursion, regular
+/// non-symlink `.json` files with "hackhash" in the name, newest first, at
+/// most three). Reads directory entries only; no file is opened.
+fn find_hackhash_exports_in(dir: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .take(20_000)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+            let metadata = std::fs::symlink_metadata(&path).ok()?;
+            (metadata.file_type().is_file()
+                && name.ends_with(".json")
+                && name.contains("hackhash")
+                && metadata.len() <= 512 * 1024 * 1024)
+                .then(|| (metadata.modified().unwrap_or(std::time::UNIX_EPOCH), path))
+        })
+        .collect();
+    found.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    found.into_iter().map(|(_, path)| path).take(3).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,5 +835,62 @@ mod tests {
         assert!(state.active.is_none());
         assert!(state.staged.is_none());
         assert!(state.preview.is_none());
+    }
+
+    #[test]
+    fn downloads_finder_offers_only_plain_hackhash_json_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str| std::fs::write(dir.path().join(name), b"{}").unwrap();
+        write("HackHash-detailed-2026.JSON");
+        write("hackhash_export.json");
+        write("holiday-photos.json");
+        write("hackhash-notes.txt");
+        std::fs::create_dir(dir.path().join("hackhash-folder.json")).unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("holiday-photos.json"),
+            dir.path().join("hackhash-link.json"),
+        )
+        .unwrap();
+        let found = find_hackhash_exports_in(dir.path());
+        let names: std::collections::BTreeSet<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            ["HackHash-detailed-2026.JSON", "hackhash_export.json"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        );
+        assert!(find_hackhash_exports_in(&dir.path().join("missing")).is_empty());
+    }
+
+    #[test]
+    fn the_first_view_never_asks_for_an_address() {
+        let state = HackHashPageState::default();
+        assert!(state.remote_url.trim().is_empty());
+        assert!(state.downloaded_exports.is_empty());
+    }
+
+    #[test]
+    fn user_dirs_file_locates_a_relocated_downloads_folder() {
+        let home = std::path::Path::new("/home/someone");
+        assert_eq!(
+            downloads_dir_from_user_dirs(
+                "XDG_DOCUMENTS_DIR=\"$HOME/Docs\"\nXDG_DOWNLOAD_DIR=\"$HOME/Descargas\"\n",
+                home
+            ),
+            Some(PathBuf::from("/home/someone/Descargas"))
+        );
+        assert_eq!(
+            downloads_dir_from_user_dirs("XDG_DOWNLOAD_DIR=\"/mnt/big/dl\"\n", home),
+            Some(PathBuf::from("/mnt/big/dl"))
+        );
+        assert_eq!(
+            downloads_dir_from_user_dirs("XDG_DOWNLOAD_DIR=\"relative\"\n", home),
+            None
+        );
+        assert_eq!(downloads_dir_from_user_dirs("nothing here", home), None);
     }
 }

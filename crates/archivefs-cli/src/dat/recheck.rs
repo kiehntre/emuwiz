@@ -1,0 +1,675 @@
+//! `dat recheck`: lists saved DAT results that are no longer backed by
+//! current evidence and, with `--confirm`, checks those games again.
+//!
+//! Without `--confirm` nothing is hashed and nothing is written. With it,
+//! game files are read (never changed) and the library database is updated
+//! one bounded set at a time. Ctrl-C stops the run: the set being read is
+//! given up, every finished set stays saved, and running the command again
+//! continues with the rest.
+//!
+//! With `--unchecked` the same steps cover games that have no saved DAT
+//! result yet (first-time matching): a game is checked only when its system
+//! is known and exactly one usable catalogue is installed for it. Several
+//! fitting catalogues are never ranked; those games wait for a choice in
+//! Check Games.
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use archivefs_core::dat::reaudit::{
+    FirstMatchPlan, FirstMatchWait, ReauditBlock, ReauditCatalogues, ReauditGroup, ReauditLimits,
+    ReauditPlan, ReauditProgress, ReauditReport, ReauditStop, plan_first_matching, plan_reaudit,
+    run_reaudit,
+};
+use archivefs_core::dat::sources::audit_run::DatAuditProgress;
+use archivefs_core::safe_read::TrustedRoots;
+use archivefs_core::{Config, SavedDatEvidenceStatus};
+use serde::Serialize;
+
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_interrupt(_: libc::c_int) {
+    STOP.store(true, Ordering::Relaxed);
+}
+
+fn status_text(status: SavedDatEvidenceStatus) -> &'static str {
+    match status {
+        SavedDatEvidenceStatus::Current => "current",
+        SavedDatEvidenceStatus::MissingProof => "saved before proof was recorded",
+        SavedDatEvidenceStatus::FileChanged => "file changed since it was checked",
+        SavedDatEvidenceStatus::FileUnavailable => "file missing or storage not connected",
+        SavedDatEvidenceStatus::CatalogueChanged => "catalogue changed since it was checked",
+        SavedDatEvidenceStatus::CatalogueUnavailable => "catalogue not available",
+        SavedDatEvidenceStatus::DoesNotApply => "saved result does not apply",
+    }
+}
+
+fn block_text(block: ReauditBlock) -> &'static str {
+    match block {
+        ReauditBlock::CatalogueUnavailable => {
+            "catalogue disabled, removed, a folder of several files, or unreadable"
+        }
+        ReauditBlock::SystemUnknown => "the game has no known system",
+        ReauditBlock::FileUnavailable => "file missing or storage not connected",
+        ReauditBlock::DoesNotApply => "saved result does not apply to this game",
+        ReauditBlock::LeftOutOfThisRun => "left out of this run by --limit",
+    }
+}
+
+#[derive(Serialize)]
+struct TallyJson {
+    saved_results: usize,
+    current: usize,
+    not_applicable: usize,
+    skipped: usize,
+    eligible: usize,
+    completed: usize,
+    verified: usize,
+    no_match: usize,
+    need_choice: usize,
+    failed: usize,
+    not_reached: usize,
+}
+
+fn tally_json(tally: archivefs_core::dat::reaudit::ReauditTally) -> TallyJson {
+    TallyJson {
+        saved_results: tally.saved_results,
+        current: tally.current,
+        not_applicable: tally.not_applicable,
+        skipped: tally.skipped,
+        eligible: tally.eligible,
+        completed: tally.completed,
+        verified: tally.verified,
+        no_match: tally.no_match,
+        need_choice: tally.need_choice,
+        failed: tally.failed,
+        not_reached: tally.not_reached,
+    }
+}
+
+fn print_tally(tally: &TallyJson, after_run: bool) {
+    println!("Saved DAT results: {}", tally.saved_results);
+    println!(
+        "  {:>7}  current         already backed by a current check; not read again",
+        tally.current
+    );
+    println!(
+        "  {:>7}  not applicable  historical results that say nothing about their game (for example a no-match from another system's catalogue); kept as they are",
+        tally.not_applicable
+    );
+    println!(
+        "  {:>7}  skipped         cannot be checked now (catalogue unavailable, system not known, file not reachable, or left out by --limit)",
+        tally.skipped
+    );
+    println!(
+        "  {:>7}  eligible        lost their proof and can be checked again by reading the game",
+        tally.eligible
+    );
+    if after_run {
+        println!("  of the eligible:");
+        println!(
+            "  {:>7}  completed       a definitive result was reached and saved",
+            tally.completed
+        );
+        println!(
+            "  {:>7}    verified      the file matches one catalogue entry exactly",
+            tally.verified
+        );
+        println!(
+            "  {:>7}    no match      the file is not in the catalogue",
+            tally.no_match
+        );
+        println!(
+            "  {:>7}    need a choice more than one catalogue entry fits",
+            tally.need_choice
+        );
+        println!(
+            "  {:>7}  failed          looked at, no result could be saved (reasons below); unchanged",
+            tally.failed
+        );
+        println!(
+            "  {:>7}  not reached     the run stopped before them",
+            tally.not_reached
+        );
+    }
+}
+
+#[derive(Serialize)]
+struct PlanJson {
+    tally: TallyJson,
+    saved_rows: usize,
+    current: usize,
+    to_check: usize,
+    bytes: u64,
+    by_reason: BTreeMap<&'static str, usize>,
+    groups: Vec<GroupJson>,
+    cannot_check: BTreeMap<&'static str, usize>,
+}
+
+#[derive(Serialize)]
+struct GroupJson {
+    source_id: String,
+    catalogue: String,
+    system: String,
+    games: usize,
+    /// For a system's catalogue set: every catalogue each game is read
+    /// against, by source id.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    catalogue_set: Vec<String>,
+}
+
+fn group_json(group: &ReauditGroup) -> GroupJson {
+    GroupJson {
+        source_id: group.source_id.clone(),
+        catalogue: group.catalogue_name.clone(),
+        system: group.platform.clone(),
+        games: group.items.len(),
+        catalogue_set: group.pool.iter().map(|c| c.source_id.clone()).collect(),
+    }
+}
+
+fn print_group(group: &GroupJson) {
+    if group.catalogue_set.is_empty() {
+        println!(
+            "    {:>7}  {} against {} ({})",
+            group.games, group.system, group.catalogue, group.source_id
+        );
+    } else {
+        println!(
+            "    {:>7}  {} against all {} (only one identity they agree on is saved)",
+            group.games, group.system, group.catalogue
+        );
+    }
+}
+
+#[derive(Serialize)]
+struct ReportJson {
+    tally: TallyJson,
+    planned: usize,
+    verified: usize,
+    no_match: usize,
+    ambiguous: usize,
+    saved: usize,
+    sets_saved: usize,
+    not_checked: Vec<NoteJson>,
+    no_longer_matching: Vec<NoteJson>,
+    not_reached: usize,
+    stopped: Option<String>,
+    warnings: Vec<String>,
+    seconds: f64,
+}
+
+#[derive(Serialize)]
+struct NoteJson {
+    archive_id: i64,
+    source_id: String,
+    path: String,
+    reason: String,
+}
+
+fn plan_json(plan: &ReauditPlan) -> PlanJson {
+    let mut cannot_check = BTreeMap::new();
+    for blocked in &plan.blocked {
+        *cannot_check.entry(block_text(blocked.block)).or_insert(0) += 1;
+    }
+    PlanJson {
+        tally: tally_json(plan.tally()),
+        saved_rows: plan.saved_rows,
+        current: plan.current,
+        to_check: plan.games(),
+        bytes: plan.bytes(),
+        by_reason: plan
+            .by_status()
+            .into_iter()
+            .map(|(status, count)| (status_text(status), count))
+            .collect(),
+        groups: plan.groups.iter().map(group_json).collect(),
+        cannot_check,
+    }
+}
+
+fn print_plan(plan: &PlanJson) {
+    print_tally(&plan.tally, false);
+    println!(
+        "Eligible: {} ({:.1} GiB by recorded size)",
+        plan.to_check,
+        plan.bytes as f64 / (1u64 << 30) as f64
+    );
+    for (reason, count) in &plan.by_reason {
+        println!("    {count:>7}  {reason}");
+    }
+    for group in &plan.groups {
+        print_group(group);
+    }
+    let cannot: usize = plan.cannot_check.values().sum();
+    println!("Not eligible ({cannot}), by reason:");
+    for (reason, count) in &plan.cannot_check {
+        println!("    {count:>7}  {reason}");
+    }
+}
+
+fn report_json(report: &ReauditReport, plan: &ReauditPlan, seconds: f64) -> ReportJson {
+    ReportJson {
+        tally: tally_json(report.tally(plan)),
+        planned: report.planned,
+        verified: report.verified,
+        no_match: report.no_match,
+        ambiguous: report.ambiguous,
+        saved: report.saved,
+        sets_saved: report.sets_saved,
+        not_checked: report
+            .not_checked
+            .iter()
+            .map(|note| NoteJson {
+                archive_id: note.archive_id,
+                source_id: note.source_id.clone(),
+                path: note.path.display().to_string(),
+                reason: note.reason.clone(),
+            })
+            .collect(),
+        no_longer_matching: report
+            .contradictions
+            .iter()
+            .map(|c| NoteJson {
+                archive_id: c.archive_id,
+                source_id: c.source_id.clone(),
+                path: c.path.display().to_string(),
+                reason: format!("saved as {}, now {:?}", c.saved_verdict, c.now),
+            })
+            .collect(),
+        not_reached: report.not_reached,
+        stopped: report.stopped.as_ref().map(|stop| match stop {
+            ReauditStop::Cancelled => "stopped on request".to_string(),
+            ReauditStop::Interrupted(reason) => reason.clone(),
+        }),
+        warnings: report.warnings.clone(),
+        seconds,
+    }
+}
+
+fn wait_text(wait: &FirstMatchWait) -> String {
+    match wait {
+        FirstMatchWait::SystemUnknown => "the game has no known system".into(),
+        FirstMatchWait::NoCatalogue => "no usable catalogue for the system (none installed, disabled, not validated, or changed since it was validated)".into(),
+        FirstMatchWait::NeedsChoice { catalogues } => format!(
+            "several catalogues fit ({}); choose one in Check Games",
+            catalogues.join(", ")
+        ),
+        FirstMatchWait::CatalogueUnusable(why) => format!("the catalogue cannot be used: {why}"),
+        FirstMatchWait::FileUnavailable => "file missing or storage not connected".into(),
+    }
+}
+
+#[derive(Serialize)]
+struct FirstPlanJson {
+    already_checked: usize,
+    to_check: usize,
+    checked_elsewhere: usize,
+    tried_before: usize,
+    left_out_by_limit: usize,
+    bytes: u64,
+    groups: Vec<GroupJson>,
+    waiting: Vec<WaitingJson>,
+    not_listed: usize,
+    not_eligible: Vec<NotEligibleJson>,
+}
+
+#[derive(Serialize)]
+struct NotEligibleJson {
+    system: String,
+    catalogue: String,
+    reason: String,
+}
+
+#[derive(Serialize)]
+struct WaitingJson {
+    system: Option<String>,
+    reason: String,
+    games: usize,
+}
+
+fn first_plan_json(first: &FirstMatchPlan) -> FirstPlanJson {
+    FirstPlanJson {
+        already_checked: first.already_checked,
+        to_check: first.plan.games(),
+        checked_elsewhere: first.checked_elsewhere,
+        tried_before: first.retry.len(),
+        left_out_by_limit: first.left_out(),
+        bytes: first.plan.bytes(),
+        groups: first.plan.groups.iter().map(group_json).collect(),
+        not_listed: first.not_listed,
+        not_eligible: first
+            .not_eligible
+            .iter()
+            .map(|(system, catalogue, reason)| NotEligibleJson {
+                system: system.clone(),
+                catalogue: catalogue.clone(),
+                reason: reason.clone(),
+            })
+            .collect(),
+        waiting: first
+            .waiting
+            .iter()
+            .map(|waiting| WaitingJson {
+                system: waiting.platform.clone(),
+                reason: wait_text(&waiting.wait),
+                games: waiting.games,
+            })
+            .collect(),
+    }
+}
+
+fn print_first_plan(plan: &FirstPlanJson) {
+    println!(
+        "Games with a saved DAT result (left alone; plain `dat recheck` covers them): {}",
+        plan.already_checked
+    );
+    println!(
+        "Games to match for the first time: {} ({:.1} GiB by recorded size)",
+        plan.to_check,
+        plan.bytes as f64 / (1u64 << 30) as f64
+    );
+    for group in &plan.groups {
+        print_group(group);
+    }
+    if plan.checked_elsewhere > 0 {
+        println!(
+            "    {:>7}  of these have results only from other catalogues (kept as they are)",
+            plan.checked_elsewhere
+        );
+    }
+    if plan.tried_before > 0 {
+        println!(
+            "    {:>7}  of these were tried before against the same catalogue without a result",
+            plan.tried_before
+        );
+    }
+    if plan.left_out_by_limit > 0 {
+        println!(
+            "Left out of this run by --limit: {} (games never tried go first)",
+            plan.left_out_by_limit
+        );
+    }
+    if plan.not_listed > 0 {
+        println!(
+            "Checked before against every catalogue of their system and listed in none, unchanged since (not read again): {}",
+            plan.not_listed
+        );
+    }
+    if !plan.not_eligible.is_empty() {
+        println!(
+            "Catalogues left out because this check cannot use them for their system ({}):",
+            plan.not_eligible.len()
+        );
+        for n in &plan.not_eligible {
+            println!("    {}: {}: {}", n.system, n.catalogue, n.reason);
+        }
+    }
+    let waiting: usize = plan.waiting.iter().map(|w| w.games).sum();
+    println!("Waiting, not matched now ({waiting}):");
+    for w in &plan.waiting {
+        println!(
+            "    {:>7}  {}: {}",
+            w.games,
+            w.system.as_deref().unwrap_or("unknown system"),
+            w.reason
+        );
+    }
+}
+
+pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut confirm = false;
+    let mut unchecked = false;
+    let mut json = false;
+    let mut limit = None;
+    let mut database = None;
+    let mut games_per_set = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--confirm" => confirm = true,
+            "--unchecked" => unchecked = true,
+            "--json" => json = true,
+            "--limit" => {
+                limit = Some(
+                    args.next()
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .ok_or("dat recheck: --limit needs a number of games")?,
+                );
+            }
+            "--games-per-set" => {
+                games_per_set = Some(
+                    args.next()
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .filter(|value| *value > 0)
+                        .ok_or("dat recheck: --games-per-set needs a number above zero")?,
+                );
+            }
+            "--database" => {
+                database = Some(PathBuf::from(
+                    args.next().ok_or("dat recheck: --database needs a path")?,
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "dat recheck: unknown argument {other}. Nothing was checked.\n\
+                     usage: dat recheck [--unchecked] [--confirm] [--limit <n>] \
+                     [--games-per-set <n>] [--database <path>] [--json]\n\
+                     Without --confirm this only lists what would be checked. \
+                     --unchecked matches games that have no saved result yet."
+                )
+                .into());
+            }
+        }
+    }
+    let database = match database {
+        Some(path) => std::path::absolute(path)?,
+        None => archivefs_core::default_database_path()?,
+    };
+    let catalogues = ReauditCatalogues::load_default()?;
+    if unchecked {
+        return run_first_time(&database, &catalogues, confirm, json, limit, games_per_set);
+    }
+    let mut plan = plan_reaudit(&database, &catalogues.configured())?;
+    if let Some(limit) = limit {
+        plan = plan.truncated(limit);
+    }
+    let summary = plan_json(&plan);
+    if !confirm {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        } else {
+            print_plan(&summary);
+            println!(
+                "Nothing was read or changed. Add --confirm to check these games again; \
+                 that reads the game files and updates the library database."
+            );
+        }
+        return Ok(());
+    }
+    if !json {
+        print_plan(&summary);
+    }
+    let (report, seconds) = execute(&database, &plan, &catalogues, games_per_set)?;
+    let output = report_json(&report, &plan, seconds);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+    println!(
+        "Checked again in {seconds:.1} s; {} rows saved in {} sets.",
+        output.saved, output.sets_saved
+    );
+    print_tally(&output.tally, true);
+    print_outcome(&output);
+    Ok(())
+}
+
+/// `dat recheck --unchecked`: first-time matching for games with no saved
+/// DAT result, through the same bounded, resumable run as a re-check.
+fn run_first_time(
+    database: &std::path::Path,
+    catalogues: &ReauditCatalogues,
+    confirm: bool,
+    json: bool,
+    limit: Option<usize>,
+    games_per_set: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut first = plan_first_matching(
+        database,
+        &catalogues.configured(),
+        &|platform| catalogues.for_platform(platform),
+        &|source_id| catalogues.resolve(source_id),
+    )?;
+    if let Some(limit) = limit {
+        first = first.truncated(limit);
+    }
+    let summary = first_plan_json(&first);
+    if !confirm {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        } else {
+            print_first_plan(&summary);
+            println!(
+                "Nothing was read or changed. Add --confirm to match these games; \
+                 that reads the game files and saves the results in the library database."
+            );
+        }
+        return Ok(());
+    }
+    if !json {
+        print_first_plan(&summary);
+    }
+    let (report, seconds) = execute(database, &first.plan, catalogues, games_per_set)?;
+    let output = report_json(&report, &first.plan, seconds);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "plan": summary,
+                // The re-check tally describes saved results; a first-time
+                // run has none, so it is left out rather than shown at zero.
+                "run": without_tally(&output)?,
+            }))?
+        );
+        return Ok(());
+    }
+    println!(
+        "Matched in {seconds:.1} s; {} rows saved in {} sets: {} verified, {} no match, {} need a choice.",
+        output.saved, output.sets_saved, output.verified, output.no_match, output.ambiguous
+    );
+    print_outcome(&output);
+    Ok(())
+}
+
+fn without_tally(output: &ReportJson) -> Result<serde_json::Value, serde_json::Error> {
+    let mut value = serde_json::to_value(output)?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("tally");
+    }
+    Ok(value)
+}
+
+/// Runs a planned check with Ctrl-C handling and the configured trusted roots.
+fn execute(
+    database: &std::path::Path,
+    plan: &ReauditPlan,
+    catalogues: &ReauditCatalogues,
+    games_per_set: Option<usize>,
+) -> Result<(ReauditReport, f64), Box<dyn std::error::Error>> {
+    // SAFETY: the handler only stores to an atomic.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            on_interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+    }
+    let trusted = Config::load_default()
+        .ok()
+        .as_ref()
+        .map(TrustedRoots::from_config)
+        .unwrap_or_else(TrustedRoots::none);
+    let mut limits = ReauditLimits::default();
+    if let Some(games) = games_per_set {
+        limits.max_games_per_set = games;
+    }
+    let started = std::time::Instant::now();
+    let report = run_reaudit(
+        database,
+        plan,
+        &|source_id| catalogues.resolve(source_id),
+        &trusted,
+        &STOP,
+        limits,
+        &|progress| match progress {
+            ReauditProgress::SetStarted {
+                platform,
+                games,
+                done,
+                planned,
+                ..
+            } => eprintln!("[{done}/{planned}] checking {games} {platform} games"),
+            ReauditProgress::SetSaved {
+                verified,
+                no_match,
+                ambiguous,
+                not_checked,
+            } => eprintln!(
+                "  saved: {verified} verified, {no_match} no match, {ambiguous} need review, {not_checked} not checked"
+            ),
+            ReauditProgress::SetNotSaved { reason, retrying } => eprintln!(
+                "  not saved{}: {reason}",
+                if retrying { " (trying again)" } else { "" }
+            ),
+            ReauditProgress::CatalogueOfSet {
+                index,
+                of,
+                catalogue,
+            } => {
+                if index == 1 || index == of || index % 25 == 0 {
+                    eprintln!("  catalogue {index}/{of}: {catalogue}");
+                }
+            }
+            ReauditProgress::Audit(DatAuditProgress::Hashing { .. })
+            | ReauditProgress::Audit(_) => {}
+        },
+    )?;
+    Ok((report, started.elapsed().as_secs_f64()))
+}
+
+fn print_outcome(output: &ReportJson) {
+    if !output.no_longer_matching.is_empty() {
+        println!(
+            "{} saved matches no longer match their file (the earlier results are kept for the record):",
+            output.no_longer_matching.len()
+        );
+        for note in output.no_longer_matching.iter().take(20) {
+            println!("  {}: {}", note.path, note.reason);
+        }
+    }
+    if !output.not_checked.is_empty() {
+        println!("{} games were not checked:", output.not_checked.len());
+        for note in output.not_checked.iter().take(20) {
+            println!("  {}: {}", note.path, note.reason);
+        }
+        if output.not_checked.len() > 20 {
+            println!(
+                "  ... and {} more (use --json for all)",
+                output.not_checked.len() - 20
+            );
+        }
+    }
+    for warning in &output.warnings {
+        println!("Note: {warning}");
+    }
+    if let Some(stopped) = &output.stopped {
+        println!(
+            "Stopped early ({stopped}). {} games were not reached. Finished sets are saved; \
+             run the command again to continue.",
+            output.not_reached
+        );
+    }
+    println!(
+        "A verified file matches its catalogue entry. That says nothing about whether an emulator will run it."
+    );
+}

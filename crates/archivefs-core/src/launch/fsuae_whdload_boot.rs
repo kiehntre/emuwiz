@@ -737,6 +737,7 @@ pub(crate) fn preview_fixture() -> BootApproval {
     let evidence = Evidence {
         path: "/nonexistent/job38-preview-only".into(),
         identity: CapturedFileIdentity {
+            changed: None,
             device: 0,
             inode: 0,
             size: 0,

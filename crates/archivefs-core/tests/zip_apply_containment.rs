@@ -265,6 +265,7 @@ fn zip_plan(source: &Path, destination: &Path) -> archivefs_core::archive_workfl
         expanded_bytes: 0,
         eligibility: ArchiveEligibility::Ready,
         warnings: Vec::new(),
+        source_identity: None,
     }
 }
 

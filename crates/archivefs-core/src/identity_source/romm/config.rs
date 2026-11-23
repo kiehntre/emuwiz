@@ -51,9 +51,10 @@ pub const MAX_TOKEN_BYTES: usize = 4096;
 /// declares `platforms.read` and `/api/roms` declares `roms.read`.
 pub const REQUIRED_READ_SCOPES: &[&str] = &["platforms.read", "roms.read"];
 
-/// Scopes that would let EmuWiz change something in RomM. Never requested,
-/// and reported as a warning if the supplied token happens to carry them, so a
-/// person can narrow it.
+/// Scopes that would let EmuWiz change something in RomM. Never requested for
+/// browsing or import. `roms.write` is needed only by the optional Rename
+/// title update ([`super::title_sync`]), through its own separate token file;
+/// the read-only token never needs it.
 pub const UNWANTED_WRITE_SCOPES: &[&str] = &[
     "roms.write",
     "platforms.write",

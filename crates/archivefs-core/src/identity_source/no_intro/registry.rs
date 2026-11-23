@@ -143,8 +143,28 @@ pub fn load_no_intro_sources(
         Some(id) => registry.sorted_enabled_for_platform(id),
         None => registry.sorted_enabled(),
     };
+    // An unassigned catalogue applies to every system, so without this each
+    // new system re-parsed every unassigned DAT in the registry (about 25 s
+    // per system for a 450-DAT No-Intro pack). Its last validated header,
+    // read without opening the DAT, already says which system it lists; only
+    // a catalogue whose unchanged header names other systems is skipped.
+    let entries: Vec<&DatSourceEntry> = match platform_id {
+        Some(id) => entries
+            .into_iter()
+            .filter(|entry| entry.platform.is_some() || !header_names_other_systems(entry, id))
+            .collect(),
+        None => entries,
+    };
     let mut matches = Vec::new();
     for candidate in candidates_for(&entries) {
+        let observed = file_observation(&candidate.path);
+        if observed.as_ref().is_some_and(|key| {
+            not_no_intro_memo()
+                .lock()
+                .is_ok_and(|memo| memo.contains(key))
+        }) {
+            continue;
+        }
         match import_no_intro_dat(&candidate.path) {
             Ok(imported) => matches.push((
                 NoIntroSourceLabel {
@@ -154,8 +174,20 @@ pub fn load_no_intro_sources(
                 },
                 imported,
             )),
-            Err(NoIntroImportError::NotNoIntro { .. } | NoIntroImportError::Io { .. })
-            | Err(NoIntroImportError::Parse(_)) => {}
+            Err(NoIntroImportError::NotNoIntro { .. }) => {
+                // The same unchanged file always gives the same answer; a
+                // TOSEC, Redump or MAME catalogue was otherwise hashed and
+                // fully parsed again on every selected system (~100 MB here).
+                if let Some(key) = observed
+                    && let Ok(mut memo) = not_no_intro_memo().lock()
+                {
+                    if memo.len() >= 4096 {
+                        memo.clear();
+                    }
+                    memo.insert(key);
+                }
+            }
+            Err(NoIntroImportError::Io { .. }) | Err(NoIntroImportError::Parse(_)) => {}
         }
     }
     matches.sort_by(|(a, _), (b, _)| {
@@ -164,6 +196,68 @@ pub fn load_no_intro_sources(
             .then_with(|| a.artifact_path.cmp(&b.artifact_path))
     });
     matches
+}
+
+type FileObservation = (PathBuf, u64, u128);
+
+/// (path, size, mtime) of a regular file, or `None` when it cannot be read.
+fn file_observation(path: &std::path::Path) -> Option<FileObservation> {
+    let metadata = std::fs::metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)?;
+    let mtime = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((path.to_path_buf(), metadata.len(), mtime))
+}
+
+/// Files already found not to be No-Intro catalogues, per process.
+fn not_no_intro_memo() -> &'static std::sync::Mutex<std::collections::HashSet<FileObservation>> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<FileObservation>>> =
+        std::sync::OnceLock::new();
+    MEMO.get_or_init(Default::default)
+}
+
+/// The `origin` the No-Intro pack import writes for each catalogue.
+const PACK_IMPORT_ORIGIN: &str = "browser-assisted No-Intro pack import";
+
+/// True only when this file catalogue's recorded, still-current header names
+/// one or more systems and none of them is `platform_id`. Anything unchecked,
+/// changed, unrecognised or multi-system is kept (never skipped on a guess).
+fn header_names_other_systems(entry: &DatSourceEntry, platform_id: &str) -> bool {
+    use crate::dat::catalogue_recognition::{CatalogueRecognition as R, same_platform};
+    use crate::dat::sources::recognition::{RecognitionState, recognition_state};
+    let wanted = crate::canonical_platform_for_alias(platform_id).unwrap_or(platform_id);
+    let recognition = match recognition_state(entry) {
+        RecognitionState::Recognised(recognition) => recognition,
+        // A pack-imported catalogue is named "No-Intro: <its own header
+        // system name>" at import. That name is used only while the file is
+        // still exactly the one validated then (same size and mtime).
+        RecognitionState::NotChecked
+            if entry.kind == DatSourceKind::File
+                && entry.origin.as_deref() == Some(PACK_IMPORT_ORIGIN)
+                && entry.health.observed_size_bytes.is_some()
+                && entry.path.is_file()
+                && !entry.health.is_stale_for(&entry.path, entry.kind) =>
+        {
+            let Some(name) = entry.display_name.strip_prefix("No-Intro: ") else {
+                return false;
+            };
+            crate::dat::catalogue_recognition::recognise_catalogue(Some(name), None)
+        }
+        _ => return false,
+    };
+    match recognition {
+        R::Games { platform } | R::Extras { platform, .. } | R::NeedsReview { platform, .. } => {
+            !same_platform(platform, wanted)
+        }
+        R::Ambiguous { platforms } => !platforms.iter().any(|p| same_platform(p, wanted)),
+        R::NotGames { .. } => true,
+        R::SeveralSystems | R::NotRecognised { .. } | R::NoName => false,
+    }
 }
 
 /// A cheap fingerprint of exactly the registry state

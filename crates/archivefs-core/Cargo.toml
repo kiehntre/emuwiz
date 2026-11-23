@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 ring = "0.17"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 # Library Views manifests (crates::library_views): a per-view JSON record
 # of every managed symlink, read/written wholesale on every plan/apply -
 # not hand-edited by users like config.toml, so a real structured format
@@ -23,6 +23,16 @@ unicode-normalization = "0.1"
 # in the lockfile). Validated against the original MIT C implementation; see
 # docs/research/PS2_CODEBREAKER_PNACH_PREVIEW.md.
 codebreaker = "=0.4.0"
+# PlayStation memory-card manager (memory_card_manager). `ps1-memcard` reads
+# the PS1 containers (.gme/.vgs/.vmp), block chains and single saves
+# (.mcs/.psv); `ps2-memcard` supplies the PS2 spare-area ECC and an independent
+# second PS2 reader. Exact pins: Apache-2.0, no dependencies,
+# `forbid(unsafe_code)`. Both are young (first published 2026-08), so nothing
+# they return is trusted alone: every result is cross-checked against EmuWiz's
+# own reader in memory_card_inventory, and a disagreement disables writing.
+# The GPL tools (myMCpp, PSMemoryManager, MemcardRex) are never used as code.
+ps1-memcard = "=0.10.3"
+ps2-memcard = "=0.10.3"
 log = "0.4"
 libc = "0.2"
 notify = "8"
@@ -36,7 +46,7 @@ sha2 = "0.11.0"
 # primitive - they exist only to compare identifiers.
 sha1 = "0.11.0"
 md-5 = "0.11.0"
-rusqlite = { version = "0.40.1", default-features = false, features = ["backup", "bundled"] }
+rusqlite = { version = "0.41.1", default-features = false, features = ["backup", "bundled"] }
 ureq = { version = "3.3", default-features = false, features = ["rustls"] }
 http = "1"
 url = "2"

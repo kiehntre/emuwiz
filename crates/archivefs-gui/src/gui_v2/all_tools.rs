@@ -172,6 +172,14 @@ pub(super) fn groups() -> Vec<ToolGroup> {
             S::Activity,
         ],
     );
+    // Reads a game file and, after a confirmation, writes only new files in
+    // EmuWiz's own prepared-media folder; a game file is never changed.
+    health.tools.push(Tool {
+        route: Route::Tool(ToolPage::GameRecovery),
+        title: ToolPage::GameRecovery.title(),
+        purpose: ToolPage::GameRecovery.purpose(),
+        safety: ToolSafety::AsksFirst,
+    });
     health.tools.insert(
         2,
         Tool {
@@ -197,6 +205,13 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         route: Route::Tool(ToolPage::FolderCheck),
         title: ToolPage::FolderCheck.title(),
         purpose: ToolPage::FolderCheck.purpose(),
+        safety: ToolSafety::AsksFirst,
+    });
+    #[cfg(target_os = "linux")]
+    games.tools.push(Tool {
+        route: Route::Tool(ToolPage::Relocation),
+        title: ToolPage::Relocation.title(),
+        purpose: ToolPage::Relocation.purpose(),
         safety: ToolSafety::LookingOnly,
     });
     games.tools.push(Tool {
@@ -317,6 +332,22 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         purpose: ToolPage::Mounts.purpose(),
         safety: ToolSafety::AsksFirst,
     });
+    // Reads cards and writes only new files in EmuWiz's own folders; no
+    // card, save or game file is ever changed from this page.
+    let mut saves = group("Saves", &[S::SavesStates, S::Saves]);
+    saves.tools.push(Tool {
+        route: Route::Tool(ToolPage::MemoryCards),
+        title: ToolPage::MemoryCards.title(),
+        purpose: ToolPage::MemoryCards.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
+    // Reads the session journal and the snapshot store; writes nothing.
+    saves.tools.push(Tool {
+        route: Route::Tool(ToolPage::SaveContinuity),
+        title: ToolPage::SaveContinuity.title(),
+        purpose: ToolPage::SaveContinuity.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
     vec![
         games,
         verification,
@@ -327,7 +358,7 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         cheats,
         group("Media conversion", &[S::Conversion, S::Converter, S::Tape]),
         storage,
-        group("Saves", &[S::SavesStates, S::Saves]),
+        saves,
         organise,
         group(
             "Emulator utilities",
@@ -382,12 +413,13 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut AllToolsState) -> Option<Route
         }
     });
     ui.add_space(6.0);
-    ui.add(
+    let search = ui.add(
         egui::TextEdit::singleline(&mut state.query)
             .id(egui::Id::new("v2_all_tools_search"))
             .hint_text("Find a tool, for example \u{201c}convert\u{201d}, \u{201c}duplicates\u{201d} or \u{201c}cheats\u{201d}")
             .desired_width(ui.available_width().min(620.0)),
     );
+    crate::gui_v2::shortcuts::register_search(&search);
     ui.add_space(12.0);
     let visible: Vec<(&'static str, Vec<Tool>)> = groups()
         .into_iter()

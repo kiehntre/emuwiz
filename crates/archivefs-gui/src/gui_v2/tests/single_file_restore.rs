@@ -432,3 +432,226 @@ fn only_witnessed_sram_of_this_game_is_offered_restore() {
     let state_target = snapshot_target(&state, &game);
     assert!(state_target.is_err() || !sfr::restorable(&state_target.unwrap()));
 }
+
+// ---- Night Watch II regressions (uncommitted; FAIL on 571d4afb while the defects exist) ----
+
+fn nw2_deliver(
+    context: &egui::Context,
+    app: &mut App,
+    id: u64,
+    outcome: Result<super::super::backend::Payload, String>,
+) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.backend.rx = receiver;
+    sender
+        .send(super::super::backend::Event::Finished { id, outcome })
+        .unwrap();
+    app.poll(context);
+}
+
+/// NW2-B-03: a failed single-file restore must not be recorded as a success.
+#[test]
+fn nw2_b03_failed_single_file_restore_is_recorded_as_failed_in_activity() {
+    let context = egui::Context::default();
+    let world = World::new();
+    let mut app = world.app(&context);
+    let target = snapshot_target(&world.record, &world.game()).unwrap();
+    let id = app.activity.queue_with(
+        "Restoring a save",
+        Route::Section(Section::Activity),
+        activity::CancelPolicy::SafeNow,
+    );
+    app.activity.start(id);
+    app.saves_states.single_file.job = Some(id);
+    nw2_deliver(
+        &context,
+        &mut app,
+        id,
+        Ok(super::super::backend::Payload::SingleFileRestore(Box::new(
+            Outcome::Applied {
+                target: Box::new(target),
+                result: Err(
+                    "The restore could not be reversed safely. Do not start the emulator.".into(),
+                ),
+            },
+        ))),
+    );
+    assert!(!app.activity.jobs[&id].active(), "job settled");
+    assert_eq!(
+        app.activity.failed(),
+        1,
+        "a failed restore was recorded as a success in Activity"
+    );
+}
+
+/// NW2-B-04: a worker failure must release the single-file job slot.
+#[test]
+fn nw2_b04_worker_failure_releases_single_file_job() {
+    let context = egui::Context::default();
+    let world = World::new();
+    let mut app = world.app(&context);
+    let id = app.activity.queue_with(
+        "Restoring a save",
+        Route::Section(Section::Activity),
+        activity::CancelPolicy::SafeNow,
+    );
+    app.activity.start(id);
+    app.saves_states.single_file.job = Some(id);
+    nw2_deliver(&context, &mut app, id, Err("worker stopped".into()));
+    assert_eq!(
+        app.saves_states.single_file.job, None,
+        "Restore/Undo stay disabled until restart"
+    );
+}
+
+/// NW2-B-03: a snapshot that was not created must reach Activity as a
+/// failure; the inline feedback and the activity entry must agree.
+#[test]
+fn nw2_b03_failed_snapshot_creation_is_recorded_as_failed_in_activity() {
+    let context = egui::Context::default();
+    let world = World::new();
+    let mut app = world.app(&context);
+    let id = app.activity.queue_with(
+        "Creating a save snapshot",
+        Route::Section(Section::Activity),
+        activity::CancelPolicy::SafeNow,
+    );
+    app.activity.start(id);
+    app.saves_states.snapshots.create_job = Some(id);
+    nw2_deliver(
+        &context,
+        &mut app,
+        id,
+        Ok(super::super::backend::Payload::SaveSnapshotCreated {
+            result: Err("The emulator is running, so the snapshot was not created.".into()),
+        }),
+    );
+    let job = &app.activity.jobs[&id];
+    assert_eq!(job.phase, activity::Phase::Failed, "{}", job.summary);
+    assert_eq!(app.activity.failed(), 1);
+    assert_eq!(app.saves_states.snapshots.create_job, None);
+    assert_eq!(
+        app.saves_states.snapshots.feedback,
+        Some((
+            false,
+            "The emulator is running, so the snapshot was not created.".to_string()
+        ))
+    );
+    assert_eq!(app.activity.jobs[&id].technical, job.summary);
+}
+
+/// NW2-B-04: after a worker failure, a stale Confirm is dropped and the
+/// person is told inline that the step did not finish.
+#[test]
+fn nw2_b04_worker_failure_drops_stale_confirm_and_explains_inline() {
+    let context = egui::Context::default();
+    let world = World::new();
+    let target = snapshot_target(&world.record, &world.game()).unwrap();
+    save_snapshots::create(&world.root(), &target, &CLOSED).unwrap();
+    let mut app = world.app(&context);
+    prepare(&world, &mut app, &CLOSED);
+    assert!(matches!(
+        app.saves_states.single_file.flow,
+        Flow::Confirm(_)
+    ));
+    let id = app.activity.queue_with(
+        "Restoring a save",
+        Route::Section(Section::Activity),
+        activity::CancelPolicy::SafeNow,
+    );
+    app.activity.start(id);
+    app.saves_states.single_file.job = Some(id);
+    nw2_deliver(
+        &context,
+        &mut app,
+        id,
+        Err("The background operation stopped unexpectedly.".into()),
+    );
+    assert_eq!(app.saves_states.single_file.job, None);
+    assert!(matches!(app.saves_states.single_file.flow, Flow::Idle));
+    let (path, ok, message) = app.saves_states.single_file.feedback.clone().unwrap();
+    assert_eq!(path, world.save);
+    assert!(!ok);
+    assert!(message.starts_with("The step did not finish."), "{message}");
+    assert!(message.contains("stopped unexpectedly"), "{message}");
+    assert_eq!(app.saves_states.snapshots.loaded_for, None);
+    assert_eq!(app.activity.failed(), 1);
+}
+
+/// Review of NW2-B-03: a restore or Undo that a program may have opened
+/// during the write is amber inline ("check the save") and must be "Needs
+/// attention" in Activity too, with the same message.
+#[test]
+fn nw2_b03_restore_or_undo_opened_during_the_write_is_recorded_as_needing_attention() {
+    let context = egui::Context::default();
+    let world = World::new();
+    let target = snapshot_target(&world.record, &world.game()).unwrap();
+    save_snapshots::create(&world.root(), &target, &CLOSED).unwrap();
+    // Played on after the snapshot, so there is something to restore.
+    std::fs::write(&world.save, b"CHECKPOINT-TWO-LATER").unwrap();
+    let mut app = world.app(&context);
+    prepare(&world, &mut app, &CLOSED);
+    let Flow::Confirm(preview) = app.saves_states.single_file.flow.clone() else {
+        panic!("preview expected")
+    };
+    let Outcome::Applied { target, result } = sfr::run_with(
+        Job::Apply {
+            preview,
+            dirs: world.dirs(),
+        },
+        &CLOSED,
+    ) else {
+        unreachable!()
+    };
+    let (receipt, _) = result.unwrap();
+
+    for (undo, expected) in [
+        (false, "a program may have opened it during the restore"),
+        (true, "a program may have opened it meanwhile"),
+    ] {
+        let id = app.activity.queue_with(
+            "Restoring a save",
+            Route::Section(Section::Activity),
+            activity::CancelPolicy::SafeNow,
+        );
+        app.activity.start(id);
+        app.saves_states.single_file.job = Some(id);
+        let outcome = if undo {
+            Outcome::Undone {
+                receipt: receipt.clone(),
+                target: target.clone(),
+                result: Ok(true),
+            }
+        } else {
+            Outcome::Applied {
+                target: target.clone(),
+                result: Ok((receipt.clone(), true)),
+            }
+        };
+        nw2_deliver(
+            &context,
+            &mut app,
+            id,
+            Ok(super::super::backend::Payload::SingleFileRestore(Box::new(
+                outcome,
+            ))),
+        );
+        let job = &app.activity.jobs[&id];
+        assert_eq!(job.phase, activity::Phase::Failed, "{}", job.summary);
+        assert!(job.summary.contains(expected), "{}", job.summary);
+        let (_, ok, inline) = app.saves_states.single_file.feedback.clone().unwrap();
+        assert!(!ok);
+        assert_eq!(inline, job.summary);
+        assert!(
+            matches!(
+                app.saves_states.single_file.flow,
+                Flow::Done {
+                    opened_during: true,
+                    ..
+                }
+            ),
+            "Undo stays reachable"
+        );
+    }
+    assert_eq!(app.activity.failed(), 2);
+}

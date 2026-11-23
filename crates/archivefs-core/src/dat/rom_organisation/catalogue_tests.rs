@@ -116,7 +116,7 @@ impl Fixture {
     fn metadata(&self, id: i64) -> Vec<String> {
         let c = self.sql();
         let mut stmt = c.prepare("SELECT * FROM archives WHERE id=?1").unwrap();
-        let columns: Vec<_> = stmt.column_names().iter().map(|n| n.to_string()).collect();
+        let columns: Vec<_> = stmt.column_names().map(|n| n.to_string()).collect();
         stmt.query_row([id], |r| {
             Ok(columns
                 .iter()
@@ -537,6 +537,28 @@ fn unrelated_audit_and_fingerprint_collisions_are_never_rewritten() {
             .unwrap();
         assert_eq!(before, after);
     }
+}
+
+/// Organise's catalogue commit is durable across power loss: in the
+/// library's rollback-journal mode the commit is the journal's unlink, which
+/// only synchronous=EXTRA makes durable (a directory fsync). The journal
+/// mode is never changed.
+#[test]
+fn organise_catalogue_commits_are_durable() {
+    let f = Fixture::new(OrganisationMode::RenameInPlace);
+    let mode = || -> String {
+        rusqlite::Connection::open(f.db.path())
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap()
+    };
+    let mode_before = mode();
+    let guard = crate::database::organisation_paths::begin(&f.tx.entries[0], false, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(guard.synchronous_level(), 3, "synchronous=EXTRA");
+    drop(guard);
+    assert_eq!(mode_before, mode(), "the journal mode is never changed");
 }
 
 #[test]
@@ -1030,4 +1052,239 @@ fn reopening_history_after_an_interrupted_undo_allows_a_safe_retry() {
     assert_eq!(std::fs::read(&f.source).unwrap(), b"fixture contents");
     f.reload();
     assert!(f.tx.is_fully_rolled_back());
+}
+
+// --- Platform correction sealed into the catalogue move ---------------------
+
+struct Correction {
+    temp: tempfile::TempDir,
+    db: crate::Database,
+    plan: OrganisationPlan,
+    approved: BTreeSet<String>,
+    id: i64,
+}
+
+fn correction_fixture(initial_source: &str) -> Result<Correction, String> {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("games");
+    std::fs::create_dir_all(root.join("snes")).unwrap();
+    std::fs::create_dir_all(root.join("nes")).unwrap();
+    let cand = candidate(
+        &root.join("snes"),
+        "Game (USA).zip",
+        resolved("NES", PlatformIdentitySource::VerifiedDat),
+    );
+    let mut db = crate::Database::open_or_create(temp.path().join("fixture.sqlite3")).unwrap();
+    db.register_source_folders(std::slice::from_ref(&root))
+        .unwrap();
+    let folder = db.list_source_folders().unwrap()[0].id;
+    let archive = crate::Archive::from_path_in_root(&cand.source_path, &root).unwrap();
+    let id = db
+        .upsert_archive(folder, &root, &archive)
+        .unwrap()
+        .archive_id;
+    {
+        let c = Connection::open(db.path()).unwrap();
+        c.execute("DELETE FROM platform_assignments WHERE archive_id=?1", [id])
+            .unwrap();
+        c.execute(
+            "INSERT INTO platform_assignments(archive_id,platform,source,confidence,is_current,assigned_at) \
+             VALUES (?1,'SNES',?2,NULL,1,'2026-01-01T00:00:00Z')",
+            params![id, initial_source],
+        )
+        .unwrap();
+    }
+    let mut plan = plan_for(
+        &root,
+        OrganisationMode::MoveRealFile,
+        std::slice::from_ref(&cand),
+        1,
+    );
+    let corrections = std::collections::BTreeMap::from([(
+        cand.source_path.clone(),
+        PlatformCorrection {
+            platform: "NES".into(),
+            source: "verified_dat",
+        },
+    )]);
+    prepare_organisation_catalogue_with_platforms(&mut plan, &db, &corrections)?;
+    let approved = approved_of(&[&cand.source_path]);
+    Ok(Correction {
+        temp,
+        db,
+        plan,
+        approved,
+        id,
+    })
+}
+
+fn current_platform(db: &crate::Database, id: i64) -> (String, String) {
+    Connection::open(db.path())
+        .unwrap()
+        .query_row(
+            "SELECT platform,source FROM platform_assignments WHERE archive_id=?1 AND is_current=1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn platform_correction_commits_with_the_move_and_undo_restores_it() {
+    let f = correction_fixture("folder_alias").unwrap();
+    let mut tx = build_organisation_transaction(&f.plan, &f.approved, 1).unwrap();
+    let destination = tx.entries[0].destination_path.clone();
+    assert!(destination.ends_with("nes/Game (USA).zip"));
+    let journal = f.temp.path().join("journal");
+    super::super::transaction::apply_organisation_transaction(
+        &mut tx,
+        &f.approved,
+        1,
+        TrustedRoots::from_paths([f.plan.master_root.clone()]),
+        &journal,
+        &no_cancel(),
+        f.plan.mode,
+        &f.plan.master_root,
+        &f.db,
+    )
+    .unwrap();
+    assert!(destination.exists());
+    assert_eq!(
+        current_platform(&f.db, f.id),
+        ("NES".into(), "verified_dat".into())
+    );
+    assert_eq!(
+        f.db.find_archive_id_by_absolute_path(&destination).unwrap(),
+        Some(f.id)
+    );
+    rollback_organisation_transaction(&mut tx, &journal, &no_cancel(), &f.plan.master_root)
+        .unwrap();
+    assert!(!destination.exists());
+    assert_eq!(
+        current_platform(&f.db, f.id),
+        ("SNES".into(), "folder_alias".into())
+    );
+    let history: i64 = Connection::open(f.db.path())
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM platform_assignments WHERE archive_id=?1",
+            [f.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        history, 1,
+        "undo removes the correction row and keeps the original"
+    );
+}
+
+#[test]
+fn a_contradicted_manual_choice_is_never_overridden_by_a_correction() {
+    let error = correction_fixture("manual").err().expect("refused");
+    assert!(error.contains("manual system choice"), "{error}");
+}
+
+#[test]
+fn a_platform_change_after_preview_refuses_the_apply() {
+    let f = correction_fixture("folder_alias").unwrap();
+    let mut tx = build_organisation_transaction(&f.plan, &f.approved, 1).unwrap();
+    {
+        let c = Connection::open(f.db.path()).unwrap();
+        c.execute(
+            "UPDATE platform_assignments SET is_current=0 WHERE archive_id=?1",
+            [f.id],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO platform_assignments(archive_id,platform,source,confidence,is_current,assigned_at) \
+             VALUES (?1,'Game Boy','manual',NULL,1,'2026-01-02T00:00:00Z')",
+            [f.id],
+        )
+        .unwrap();
+    }
+    let journal = f.temp.path().join("journal");
+    let result = super::super::transaction::apply_organisation_transaction(
+        &mut tx,
+        &f.approved,
+        1,
+        TrustedRoots::from_paths([f.plan.master_root.clone()]),
+        &journal,
+        &no_cancel(),
+        f.plan.mode,
+        &f.plan.master_root,
+        &f.db,
+    );
+    assert!(result.is_err());
+    assert!(f.plan.entries[0].source_path.exists(), "nothing moved");
+}
+
+/// PR #278 owner follow-up 2026-11-15: an Organise rename and its Undo keep the
+/// same catalogue row, so a favourite or collection entry stays on that game
+/// across a restart with nothing to reconcile and nothing proposed.
+#[test]
+fn organise_and_undo_keep_favourites_and_collections_on_the_same_game() {
+    for mode in [
+        OrganisationMode::RenameInPlace,
+        OrganisationMode::MoveRealFile,
+    ] {
+        let mut f = Fixture::new(mode);
+        let favourites = f.db.favourites_collection_id().unwrap();
+        let shelf = f.db.create_game_collection("Shelf").unwrap();
+        f.db.add_game_to_collection(favourites, f.id).unwrap();
+        f.db.add_game_to_collection(shelf, f.id).unwrap();
+        let members = |db: &crate::Database| -> Vec<(i64, Option<i64>, Option<i64>)> {
+            db.load_game_collections()
+                .unwrap()
+                .iter()
+                .flat_map(|c| c.items.iter())
+                .map(|i| {
+                    (
+                        i.stored_archive_id,
+                        i.resolved_archive_id,
+                        i.proposed_archive_id,
+                    )
+                })
+                .collect()
+        };
+        let expected = vec![(f.id, Some(f.id), None); 2];
+        let reopen = |f: &mut Fixture| {
+            let path = f.db.path().to_path_buf();
+            f.db = crate::Database::open_or_create(path).unwrap();
+        };
+        assert_eq!(
+            f.apply().unwrap().transaction.state,
+            TransactionState::Applied
+        );
+        reopen(&mut f);
+        assert_eq!(
+            members(&f.db),
+            expected,
+            "{mode:?}: after Organise and a restart"
+        );
+        let journal = f.journal();
+        let saved = f.db.save_journalled_collection_moves(&journal).unwrap();
+        assert_eq!(
+            saved,
+            crate::JournalledMoves::default(),
+            "{mode:?}: nothing to move"
+        );
+        f.reload();
+        assert_eq!(
+            f.undo().unwrap().rollback.result,
+            crate::dat::rename_apply::RollbackResult::FullyRolledBack
+        );
+        reopen(&mut f);
+        assert_eq!(
+            members(&f.db),
+            expected,
+            "{mode:?}: after Undo and a restart"
+        );
+        let saved = f.db.save_journalled_collection_moves(&journal).unwrap();
+        assert_eq!(
+            saved,
+            crate::JournalledMoves::default(),
+            "{mode:?}: nothing to move"
+        );
+        assert_eq!(members(&f.db), expected);
+    }
 }

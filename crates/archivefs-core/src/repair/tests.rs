@@ -747,6 +747,7 @@ fn rename_proposal(source: &Path, proposed: Option<&str>, state: ProposalState) 
         sanitisation_notes: Vec::new(),
         actionable: matches!(state, ProposalState::Suggested),
         audited_identity: Some(capture_identity(source).unwrap()),
+        audited_fingerprint: None,
         is_outer_archive: false,
     }
 }

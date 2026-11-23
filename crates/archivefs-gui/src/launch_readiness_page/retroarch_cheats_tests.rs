@@ -116,12 +116,15 @@ impl World {
             p
         };
         // Records its arguments and the temporary profile it was pointed at.
+        // When `record.stderr` exists it prints that file on standard error
+        // before exiting, to replay real RetroArch output.
         let script = write(
             "bin/retroarch",
             format!(
                 "#!/bin/sh\\nrec=\"{rec}\"\\nmkdir -p \"$rec\"\\nprintf '%s\\\\n' \"$@\" > \"$rec/args.txt\"\\n\
                  while [ $# -gt 0 ]; do if [ \"$1\" = \"--config\" ]; then cp -r \"$(dirname \"$(dirname \"$2\")\")\" \"$rec/profile\"; fi; shift; done\\n\
-                 if [ -e \"$rec.hold\" ]; then : > \"$rec.held\"; while [ -e \"$rec.hold\" ]; do sleep 0.01; done; fi\\nexit 0\\n",
+                 if [ -e \"$rec.hold\" ]; then : > \"$rec.held\"; while [ -e \"$rec.hold\" ]; do sleep 0.01; done; fi\\n\
+                 if [ -e \"$rec.stderr\" ]; then cat \"$rec.stderr\" >&2; fi\\nexit 0\\n",
                 rec = root.join("record").display()
             )
             .replace("\\\\n", "\n")
@@ -765,8 +768,15 @@ fn a_verified_fixture_game_reaches_retroarch_with_core_config_and_selected_cheat
         !config.starts_with(world.root.join("config")),
         "RetroArch must get a temporary profile, not the user's: {args:?}"
     );
-    // Exactly: -L <core> <content> --config <temporary profile>.
-    assert_eq!(args.len(), 5, "{args:?}");
+    // Exactly: --verbose -L <core> <content> --config <temporary profile>.
+    // `--verbose` is how a managed launch gets RetroArch to say why it
+    // failed; it is an argument for this run only and changes no setting.
+    assert_eq!(
+        args.first().map(String::as_str),
+        Some("--verbose"),
+        "{args:?}"
+    );
+    assert_eq!(args.len(), 6, "{args:?}");
     assert_eq!(
         Path::new(&args[core_at + 2]),
         fixture.rom.as_path(),
@@ -783,4 +793,64 @@ fn a_verified_fixture_game_reaches_retroarch_with_core_config_and_selected_cheat
     // Nothing the user owns changed.
     assert_eq!(fs::read(&fixture.rom).unwrap(), rom);
     assert_eq!(fs::read_to_string(&cheat_path).unwrap(), CHT);
+}
+
+/// A cheat launch takes its save check from the output as captured, before
+/// any of it is let go of, exactly like a plain launch.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_cheat_launch_that_exits_normally_after_a_failed_save_warns_about_the_save() {
+    use super::SaveCheck;
+    use super::save_check_tests::{SRAM_FAILED, SRAM_OK, rendered};
+
+    let kept_output = |state: &mut RetroArchLaunchState| match state.tracked.as_mut() {
+        Some((_, super::RetroArchLaunchStage::ExitedCheats { session, .. })) => session
+            .process_mut()
+            .and_then(|process| process.poll())
+            .map_or(0, |report| report.stderr.len()),
+        _ => panic!("expected an exited cheat launch"),
+    };
+
+    // Real RetroArch 1.21.0 output: the save folder was read-only, exit 0.
+    let world = World::new("Genesis Plus GX");
+    fs::write(world.root.join("record.stderr"), SRAM_FAILED).unwrap();
+    let mut state = state_for(&world, world.choice(CHT, &["Infinite Lives"]));
+    state.start_with_cheats(world.request.clone());
+    run_state(&mut state);
+    assert!(state.smoke_receipt().is_some(), "this was a cheat launch");
+    for _ in 0..3 {
+        let display = state.display_for(&world.request);
+        let RetroArchLaunchDisplay::Exited { success, saves, .. } = &display else {
+            panic!("expected an exited launch");
+        };
+        assert!(success);
+        assert!(matches!(saves, SaveCheck::WriteFailed { .. }), "{saves:?}");
+        let text = rendered(&display);
+        assert!(
+            text.contains("Your progress may not have been saved"),
+            "{text}"
+        );
+        assert!(!text.contains("RetroArch closed normally."), "{text}");
+    }
+    assert!(
+        kept_output(&mut state) > 0,
+        "a save problem keeps its details"
+    );
+
+    // The same route with a save that was written: no warning, and only then
+    // is the capture let go of.
+    let world = World::new("Genesis Plus GX");
+    fs::write(world.root.join("record.stderr"), SRAM_OK).unwrap();
+    let mut state = state_for(&world, world.choice(CHT, &["Infinite Lives"]));
+    state.start_with_cheats(world.request.clone());
+    run_state(&mut state);
+    let display = state.display_for(&world.request);
+    let RetroArchLaunchDisplay::Exited { saves, .. } = &display else {
+        panic!("expected an exited launch");
+    };
+    assert!(
+        matches!(saves, SaveCheck::NoFailureDetected { .. }),
+        "{saves:?}"
+    );
+    assert_eq!(kept_output(&mut state), 0);
 }

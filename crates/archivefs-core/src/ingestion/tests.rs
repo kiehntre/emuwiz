@@ -2899,3 +2899,35 @@ fn archive_listings_with_no_recognised_member_are_relisted_under_a_wider_registr
         .unwrap();
     assert_eq!(mario.content, Some(ContentKind::RomCartridge));
 }
+
+/// A Commodore program file: load address `$0801` (C64 BASIC start) and a body.
+fn minimal_prg(load: u16) -> Vec<u8> {
+    let mut bytes = load.to_le_bytes().to_vec();
+    bytes.extend_from_slice(b"\x0b\x08\x0a\x00\x9e2061\x00\x00\x00");
+    bytes
+}
+
+#[test]
+fn commodore_prg_files_are_discovered_as_programs_never_as_disks() {
+    // Loose files at the source root: a folder holding recognised content is
+    // a game folder in discovery, whatever the extension. The machine for a
+    // `.prg` comes from folder evidence, tested in `platform::tests` and
+    // `media_registry::tests`.
+    let root = source_dir("commodore-prg");
+    std::fs::write(root.path().join("c64_game.prg"), minimal_prg(0x0801)).unwrap();
+    std::fs::write(root.path().join("ted_game.prg"), minimal_prg(0x1001)).unwrap();
+    let report = discover_source(root.path()).unwrap();
+    for name in ["c64_game.prg", "ted_game.prg"] {
+        let item = report
+            .items
+            .iter()
+            .find(|item| item.path.ends_with(name))
+            .unwrap_or_else(|| panic!("{name} was not discovered: {report:?}"));
+        assert_eq!(item.content, Some(ContentKind::Executable), "{name}");
+        assert_ne!(item.content, Some(ContentKind::ComputerDisk), "{name}");
+        assert_eq!(
+            item.platform_hint, None,
+            "{name}: a .prg alone names no machine"
+        );
+    }
+}

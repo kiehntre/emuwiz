@@ -486,7 +486,14 @@ mod tests {
         let opened = fs::File::open(&path).unwrap();
         fs::rename(&path, &other).unwrap();
         fs::rename(&parked, &path).unwrap();
-        assert_eq!(capture_file_identity(&path).unwrap().1, before);
+        // The path again names the original on device, inode, size and
+        // mtime (the renames moved its ctime, which the launch also checks);
+        // the opened handle is still caught by the hash itself.
+        let now = capture_file_identity(&path).unwrap().1;
+        assert_eq!(
+            (now.device, now.inode, now.size, now.modified),
+            (before.device, before.inode, before.size, before.modified)
+        );
         assert_eq!(
             hash_opened_cassette(&path, before, opened)
                 .err()

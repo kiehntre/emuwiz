@@ -562,7 +562,7 @@ pub(crate) fn build_card_view(
         ("Not configured".to_string(), widgets::StatusTone::Warning)
     });
     badges.push((
-        "Read-only towards RomM".to_string(),
+        "Read-only towards RomM, unless Rename title updates are on".to_string(),
         widgets::StatusTone::Info,
     ));
     if status.state.can_browse() {
@@ -1417,7 +1417,11 @@ fn build_import_result(summary: &RommImportSummary, sample: bool) -> RommResultV
                 "Platform conflicts",
                 format!("{} — Review required", enrichment.conflicts),
             ));
-            for conflict in enrichment.conflict_details.iter().take(3) {
+            for conflict in enrichment
+                .conflict_details
+                .iter()
+                .take(REVIEW_EXAMPLES_SHOWN)
+            {
                 notes.push(
                     conflict
                         .evidence
@@ -1433,6 +1437,57 @@ fn build_import_result(summary: &RommImportSummary, sample: bool) -> RommResultV
                         .join(" · "),
                 );
             }
+            push_more_note(&mut notes, enrichment.conflict_details.len());
+        }
+        if enrichment.romm_disagreements > 0 {
+            rows.push(row(
+                "RomM disagrees with a verified catalogue",
+                format!("{} — verified platform kept", enrichment.romm_disagreements),
+            ));
+            for disagreement in enrichment
+                .romm_disagreement_details
+                .iter()
+                .take(REVIEW_EXAMPLES_SHOWN)
+            {
+                notes.push(
+                    disagreement
+                        .evidence
+                        .iter()
+                        .map(|item| {
+                            format!(
+                                "{}: {}",
+                                item.source.label(),
+                                archivefs_core::platform::display_name_for(&item.platform)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · "),
+                );
+            }
+            push_more_note(&mut notes, enrichment.romm_disagreement_details.len());
+        }
+        if enrichment.romm_suggestions > 0 {
+            rows.push(row(
+                "RomM suggests a different platform",
+                format!(
+                    "{} — EmuWiz's platform kept, for review",
+                    enrichment.romm_suggestions
+                ),
+            ));
+            for suggestion in enrichment
+                .romm_suggestion_details
+                .iter()
+                .take(REVIEW_EXAMPLES_SHOWN)
+            {
+                notes.push(format!(
+                    "Kept {} ({}); RomM proposes {}. {}.",
+                    archivefs_core::platform::display_name_for(&suggestion.current_platform),
+                    platform_source_name(&suggestion.current_source),
+                    archivefs_core::platform::display_name_for(&suggestion.proposed_platform),
+                    suggestion.reason,
+                ));
+            }
+            push_more_note(&mut notes, enrichment.romm_suggestion_details.len());
         }
         if enrichment.applied > 0 {
             notes.push(
@@ -1563,7 +1618,9 @@ pub(crate) fn show_romm_source_card(
     widgets::section_header(
         ui,
         "RomM",
-        Some("Optional local identity source. Read-only towards RomM."),
+        Some(
+            "Optional local identity source. Read-only towards RomM, except the optional Rename title update (off unless you turn it on).",
+        ),
     );
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -1950,3 +2007,21 @@ pub(crate) fn show_romm_source_card(
 
 #[cfg(test)]
 mod tests;
+
+/// Where a stored platform came from, in words, for the RomM result notes.
+fn platform_source_name(source: &str) -> &'static str {
+    archivefs_core::platform_source_words(source)
+}
+
+/// How many review examples the import result shows per list.
+const REVIEW_EXAMPLES_SHOWN: usize = 3;
+
+/// After the examples, says how many more there are and where to see them all.
+fn push_more_note(notes: &mut Vec<String>, total: usize) {
+    if total > REVIEW_EXAMPLES_SHOWN {
+        notes.push(format!(
+            "+{} more not shown here; `emuwiz-cli identity source romm import` lists every one.",
+            total - REVIEW_EXAMPLES_SHOWN
+        ));
+    }
+}

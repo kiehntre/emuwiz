@@ -24,7 +24,11 @@
 //! compared with every current row, and then both platforms must be known and equal.
 //! Journal links excepted, two known platforms must agree, and anything ambiguous - several candidates,
 //! the same title alone, a different size - is left unresolved so it keeps
-//! appearing, and counting, as an ordinary row.
+//! appearing, and counting, as an ordinary row. The one exception is
+//! [`retire_absent_old_location_rows`]: an unresolved row of a source that is no
+//! longer configured, whose old path is confirmed absent, is reported as
+//! retired (with whether a same-named copy exists) so it is not listed as a
+//! live game. It is never deleted.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
@@ -345,9 +349,104 @@ pub fn derive_supersessions(
     result
 }
 
+/// Why a row from an old library location, with no confident replacement, is
+/// no longer listed as a game. The row itself stays in the database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Retirement {
+    /// A file with the same name exists at a current location, but not as one
+    /// confident replacement (several copies, another size or another system).
+    UnresolvedCopies,
+    /// No current row has the same file name: the file appears to be gone.
+    NotFoundAnywhere,
+}
+
+impl Retirement {
+    /// Plain-language reason.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::UnresolvedCopies => {
+                "an old library location; the file is no longer there and a file with the same name elsewhere could not be confirmed as the same game"
+            }
+            Self::NotFoundAnywhere => {
+                "an old library location; the file is no longer there and was not found in the current library"
+            }
+        }
+    }
+}
+
+/// Rows of sources that are no longer configured, that no current row
+/// supersedes, and whose old path `is_absent` reports as gone. Rows of a
+/// configured source are never retired here (a scan of that source decides),
+/// and a row whose old path still exists stays listed. Apart from what
+/// `is_absent` does, this reads nothing; it writes and deletes nothing.
+pub fn retire_absent_old_location_rows(
+    archives: &[PersistedArchive],
+    superseded: &BTreeMap<i64, Supersession>,
+    configured_sources: &HashSet<i64>,
+    is_absent: impl Fn(&Path) -> bool,
+) -> BTreeMap<i64, Retirement> {
+    let configured =
+        |archive: &PersistedArchive| configured_sources.contains(&archive.source_folder_id);
+    let current_names: HashSet<&OsStr> = archives
+        .iter()
+        .filter(|archive| configured(archive) && !is_missing(archive))
+        .map(file_name)
+        .collect();
+    archives
+        .iter()
+        .filter(|archive| !configured(archive) && !superseded.contains_key(&archive.id))
+        .filter(|archive| is_absent(&archive.absolute_path))
+        .map(|archive| {
+            let reason = if current_names.contains(file_name(archive)) {
+                Retirement::UnresolvedCopies
+            } else {
+                Retirement::NotFoundAnywhere
+            };
+            (archive.id, reason)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_absent_unreplaced_rows_of_removed_sources_are_retired_and_kept_apart() {
+        let removed = |id, rel: &str, size, platform| {
+            let mut row = row(id, rel, size, false, Some(platform));
+            row.source_folder_id = 5;
+            row.absolute_path = Path::new("/old").join(rel);
+            row
+        };
+        let rows = vec![
+            // Moved with the same system: superseded, not retired.
+            removed(1, "genesis/Sonic.md", 10, "Genesis"),
+            row(2, "genesis/Sonic.md", 10, false, Some("Genesis")),
+            // Moved and re-labelled (the snes -> nes case): same name, other system.
+            removed(3, "snes/Mario.nes", 20, "SNES"),
+            row(4, "nes/Mario.nes", 20, false, Some("NES")),
+            // Gone everywhere.
+            removed(5, "snes/Lost.sfc", 30, "SNES"),
+            // Old path still on disk: stays listed.
+            removed(6, "snes/Still.sfc", 40, "SNES"),
+            // Configured source, never flagged: a scan decides, not this.
+            row(7, "atari2600/Gone.a26", 50, false, Some("Atari 2600")),
+        ];
+        let configured = HashSet::from([1]);
+        let links = derive_supersessions(&rows, &[], Some(&configured));
+        assert_eq!(links.keys().copied().collect::<Vec<_>>(), vec![1]);
+        let retired = retire_absent_old_location_rows(&rows, &links, &configured, |path| {
+            !path.ends_with("snes/Still.sfc") && !path.starts_with("/games")
+        });
+        assert_eq!(
+            retired.into_iter().collect::<Vec<_>>(),
+            vec![
+                (3, Retirement::UnresolvedCopies),
+                (5, Retirement::NotFoundAnywhere)
+            ]
+        );
+    }
 
     fn row(
         id: i64,

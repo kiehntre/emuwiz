@@ -5,6 +5,7 @@ use crate::save_snapshots::tree_restore::safety::DirectorySaveBinding;
 use crate::save_snapshots::{
     EmulatorUseStatus, SaveArtifactType, SaveLocation, SaveProvenance, SaveSnapshotRequest,
     SaveTargetBinding, create_snapshot, list_single_file_restore_receipts,
+    undo_single_file_restore_gated,
 };
 use std::cell::Cell;
 use std::fs;
@@ -89,7 +90,7 @@ fn restore(
     )
 }
 
-fn refused(result: Result<GuardedRestore, SaveRestoreError>) -> SaveRestoreRefusal {
+fn refused<T: std::fmt::Debug>(result: Result<T, SaveRestoreError>) -> SaveRestoreRefusal {
     match result {
         Err(SaveRestoreError::Refused(reason)) => reason,
         other => panic!("expected a refusal, got {other:?}"),
@@ -625,4 +626,266 @@ fn live_restore_undo_cycle() {
             assert_eq!(fs::read(&save).unwrap(), b"PLAYED-ON-LATER-CHECKPOINT");
         }
     }
+}
+
+// ---- Night Watch II regression (uncommitted; FAILS on 571d4afb while NW2-D-03 exists) ----
+
+/// NW2-D-03: an Undo interrupted mid-copy (process killed, ENOSPC, EIO)
+/// leaves its stage file. The stage name is the same on every attempt, so a
+/// later Undo must still succeed once the cause has gone away.
+#[test]
+fn nw2_d03_undo_succeeds_after_an_interrupted_undo_left_its_stage_file() {
+    let f = fixture();
+    let observer = proc(f.dir.path(), "closed", &[("10", "bash", b"/bin/bash\0")]);
+    restore(&f, &observer).unwrap();
+    let receipts =
+        list_single_file_restore_receipts(&options(&f).receipt_root, &options(&f).backup_root);
+    let receipt = &receipts[0];
+    // Exactly what a killed Undo leaves behind: a partial copy at the
+    // deterministic stage path next to the save.
+    let stage = f.save.parent().unwrap().join(format!(
+        ".{}.emuwiz-undo-stage-{}",
+        f.save.file_name().unwrap().to_str().unwrap(),
+        crate::save_snapshots::short_path_token(&receipt.receipt_path)
+    ));
+    fs::write(&stage, b"newer pro").unwrap();
+    let retry = undo_single_file_guarded(receipt, StateEmulator::RetroArch, &observer);
+    assert!(
+        retry.is_ok(),
+        "Undo stays blocked by its own leftover stage file {stage:?}: {retry:?}"
+    );
+    assert_eq!(fs::read(&f.save).unwrap(), b"newer progress");
+}
+
+/// Stage files of an Undo for `receipt` present next to the save right now.
+fn undo_stages(f: &Fixture, receipt: &SaveRestoreReceipt) -> Vec<String> {
+    let prefix = format!(
+        ".game.srm.emuwiz-undo-stage-{}",
+        crate::save_snapshots::short_path_token(&receipt.receipt_path)
+    );
+    let mut names: Vec<String> = fs::read_dir(f.save.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(&prefix))
+        .collect();
+    names.sort();
+    names
+}
+
+fn first_receipt(f: &Fixture) -> SaveRestoreReceipt {
+    list_single_file_restore_receipts(&options(f).receipt_root, &options(f).backup_root)
+        .into_iter()
+        .next()
+        .unwrap()
+}
+
+/// NW2-D-03: every Undo attempt stages under its own name (receipt token,
+/// then process id and attempt counter), and a stage that is not published
+/// (here: the pre-publication gate says no) is removed, not left behind.
+#[test]
+fn nw2_d03_undo_stage_is_unique_per_attempt_and_removed_when_the_gate_refuses() {
+    let f = fixture();
+    let observer = proc(f.dir.path(), "closed", &[("10", "bash", b"/bin/bash\0")]);
+    restore(&f, &observer).unwrap();
+    let receipt = first_receipt(&f);
+    let seen = std::cell::RefCell::new(Vec::new());
+
+    let refused_at_gate = undo_single_file_restore_gated(
+        &receipt,
+        SaveQuiescenceRequirement::ConfirmedClosed,
+        &|| {
+            seen.borrow_mut().push(undo_stages(&f, &receipt));
+            false
+        },
+    );
+    assert_eq!(refused(refused_at_gate), SaveRestoreRefusal::SaveInUse);
+    assert_eq!(
+        fs::read(&f.save).unwrap(),
+        b"good progress",
+        "restored bytes stay"
+    );
+    assert!(
+        undo_stages(&f, &receipt).is_empty(),
+        "refused stage was removed"
+    );
+
+    let done = undo_single_file_restore_gated(
+        &receipt,
+        SaveQuiescenceRequirement::ConfirmedClosed,
+        &|| {
+            seen.borrow_mut().push(undo_stages(&f, &receipt));
+            true
+        },
+    );
+    assert!(done.is_ok(), "{done:?}");
+    assert_eq!(fs::read(&f.save).unwrap(), b"newer progress");
+    assert!(
+        undo_stages(&f, &receipt).is_empty(),
+        "published stage is gone"
+    );
+
+    let seen = seen.into_inner();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(
+        seen[0].len(),
+        1,
+        "exactly one stage during attempt 1: {seen:?}"
+    );
+    assert_eq!(
+        seen[1].len(),
+        1,
+        "exactly one stage during attempt 2: {seen:?}"
+    );
+    assert_ne!(
+        seen[0][0], seen[1][0],
+        "each attempt stages under its own name"
+    );
+    let pid = format!("-{}-", std::process::id());
+    assert!(seen.iter().all(|names| names[0].contains(&pid)), "{seen:?}");
+}
+
+/// NW2-D-03: a failed publication (rename) removes the stage, so the next
+/// Undo, once the cause is gone, succeeds instead of failing with EEXIST.
+#[test]
+fn nw2_d03_undo_removes_its_stage_when_publication_fails() {
+    let f = fixture();
+    let observer = proc(f.dir.path(), "closed", &[("10", "bash", b"/bin/bash\0")]);
+    restore(&f, &observer).unwrap();
+    let receipt = first_receipt(&f);
+    let restored = fs::read(&f.save).unwrap();
+
+    // Between the copy and the rename the target becomes a non-empty
+    // directory, so the rename cannot succeed.
+    let failed = undo_single_file_restore_gated(
+        &receipt,
+        SaveQuiescenceRequirement::ConfirmedClosed,
+        &|| {
+            fs::remove_file(&f.save).unwrap();
+            fs::create_dir(&f.save).unwrap();
+            fs::write(f.save.join("occupant"), b"x").unwrap();
+            true
+        },
+    );
+    assert!(
+        matches!(failed, Err(SaveRestoreError::Io { .. })),
+        "{failed:?}"
+    );
+    assert!(
+        undo_stages(&f, &receipt).is_empty(),
+        "stage left behind after a failed publication"
+    );
+
+    // The cause goes away: Undo now succeeds.
+    fs::remove_dir_all(&f.save).unwrap();
+    fs::write(&f.save, &restored).unwrap();
+    let retry = undo_single_file_guarded(&receipt, StateEmulator::RetroArch, &observer);
+    assert!(retry.is_ok(), "{retry:?}");
+    assert_eq!(fs::read(&f.save).unwrap(), b"newer progress");
+}
+
+/// NW2-D-03: the sweep of leftover stages touches only regular files that
+/// carry this receipt's token. A symlink with a stage-like name and a stage
+/// of another receipt are left exactly as they are.
+#[test]
+fn nw2_d03_stale_stage_sweep_skips_symlinks_and_other_receipts() {
+    let f = fixture();
+    let observer = proc(f.dir.path(), "closed", &[("10", "bash", b"/bin/bash\0")]);
+    restore(&f, &observer).unwrap();
+    let receipt = first_receipt(&f);
+    let saves = f.save.parent().unwrap().to_path_buf();
+    let token = crate::save_snapshots::short_path_token(&receipt.receipt_path);
+    let link = saves.join(format!(".game.srm.emuwiz-undo-stage-{token}-link"));
+    std::os::unix::fs::symlink(&f.save, &link).unwrap();
+    let other = saves.join(".game.srm.emuwiz-undo-stage-0000deadbeef");
+    fs::write(&other, b"someone else's partial").unwrap();
+    let ours = saves.join(format!(".game.srm.emuwiz-undo-stage-{token}-1-7"));
+    fs::write(&ours, b"our earlier partial").unwrap();
+
+    let done = undo_single_file_guarded(&receipt, StateEmulator::RetroArch, &observer);
+    assert!(done.is_ok(), "{done:?}");
+    assert_eq!(fs::read(&f.save).unwrap(), b"newer progress");
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "symlink was followed or removed"
+    );
+    assert_eq!(fs::read(&other).unwrap(), b"someone else's partial");
+    assert!(!ours.exists(), "our own leftover stage was swept");
+    assert!(
+        undo_stages(&f, &receipt).len() == 1,
+        "only the symlink remains: {:?}",
+        undo_stages(&f, &receipt)
+    );
+}
+
+/// Residual of S04-04: Undo re-proves closure immediately before publication,
+/// as apply does. A RetroArch that starts after the first proof (observation
+/// 1 at open) is seen by the gate (observation 2) and the restored bytes stay.
+#[test]
+fn nw2_d03_undo_re_proves_closure_before_publication() {
+    let f = fixture();
+    let closed = proc(f.dir.path(), "closed", &[("10", "bash", b"/bin/bash\0")]);
+    restore(&f, &closed).unwrap();
+    let receipt = first_receipt(&f);
+    let observer = Starts {
+        closed_for: Cell::new(1),
+    };
+    let result = undo_single_file_guarded(&receipt, StateEmulator::RetroArch, &observer);
+    assert_eq!(refused(result), SaveRestoreRefusal::SaveInUse);
+    assert_eq!(fs::read(&f.save).unwrap(), b"good progress");
+    assert!(undo_stages(&f, &receipt).is_empty());
+}
+
+/// NW2-D-02: directory fsync order during a restore. The backup's folders
+/// are made durable innermost first, then backup_root (which lists the
+/// backup), before the receipt that names the backup is persisted, and the
+/// receipt before the live save is replaced. The folders a restore had to
+/// create (and the existing parent that lists the first of them) are
+/// fsynced too.
+#[test]
+fn nw2_d02_backup_folders_are_durable_before_the_receipt_and_the_receipt_before_the_save() {
+    let f = fixture();
+    let observer = proc(f.dir.path(), "closed", &[("10", "bash", b"/bin/bash\0")]);
+    let _ = crate::save_snapshots::sync_log::take();
+    let done = restore(&f, &observer).unwrap();
+    let synced = crate::save_snapshots::sync_log::take();
+    let backup = done
+        .result
+        .backup_snapshot
+        .as_ref()
+        .unwrap()
+        .storage_path
+        .clone();
+    let opts = options(&f);
+    let first = |dir: &Path| {
+        synced
+            .iter()
+            .position(|path| path == dir)
+            .unwrap_or_else(|| panic!("{dir:?} was never fsynced: {synced:?}"))
+    };
+    let after = |start: usize, dir: &Path| {
+        synced
+            .iter()
+            .enumerate()
+            .skip(start + 1)
+            .find(|(_, path)| *path == dir)
+            .map(|(index, _)| index)
+            .unwrap_or_else(|| panic!("{dir:?} was not fsynced after step {start}: {synced:?}"))
+    };
+    // Created ancestors: backups/ and receipts/ are new under the temp dir.
+    assert!(synced.contains(&f.dir.path().to_path_buf()), "{synced:?}");
+    let files = first(&backup.join("files"));
+    let folder = first(&backup);
+    let game_dir = first(backup.parent().unwrap());
+    assert!(
+        files < folder && folder < game_dir,
+        "innermost first: {synced:?}"
+    );
+    let backup_root = after(game_dir, &opts.backup_root);
+    let receipt = after(backup_root, &opts.receipt_root);
+    let save = after(receipt, f.save.parent().unwrap());
+    assert!(backup_root < receipt && receipt < save, "{synced:?}");
 }

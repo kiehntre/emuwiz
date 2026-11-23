@@ -89,6 +89,7 @@ pub(super) fn show_skipped_files_window(
                     archivefs_core::SkipReason::InvalidContent,
                     archivefs_core::SkipReason::UnsupportedVariant,
                     archivefs_core::SkipReason::AmbiguousPlatform,
+                    archivefs_core::SkipReason::IdenticalCopy,
                 ] {
                     if ui
                         .selectable_label(*filter == Some(reason), reason.label())
@@ -1175,6 +1176,7 @@ mod tests {
             ingestion_skip_reasons,
             ingestion_platform_counts: std::collections::BTreeMap::new(),
             arcade_ingestion: Default::default(),
+            nested_mounts: Vec::new(),
             ingestion_skipped: vec![
                 item("mystery1.xyz", SkipReason::UnsupportedExtension),
                 item("mystery2.xyz", SkipReason::UnsupportedExtension),
@@ -1287,6 +1289,7 @@ mod tests {
             ingestion_skip_reasons,
             ingestion_platform_counts: std::collections::BTreeMap::new(),
             arcade_ingestion: Default::default(),
+            nested_mounts: Vec::new(),
             ingestion_skipped: Vec::new(),
             ingestion_recognised_sample: Vec::new(),
         }

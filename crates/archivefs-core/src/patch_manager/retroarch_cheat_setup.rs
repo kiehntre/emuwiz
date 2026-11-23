@@ -14,8 +14,8 @@ use sha2::{Digest, Sha256};
 
 use crate::emulator_environment::retroarch::{
     AppImageIdentificationConfidence, ConfigAssociation, ConfigReadOutcome, Diagnostic,
-    DiscoveryEnvironment, ExecutableState, PathPurpose, ProfileKind, ProfileScope, ResolutionState,
-    RetroArchEnvironmentReport, RetroArchProfile,
+    DiscoveryEnvironment, ExecutableState, PathPurpose, ProfileKind, ProfileRef, ProfileScope,
+    ResolutionState, RetroArchEnvironmentReport, RetroArchProfile,
     discover_retroarch_environment_with_core_directory_override,
 };
 use crate::emulator_environment::{EncodedPath, FsProbe, ReadOnlyHostFilesystem};
@@ -66,6 +66,13 @@ pub struct RetroArchCheatSetupDiscovery {
     pub diagnostics: Vec<Diagnostic>,
     #[serde(skip_serializing)]
     pub environment: RetroArchEnvironmentReport,
+    /// Per profile, why a zipped cartridge's launch would be refused because
+    /// RetroArch's save setup would lose saves (empty = safe), from
+    /// [`crate::launch::zipped_cartridge_save_findings`] over this same scan.
+    /// Computed once here (off the GUI thread) so readiness never reads files
+    /// per frame; the launch re-runs the full check itself.
+    #[serde(skip_serializing)]
+    pub zipped_save_findings: Vec<(ProfileRef, Vec<String>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -294,11 +301,30 @@ pub fn discover_retroarch_cheat_setup_profiles_with_core_directory_override(
         .iter()
         .map(|profile| classify_profile(profile, configuration_override))
         .collect();
+    let zipped_save_findings = report
+        .profiles
+        .iter()
+        .map(|profile| {
+            let profile_ref = ProfileRef {
+                profile_kind: profile.profile_kind,
+                scope: profile.scope,
+            };
+            (
+                profile_ref,
+                crate::launch::zipped_cartridge_save_findings(
+                    Some(&report),
+                    &profile_ref,
+                    environment,
+                ),
+            )
+        })
+        .collect();
     Ok(RetroArchCheatSetupDiscovery {
         schema_version: RETROARCH_CHEAT_SETUP_SCHEMA_VERSION,
         profiles,
         diagnostics: report.diagnostics.clone(),
         environment: report,
+        zipped_save_findings,
     })
 }
 

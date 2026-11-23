@@ -85,6 +85,7 @@ fn plan_for(
         content_policy: crate::dat::classification::ContentSelectionPolicy::AllEntries,
         candidates,
         generation,
+        unknown_folder: None,
     })
 }
 
@@ -1717,6 +1718,7 @@ fn games_only_organisation_blocks_unknown_without_mutation() {
         content_policy: ContentSelectionPolicy::GamesOnly,
         candidates: &[candidate],
         generation: 1,
+        unknown_folder: None,
     });
     assert_eq!(plan.entries[0].status, OrganisationStatus::Blocked);
     assert!(
@@ -1761,6 +1763,7 @@ fn games_only_organisation_allows_confirmed_game_classes() {
             content_policy: ContentSelectionPolicy::GamesOnly,
             candidates: &[candidate],
             generation: 1,
+            unknown_folder: None,
         });
         assert_eq!(plan.entries[0].status, OrganisationStatus::Suggested);
     }
@@ -1933,6 +1936,7 @@ fn the_preview_reports_its_real_phases_and_matches_the_plain_planner() {
         content_policy: crate::dat::classification::ContentSelectionPolicy::AllEntries,
         candidates: &candidates,
         generation: 1,
+        unknown_folder: None,
     };
     let mut seen: Vec<JobProgress> = Vec::new();
     let plan = {
@@ -1971,6 +1975,7 @@ fn a_cancelled_preview_yields_no_plan_and_changes_nothing_on_disk() {
         content_policy: crate::dat::classification::ContentSelectionPolicy::AllEntries,
         candidates: &candidates,
         generation: 1,
+        unknown_folder: None,
     };
     let cancel = AtomicBool::new(false);
     let mut sink = |progress: crate::job_progress::JobProgress| {
@@ -2039,3 +2044,113 @@ fn persisted_canonical_atari2600_assignment_survives_into_the_plan_but_a_folder_
 
 #[path = "catalogue_tests.rs"]
 mod catalogue_tests;
+
+// --- Platform correction: existing folders and Unknown placement -----------
+
+fn plan_with_unknown(
+    master_root: &Path,
+    candidates: &[OrganisationCandidate],
+    unknown: Option<&Path>,
+) -> OrganisationPlan {
+    build_organisation_plan(&OrganisationPlanRequest {
+        master_root,
+        mode: OrganisationMode::MoveRealFile,
+        content_policy: ContentSelectionPolicy::AllEntries,
+        candidates,
+        generation: 1,
+        unknown_folder: unknown,
+    })
+}
+
+#[test]
+fn an_existing_scanner_folder_for_the_platform_is_the_destination() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("games");
+    std::fs::create_dir_all(root.join("snes")).unwrap();
+    std::fs::create_dir_all(root.join("nes")).unwrap();
+    let cand = candidate(
+        &root.join("snes"),
+        "Game.zip",
+        resolved("NES", PlatformIdentitySource::VerifiedDat),
+    );
+    let plan = plan_with_unknown(&root, &[cand], None);
+    assert_eq!(plan.entries[0].status, OrganisationStatus::Suggested);
+    assert_eq!(
+        plan.entries[0].destination_path,
+        root.join("nes").join("Game.zip")
+    );
+    assert_eq!(layout_folder_in(&root, "NES").unwrap(), "nes");
+}
+
+#[test]
+fn without_an_existing_folder_the_canonical_folder_is_planned() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("games");
+    std::fs::create_dir_all(root.join("snes")).unwrap();
+    let canonical = crate::platform::canonical_layout_folder("NES").unwrap();
+    assert_eq!(layout_folder_in(&root, "NES").unwrap(), canonical);
+}
+
+#[test]
+fn two_existing_non_canonical_folders_for_one_platform_block_the_move() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("games");
+    std::fs::create_dir_all(root.join("snes")).unwrap();
+    std::fs::create_dir_all(root.join("nes")).unwrap();
+    std::fs::create_dir_all(root.join("famicom")).unwrap();
+    let cand = candidate(
+        &root.join("snes"),
+        "Game.zip",
+        resolved("NES", PlatformIdentitySource::VerifiedDat),
+    );
+    let plan = plan_with_unknown(&root, &[cand], None);
+    assert_eq!(plan.entries[0].status, OrganisationStatus::Blocked);
+    assert!(
+        plan.entries[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("several existing folders")
+    );
+}
+
+#[test]
+fn unknown_games_move_to_the_unknown_folder_only_when_requested() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("games");
+    std::fs::create_dir_all(root.join("mixed")).unwrap();
+    let cand = candidate(
+        &root.join("mixed"),
+        "Mystery.bin",
+        PlatformIdentityResolution::Unknown { generation: 1 },
+    );
+    let blocked = plan_with_unknown(&root, std::slice::from_ref(&cand), None);
+    assert_eq!(blocked.entries[0].status, OrganisationStatus::Blocked);
+    let unknown = Path::new("Unnamed/Unknown");
+    let plan = plan_with_unknown(&root, std::slice::from_ref(&cand), Some(unknown));
+    assert_eq!(plan.entries[0].status, OrganisationStatus::Suggested);
+    assert_eq!(
+        plan.entries[0].destination_path,
+        root.join("Unnamed").join("Unknown").join("Mystery.bin")
+    );
+    assert_eq!(plan.entries[0].platform, None);
+    // Unsafe Unknown folders are refused.
+    for bad in ["../x", "/abs", ""] {
+        let plan = plan_with_unknown(&root, std::slice::from_ref(&cand), Some(Path::new(bad)));
+        assert_eq!(plan.entries[0].status, OrganisationStatus::Blocked, "{bad}");
+    }
+}
+
+#[test]
+fn conflicting_platforms_never_move_even_with_an_unknown_folder() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("games");
+    std::fs::create_dir_all(root.join("mixed")).unwrap();
+    let conflict = PlatformIdentityResolution::Conflict {
+        generation: 1,
+        evidence: Vec::new(),
+    };
+    let cand = candidate(&root.join("mixed"), "Both.zip", conflict);
+    let plan = plan_with_unknown(&root, &[cand], Some(Path::new("Unnamed/Unknown")));
+    assert_eq!(plan.entries[0].status, OrganisationStatus::Blocked);
+}

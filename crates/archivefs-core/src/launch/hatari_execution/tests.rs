@@ -62,8 +62,11 @@ fn identity() -> CanonicalIdentityStatus {
 fn preflight_rechecks_config_content_and_executable() {
     let (_dir, request, roots) = setup();
     let command = preflight_hatari_launch(&request, &roots, &identity()).unwrap();
-    assert_eq!(command.arguments[0], "--configfile");
-    assert_eq!(command.arguments[2], "--disk-a");
+    // The preview never carries the user's configuration; the real spawn
+    // additionally swaps the disk for a private read-only copy.
+    assert!(command.arguments.iter().all(|a| a != "--configfile"));
+    assert!(command.arguments.iter().any(|a| a == "--disk-a"));
+    assert!(command.arguments.iter().any(|a| a == "--drive-b"));
 }
 
 #[test]

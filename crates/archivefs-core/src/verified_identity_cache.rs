@@ -253,6 +253,8 @@ impl PersistedIdentityFact {
                     .ok()
                     .map(|s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s))
             }),
+            // Persisted facts never stored ctime; `freshness` compares fields.
+            changed: None,
         }
     }
 

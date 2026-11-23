@@ -321,6 +321,13 @@ impl App {
         self.simple.sync_style(context);
         // Database status's upgrade may finish while another page is shown.
         self.tools.database.settle(context);
+        // Blue's folder scan and database upgrade write the catalogue; the
+        // native Sources page must not start its own writer meanwhile. Set
+        // here, on the one path every frame takes (eframe and tests alike).
+        if let Some(workflows) = &mut self.native_workflows {
+            workflows.app.external_catalogue_writer_busy =
+                self.scan_job.is_some() || self.tools.database.upgrading();
+        }
         // Kept until no other load is in flight, so the reload is not lost.
         if self.load_job.is_none() && std::mem::take(&mut self.tools.database.library_changed) {
             self.load(false);
@@ -334,61 +341,9 @@ impl App {
         }
         self.drive_pad_shell(context);
         crate::ui::picker::show(context);
-        let modal_open = self.confirm_scan
-            || self.setup_actions.confirm.is_some()
-            || self.repair_confirm
-            || self.undo_confirm.is_some()
-            || self.history_view.confirm_undo.is_some()
-            || self.missing.confirm
-            || self.equiv.confirm;
-        let (escape, alt_back) = context.input(|input| {
-            (
-                input.key_pressed(egui::Key::Escape),
-                input.modifiers.alt && input.key_pressed(egui::Key::ArrowLeft),
-            )
-        });
-        if escape {
-            // Any other open dialog (the classic Sources dialogs are hosted here too)
-            // is not ours to cancel, but Back must not run underneath it.
-            let other_window_open = context.memory(|memory| {
-                memory
-                    .areas()
-                    .visible_layer_ids()
-                    .iter()
-                    .any(|layer| layer.order == egui::Order::Middle)
-            });
-            match escape_action(
-                modal_open,
-                egui::Popup::is_any_open(context),
-                other_window_open,
-                self.text_was_focused,
-            ) {
-                EscapeAction::CloseModal => {
-                    // Every v2 confirmation is a preview-only step, so closing is always safe.
-                    self.confirm_scan = false;
-                    if let Some(confirm) = self.setup_actions.confirm.take() {
-                        let opened = egui::Id::new(("v2_setup_confirm_opened", confirm.path()));
-                        context.data_mut(|data| data.remove::<bool>(opened));
-                    }
-                    self.repair_confirm = false;
-                    self.undo_confirm = None;
-                    if let Some(id) = self.history_view.confirm_undo.take() {
-                        let opened = egui::Id::new(("v2_history_undo_opened", id));
-                        context.data_mut(|data| data.remove::<bool>(opened));
-                    }
-                    self.missing.confirm = false;
-                    self.equiv.confirm = false;
-                }
-                // egui has already released the field's focus on this key press.
-                EscapeAction::LeaveFocus => {}
-                // egui closes an open popup on this same key press.
-                EscapeAction::PopupHandles => {}
-                EscapeAction::KeepDialogOpen => {}
-                EscapeAction::Back => self.back(),
-            }
-        } else if alt_back && !modal_open {
-            self.back();
-        }
+        // Escape and Alt+Left, after the viewers, Big Picture and the
+        // controller keyboard above have had their keys.
+        self.apply_back_keys(context);
         if context.input(|input| input.modifiers.alt && input.key_pressed(egui::Key::Home)) {
             self.go(Route::Home);
         }
@@ -1442,6 +1397,8 @@ impl App {
     }
 
     fn setup_doctor(&mut self, ui: &mut egui::Ui) {
+        // First, so its status and next step are visible without scrolling.
+        self.doctor_launch_check(ui);
         self.folder_check_cards(ui);
         // A summary that arrived since the last frame goes to the clipboard once.
         if let Some(summary) = self.setup_actions.summary.take() {
@@ -1486,6 +1443,100 @@ impl App {
                 Some(false) => self.setup_actions.confirm = None,
                 None => {}
             }
+        }
+    }
+
+    /// The selected game's launch check: read-only, from the readiness
+    /// answer Blue already holds. Its one button opens an existing screen.
+    fn doctor_launch_check(&mut self, ui: &mut egui::Ui) {
+        let library = self.library.clone();
+        // A game chosen here runs the same quick readiness check as selecting
+        // it in the Library (no whole-file checksum). Otherwise the card
+        // follows the game last opened in Browse & Play, read-only.
+        let on_screen = self
+            .native_workflows
+            .as_ref()
+            .and_then(|workflows| workflows.selected_game_on_screen())
+            .map(|(id, _)| id);
+        let picked = self
+            .doctor_picker
+            .current(on_screen)
+            .and_then(|id| library.game(id))
+            .cloned();
+        let summary = if let Some(game) = &picked {
+            let id = game.archive.id;
+            let path = &game.archive.absolute_path;
+            let workflows = self.native_workflows.get_or_insert_with(|| {
+                super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
+            });
+            workflows.note_catalogue_row(&game.archive);
+            let (summary, _) = workflows.readiness_projection(
+                ui.ctx(),
+                id,
+                path,
+                game.archive.identity_report.as_ref(),
+                game.dat_exact.is_some(),
+                false,
+                &mut self.activity,
+            );
+            // Only this game's own answer is ever shown.
+            (workflows.selected_game_on_screen().as_ref() == Some(&(id, path.clone())))
+                .then_some((id, summary))
+        } else {
+            self.native_workflows
+                .as_ref()
+                .and_then(|workflows| workflows.selected_game_on_screen())
+                .filter(|(id, path)| {
+                    library
+                        .game(*id)
+                        .is_some_and(|game| game.archive.absolute_path == *path)
+                })
+                .and_then(|(id, path)| {
+                    self.native_workflows
+                        .as_ref()
+                        .and_then(|workflows| workflows.readiness_summary(id, &path))
+                        .map(|summary| (id, summary))
+                })
+        };
+        if let Some((id, summary)) = &summary
+            && let Some(game) = library.game(*id)
+            && let Some(view) = self
+                .native_workflows
+                .as_ref()
+                .map(|w| w.compact_of(summary))
+        {
+            self.note_checked_readiness(game, &view);
+        }
+        let diagnosis = match (&picked, &summary) {
+            (Some(_), None) => super::doctor_launch_check::checking(),
+            _ => super::doctor_launch_check::diagnose(summary.as_ref().map(|(_, summary)| summary)),
+        };
+        if diagnosis.verdict == super::doctor_launch_check::Verdict::Checking {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        let shown = summary.as_ref().map(|(id, _)| *id);
+        let title = shown
+            .and_then(|id| library.game(id))
+            .or(picked.as_ref())
+            .map(|game| game.title.clone());
+        let pressed = super::doctor_launch_check::show(
+            ui,
+            title.as_deref(),
+            &diagnosis,
+            &mut self.doctor_picker.query,
+        );
+        if let Some(id) =
+            super::doctor_launch_check::show_matches(ui, &self.doctor_picker.query, &library.games)
+        {
+            self.doctor_picker.pick(id);
+            ui.ctx().request_repaint();
+        }
+        ui.add_space(theme::SPACE_SM);
+        if let (Some(action), Some(id)) = (pressed, shown)
+            && let Some(route) = super::doctor_launch_check::route(action, id)
+        {
+            self.go(route);
         }
     }
 
@@ -1848,60 +1899,18 @@ impl App {
                 response.on_hover_text("RomM's saved record is out of date because its game file changed or disappeared. This picture is retained as display evidence. Refresh the RomM index to recheck its association.");
             }
         } else {
-            // No cover (yet): the game's own platform hardware, dimmed, on the
-            // same plate, so an uncovered shelf still reads as distinct systems.
-            ui.painter().rect_filled(rect, 8.0, theme::deep_fill(ui));
-            // Blue: a dashed same-size placeholder, never a fake cover.
-            if theme::blue_profile(ui) {
-                crate::ui::components::paint_dashed_outline(
-                    ui.painter(),
-                    rect,
-                    theme::blue::BORDER_STRONG,
-                );
-            } else {
-                ui.painter()
-                    .rect_stroke(rect, 8.0, theme::border(ui), egui::StrokeKind::Inside);
-            }
+            // No cover (yet): a platform-coloured plate with the platform's
+            // name, its hardware picture and the title (`artwork_fallback`).
             let label = self.artwork.label(key);
-            let labelled = size.x > 90.0 && size.y > 90.0;
-            // Lay the words out first so the hardware image leaves them room.
-            let font = egui::FontId::proportional(theme::METADATA_SIZE);
-            let wrap = (size.x - 12.0).max(40.0);
-            let galleys: Vec<_> = if labelled {
-                std::iter::once(label.headline.to_string())
-                    .chain(label.detail.clone().filter(|_| detail_on_tile))
-                    .map(|text| {
-                        ui.painter()
-                            .layout(text, font.clone(), theme::SECONDARY_TEXT, wrap)
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let text_height: f32 = galleys.iter().map(|galley| galley.size().y).sum();
-            let side = if labelled {
-                (size.x.min(size.y - text_height - 22.0)).max(24.0) * 0.72
-            } else {
-                size.x.min(size.y) * 0.82
-            };
-            let centre = if labelled {
-                rect.center() - egui::vec2(0.0, text_height / 2.0)
-            } else {
-                rect.center()
-            };
-            self.imagery.paint_platform(
+            super::artwork_fallback::paint(
                 ui,
-                egui::Rect::from_center_size(centre, egui::vec2(side, side)),
+                &mut self.imagery,
+                rect,
+                &game.title,
                 &game.platform,
-                Color32::from_white_alpha(150),
+                &label,
+                detail_on_tile,
             );
-            let mut bottom = rect.bottom() - 8.0;
-            for galley in galleys.into_iter().rev() {
-                bottom -= galley.size().y;
-                let x = rect.center().x - galley.size().x / 2.0;
-                ui.painter()
-                    .galley(egui::pos2(x, bottom), galley, theme::SECONDARY_TEXT);
-            }
             // Small tiles have no room for words; the tooltip carries them.
             let hover = match &label.detail {
                 Some(detail) => format!("{}\n{detail}", label.headline),
@@ -2129,6 +2138,9 @@ impl App {
         // not beside a promise that nothing is renamed here.
         ui.label("Read-only verification. Your original game files are never renamed, moved or deleted here. Verification is optional; you do not need it to play.");
         if self.check_platform.is_none() {
+            // Saved results that stopped counting, and the way to check
+            // those games again. Shows nothing when there are none.
+            self.saved_recheck.show(ui);
             ui.label(theme::card_title("Choose a platform"));
             // Arcade readiness is read from the saved DAT registry, the same
             // way the platform Check page decides whether it can verify
@@ -2522,11 +2534,12 @@ impl App {
                     self.problem_filter = ProblemFilter::All;
                 }
                 ui.label("Search");
-                ui.add_sized(
+                let search = ui.add_sized(
                     [220.0, 28.0],
                     egui::TextEdit::singleline(&mut self.problem_query)
                         .hint_text("title, game or path"),
                 );
+                super::shortcuts::register_search(&search);
                 if !self.problem_query.is_empty() && ui.button("Clear").clicked() {
                     self.problem_query.clear();
                 }
@@ -2551,13 +2564,17 @@ impl App {
                     .game(game_id)
                     .map(|game| (game.title.clone(), game.platform.clone()))
             {
-                let identity = self.identity_review_for(game_id);
+                // The same identity wording as Game Details.
+                let identity = self
+                    .library
+                    .game(game_id)
+                    .and_then(|game| self.detail_identity_wording(game));
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.heading(&title);
                     ui.label(format!("Problems for this game · {platform}"));
-                    if let Some(review) = &identity {
-                        ui.label(format!("Identity: {}", review.list_label()));
-                        if !review.is_verified() && ui.button("Review identity").clicked() {
+                    if let Some(identity) = &identity {
+                        ui.label(format!("Identity: {}", identity.label));
+                        if !identity.is_verified() && ui.button("Review identity").clicked() {
                             self.go(Route::ReviewIdentity(game_id));
                         }
                     }
@@ -2943,6 +2960,8 @@ impl App {
                                     ui.add_space(theme::SPACE_LG);
                                     ui.vertical(|ui| {
                                         self.detail_heading(ui, &library, game);
+                                        self.collection_message(ui);
+                                        self.game_collection_actions(ui, game.archive.id, &game.title);
                                         ui.add_space(theme::SPACE_SM);
                                         self.detail_facts(ui, game);
                                         ui.add_space(theme::SPACE_MD);
@@ -2950,6 +2969,7 @@ impl App {
                                     });
                                 });
                             });
+                            self.collection_dialogs(ui.ctx());
                             self.detail_body(ui, game, &key);
                         },
                     )
@@ -3007,6 +3027,9 @@ impl App {
                 ui.add_space(theme::SPACE_LG);
                 ui.vertical(|ui| {
                     self.detail_heading(ui, &library, game);
+                    self.collection_message(ui);
+                    self.game_collection_actions(ui, game.archive.id, &game.title);
+                    self.collection_dialogs(ui.ctx());
                     ui.add_space(theme::SPACE_SM);
                     self.detail_readiness(ui, game);
                     let notes = latest_verification.as_deref();
@@ -3166,6 +3189,8 @@ impl App {
         let identity = self.detail_identity(game);
         let identity_verified = identity.as_ref().is_some_and(|i| i.is_verified());
         let dat_identity = identity.as_ref().and_then(|i| i.card_identity());
+        // The card's identity line says what the Identity line says.
+        let identity_label = self.detail_identity_wording(game).map(|w| w.label);
         let readiness_route = {
             let workflows = self.native_workflows.get_or_insert_with(|| {
                 super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
@@ -3179,11 +3204,19 @@ impl App {
                 super::native_workflows::SavedFileFacts {
                     catalogue_verified: identity_verified,
                     dat_identity,
+                    identity_label,
                     file_missing,
                 },
                 &mut self.activity,
             )
         };
+        let shown = self.native_workflows.as_ref().and_then(|workflows| {
+            let summary = workflows.shown_readiness(id, &game.archive.absolute_path)?;
+            Some(workflows.compact_of(summary))
+        });
+        if let Some(view) = shown {
+            self.note_checked_readiness(game, &view);
+        }
         if let Some(route) = readiness_route {
             self.go(route);
         }
@@ -3198,12 +3231,42 @@ impl App {
 
     /// Everything else "Can I play it?" holds: saves, discs, verification and
     /// identity notes. Long enough that small windows place it after the facts.
+    /// The recovery engine's card, for games it has a validated preparation
+    /// for (decided by two string checks; nothing is read here). The diagnosis
+    /// itself runs once on the Game recovery page's worker thread.
+    fn detail_recovery(&mut self, ui: &mut egui::Ui, game: &Game) {
+        let path = &game.archive.absolute_path;
+        let platform = archivefs_core::canonical_platform_for_alias(&game.platform);
+        if !archivefs_core::recovery::preparation_may_apply(path, platform) {
+            return;
+        }
+        let recovery = &mut self.tools.game_recovery;
+        recovery.poll();
+        recovery.maintain(ui.ctx());
+        if recovery.report_for(path).is_none() && !recovery.is_working_on(path) {
+            recovery.open_for(
+                ui.ctx(),
+                super::game_recovery::Target {
+                    game_id: game.archive.id,
+                    title: game.title.clone(),
+                    path: path.clone(),
+                    platform: platform.map(str::to_string),
+                    platform_source: game.archive.platform_source.clone(),
+                },
+            );
+        }
+        if super::game_recovery::show_game_card(ui, &self.tools.game_recovery, path) {
+            self.go(Route::Tool(super::routes::ToolPage::GameRecovery));
+        }
+    }
+
     fn detail_readiness_notes(
         &mut self,
         ui: &mut egui::Ui,
         game: &Game,
         latest_verification: Option<&str>,
     ) {
+        self.detail_recovery(ui, game);
         let id = game.archive.id;
         let state_target = self
             .native_workflows
@@ -3282,9 +3345,10 @@ impl App {
         }
         // General file identification and launch readiness remain separate.
         // The identity result leads; the longer verification guidance follows.
-        if let Some(identity) = self.detail_identity(game) {
+        // Identification confidence only; requirements and Play stay on the card.
+        if let Some(identity) = self.detail_identity_wording(game) {
             ui.horizontal_wrapped(|ui| {
-                ui.strong(format!("Identity: {}", identity.label()));
+                ui.strong(format!("Identity: {}", identity.label));
                 let label = if identity.is_verified() {
                     "View evidence"
                 } else {
@@ -3294,6 +3358,13 @@ impl App {
                     self.go(Route::ReviewIdentity(id));
                 }
             });
+            // What a verified answer rests on. An unverified one is explained
+            // by the likely-match card and the Verification card below.
+            if identity.is_verified()
+                && let Some(note) = identity.note
+            {
+                ui.small(note);
+            }
             if !identity.is_verified() {
                 let review = self.identity_review_for(id);
                 let guess = super::detail_identity::likely_match(game, review.as_ref());
@@ -3367,7 +3438,20 @@ impl App {
     /// "More for this game": the existing per-game pages, and Open Folder.
     fn detail_more(&mut self, ui: &mut egui::Ui, game: &Game) {
         let id = game.archive.id;
-        ui.label(RichText::new("More for this game").color(theme::muted(ui)));
+        // Rename sits on the heading line so the action grid keeps its
+        // rows (and the facts stay on a short window's first screen).
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("More for this game").color(theme::muted(ui)));
+            if ui
+                .small_button("Rename…")
+                .on_hover_text(
+                    "Rename this game's file. You see exactly what changes first; Undo is in History.",
+                )
+                .clicked()
+            {
+                self.game_rename.open(game);
+            }
+        });
         let button_width = ((ui.available_width() - ui.spacing().item_spacing.x) / 2.0)
             .clamp(140.0, 240.0)
             .min(ui.available_width());
@@ -3424,6 +3508,7 @@ impl App {
                 self.send(job, Command::OpenFolder(game.archive.absolute_path.clone()));
             }
         });
+        self.game_rename_card(ui, game);
     }
 
     /// Picture retry, description, screenshots, saves, documents and the
@@ -3488,6 +3573,8 @@ impl App {
                     super::saturn_manifest::show(ui, game);
                 });
         }
+        // Closed by default and last, so it never moves anything above it.
+        self.show_game_doctor(ui, game);
     }
 
     /// Advanced details: identity, source, media kind, old locations,
@@ -3501,11 +3588,13 @@ impl App {
     ) {
         let id = game.archive.id;
         let key = key.clone();
-        ui.label(match game.dat_exact_label() {
-            Some(label) => label,
-            None if game.identified => "Identified in the saved game list".to_string(),
-            None => "Identity is not confirmed".to_string(),
-        });
+        // The page's one identity answer; a saved record is labelled as saved.
+        if let Some(identity) = self.detail_identity_wording(game) {
+            ui.label(format!("Identity: {}", identity.label));
+        }
+        if let Some(record) = game.dat_exact_label() {
+            ui.label(format!("Saved catalogue record: {record}"));
+        }
         ui.monospace(format!("Source: {}", game.archive.relative_path.display()));
         ui.monospace(format!("Media kind: {}", game.archive.archive_kind));
         for old in library.historical_for(id) {
@@ -4151,7 +4240,7 @@ impl App {
             if ui.button("View games").clicked() { self.go(Route::Section(Section::Games)); }
             if section == Section::Sources {
                 ui.label(format!("{} configured game folders are enabled.", self.library.sources));
-                if self.library.sources > 0 && ui.add_enabled(self.load_job.is_none(), egui::Button::new("Scan configured folders…")).clicked() { self.confirm_scan = true; }
+                if self.library.sources > 0 && ui.add_enabled(self.load_job.is_none() && !self.native_catalogue_writer_busy(), egui::Button::new("Scan configured folders…")).clicked() { self.confirm_scan = true; }
                 ui.label("Discovery comes first. You can choose folders manually in the existing workflow if discovery cannot find them.");
             }
             ui.collapsing("Advanced details", |ui| {
@@ -4255,6 +4344,7 @@ impl App {
     fn settings(&mut self, ui: &mut egui::Ui) {
         self.simple_shell_settings(ui);
         super::update_check::show(ui, &mut self.update_check);
+        super::shortcuts::show_help(ui);
         ui.horizontal_wrapped(|ui| {
             ui.label("Your library:");
             if crate::ui::components::action_button(
@@ -4279,6 +4369,7 @@ impl App {
             }
         });
         self.setup_portability.render(ui);
+        self.amiga_hdf_storage.render(ui);
         ui.label("Readable text and a permanent sidebar are on by default. The library view and current location are remembered separately from the legacy interface.");
         ui.separator();
         ui.label(theme::card_title("Beginner guidance"));
@@ -4386,7 +4477,7 @@ pub(super) fn romm_preview_button_label(games: usize) -> String {
 /// name that says more than the title; otherwise names the *source* the copy
 /// lives in (the last two folders of its scan root), which is what actually
 /// differs between duplicates of one file. Never a full path.
-fn disambiguating_hint(
+pub(super) fn disambiguating_hint(
     title: &str,
     relative_path: &std::path::Path,
     absolute_path: &std::path::Path,
@@ -4613,36 +4704,6 @@ mod disambiguation_tests {
         assert_eq!(first.as_deref(), Some("Source: games/roms"));
         assert_eq!(second.as_deref(), Some("Source: usbdrive/games"));
         assert_ne!(first, second);
-    }
-}
-
-/// What one Escape press means, most specific first: an open confirmation,
-/// then an open menu, then a focused text field, and only then Back.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum EscapeAction {
-    CloseModal,
-    PopupHandles,
-    KeepDialogOpen,
-    LeaveFocus,
-    Back,
-}
-
-pub(super) fn escape_action(
-    modal_open: bool,
-    popup_open: bool,
-    other_window_open: bool,
-    typing: bool,
-) -> EscapeAction {
-    if modal_open {
-        EscapeAction::CloseModal
-    } else if popup_open {
-        EscapeAction::PopupHandles
-    } else if other_window_open {
-        EscapeAction::KeepDialogOpen
-    } else if typing {
-        EscapeAction::LeaveFocus
-    } else {
-        EscapeAction::Back
     }
 }
 

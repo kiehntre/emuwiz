@@ -237,63 +237,82 @@ impl RommTransport for UreqTransport {
         // Overrides the agent's own default for this one request - see the
         // trait doc comment for why a caller asks for two different values.
         let request = request.config().timeout_global(Some(timeout)).build();
-        let response = match request.call() {
-            Ok(response) => response,
-            Err(ureq::Error::StatusCode(status)) => {
-                return Ok(RommHttpResponse {
-                    status,
-                    body: Vec::new(),
-                    location: None,
-                });
-            }
-            Err(ureq::Error::Timeout(_)) => return Err(RommRequestError::Timeout),
-            Err(error) => {
-                // Classified, never echoed with the URL: the URL is safe here,
-                // but keeping the habit means a future change cannot leak one.
-                return Err(RommRequestError::Transport {
-                    detail: classify_transport_error(&error),
-                });
-            }
-        };
-        let status = response.status().as_u16();
-        let location = response
-            .headers()
-            .get("location")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-
-        // Read with a hard ceiling, enforced while reading. `take` means an
-        // oversized body is never fully buffered.
-        let mut body = Vec::new();
-        let mut reader = response
-            .into_body()
-            .into_reader()
-            .take(max_bytes as u64 + 1);
-        reader.read_to_end(&mut body).map_err(|error| {
-            let transport_error = error
-                .get_ref()
-                .and_then(|inner| inner.downcast_ref::<ureq::Error>());
-            if error.kind() == std::io::ErrorKind::TimedOut
-                || matches!(transport_error, Some(ureq::Error::Timeout(_)))
-            {
-                RommRequestError::Timeout
-            } else {
-                RommRequestError::Transport {
-                    detail: transport_error
-                        .map(classify_transport_error)
-                        .unwrap_or_else(|| format!("while reading the response: {}", error.kind())),
-                }
-            }
-        })?;
-        if body.len() > max_bytes {
-            return Err(RommRequestError::ResponseTooLarge { limit: max_bytes });
-        }
-        Ok(RommHttpResponse {
-            status,
-            body,
-            location,
-        })
+        finish_response(request.call(), max_bytes)
     }
+}
+
+impl UreqTransport {
+    /// The configured agent (redirects off, no environment proxy, bounded
+    /// timeouts), shared with the one title write in [`super::title_sync`]
+    /// so that request gets exactly the same protections.
+    pub(super) fn agent(&self) -> &ureq::Agent {
+        &self.agent
+    }
+}
+
+/// Turns a finished `ureq` call into a bounded [`RommHttpResponse`]: a status
+/// with no body for an error status, a classified transport error, or the
+/// body read under the `max_bytes` ceiling.
+pub(super) fn finish_response(
+    result: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    max_bytes: usize,
+) -> Result<RommHttpResponse, RommRequestError> {
+    let response = match result {
+        Ok(response) => response,
+        Err(ureq::Error::StatusCode(status)) => {
+            return Ok(RommHttpResponse {
+                status,
+                body: Vec::new(),
+                location: None,
+            });
+        }
+        Err(ureq::Error::Timeout(_)) => return Err(RommRequestError::Timeout),
+        Err(error) => {
+            // Classified, never echoed with the URL: the URL is safe here,
+            // but keeping the habit means a future change cannot leak one.
+            return Err(RommRequestError::Transport {
+                detail: classify_transport_error(&error),
+            });
+        }
+    };
+    let status = response.status().as_u16();
+    let location = response
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+
+    // Read with a hard ceiling, enforced while reading. `take` means an
+    // oversized body is never fully buffered.
+    let mut body = Vec::new();
+    let mut reader = response
+        .into_body()
+        .into_reader()
+        .take(max_bytes as u64 + 1);
+    reader.read_to_end(&mut body).map_err(|error| {
+        let transport_error = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<ureq::Error>());
+        if error.kind() == std::io::ErrorKind::TimedOut
+            || matches!(transport_error, Some(ureq::Error::Timeout(_)))
+        {
+            RommRequestError::Timeout
+        } else {
+            RommRequestError::Transport {
+                detail: transport_error
+                    .map(classify_transport_error)
+                    .unwrap_or_else(|| format!("while reading the response: {}", error.kind())),
+            }
+        }
+    })?;
+    if body.len() > max_bytes {
+        return Err(RommRequestError::ResponseTooLarge { limit: max_bytes });
+    }
+    Ok(RommHttpResponse {
+        status,
+        body,
+        location,
+    })
 }
 
 /// A short classification of a transport failure, with no URL or header in it.
@@ -347,6 +366,22 @@ pub struct RommClient<'a, T: RommTransport> {
 impl<'a, T: RommTransport> RommClient<'a, T> {
     pub fn new(source: &'a ValidatedRommSource, transport: &'a T) -> Self {
         Self { source, transport }
+    }
+
+    /// `GET /api/roms/{id}`: one ROM as RomM holds it now. Used to confirm,
+    /// immediately before and after the Rename title update, that the entry
+    /// is still the one EmuWiz matched. `id` must be RomM's numeric id.
+    pub fn rom(
+        &self,
+        id: &str,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<serde_json::Value, RommRequestError> {
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(RommRequestError::MalformedResponse {
+                detail: "a RomM ROM id is a number".into(),
+            });
+        }
+        self.get_json(&format!("/api/roms/{id}"), true, REQUEST_TIMEOUT, cancel)
     }
 
     /// `GET /api/heartbeat`, which needs no token.

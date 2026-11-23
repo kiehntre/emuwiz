@@ -101,7 +101,7 @@ mod gamehacking_provider;
 mod gamehacking_shared;
 mod gamehacking_wii_provider;
 mod gecko_document;
-mod hatari_local;
+pub(crate) mod hatari_local;
 mod import_safety;
 mod local_cheat_install;
 mod local_cheat_install_dolphin;
@@ -353,14 +353,15 @@ pub use cheat_install_plan::{
     resolve_cheat_destination, stage_generated_cheat_file,
 };
 pub use cheat_install_result::{
-    CHEAT_INSTALL_RUN_SCHEMA_VERSION, CheatInstallEntryResult, CheatInstallOutcome,
-    CheatInstallPath, CheatInstallRun, CheatInstallRunSchemaError, CheatInstallRunStatus,
-    CheatInstallSummary, PreviousDestinationState, parse_cheat_install_run,
+    CHEAT_INSTALL_RUN_SCHEMA_VERSION, CheatInstallEntryResult, CheatInstallEntrySettlement,
+    CheatInstallOutcome, CheatInstallPath, CheatInstallRun, CheatInstallRunSchemaError,
+    CheatInstallRunStatus, CheatInstallSummary, PreviousDestinationState, parse_cheat_install_run,
     plan_cheat_install_entries, plan_cheat_install_entry, plan_cheat_install_run,
 };
 pub use cheat_installer::{
     CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME, CHEAT_INSTALL_RUNS_DIRECTORY_NAME, CheatInstallOptions,
-    CheatInstallRunOutcome, execute_cheat_install_run,
+    CheatInstallRunOutcome, JOURNAL_UNAVAILABLE_REASON, JOURNAL_UPDATE_FAILED_REASON,
+    execute_cheat_install_run,
 };
 pub use cheat_ir::{
     CheatApplicability, CheatConversionPreview, CheatDocument, CheatDuplicateKind,
@@ -573,14 +574,16 @@ pub use dolphin_texture_mod::{
     verified_dolphin_texture_identity,
 };
 pub use dolphin_texture_pack::{
-    DOLPHIN_TEXTURE_PACK_MANIFEST_FORMAT, DOLPHIN_TEXTURE_PACK_MAX_MANIFEST_BYTES,
-    DOLPHIN_TEXTURE_PACK_SOURCE_MODE, DolphinTexturePackApplyResult,
-    DolphinTexturePackArchivePreview, DolphinTexturePackBuildPreview,
-    DolphinTexturePackBuildRequest, DolphinTexturePackFile, DolphinTexturePackManifest,
-    DolphinTexturePackPlan, DolphinTexturePackPreviewRequest, DolphinTexturePackRejectedFile,
-    build_dolphin_texture_pack_manifest, build_dolphin_texture_pack_preview,
-    build_dolphin_texture_pack_transaction_plan, execute_dolphin_texture_pack_apply,
-    inspect_dolphin_texture_pack_zip, validate_dolphin_texture_pack_manifest,
+    DOLPHIN_TEXTURE_ARCHIVE_STAGING_PREFIX, DOLPHIN_TEXTURE_PACK_MANIFEST_FORMAT,
+    DOLPHIN_TEXTURE_PACK_MAX_MANIFEST_BYTES, DOLPHIN_TEXTURE_PACK_SOURCE_MODE,
+    DolphinTexturePackApplyResult, DolphinTexturePackArchivePreview,
+    DolphinTexturePackBuildPreview, DolphinTexturePackBuildRequest, DolphinTexturePackFile,
+    DolphinTexturePackManifest, DolphinTexturePackPlan, DolphinTexturePackPreviewRequest,
+    DolphinTexturePackRejectedFile, DolphinTexturePackStaging, build_dolphin_texture_pack_manifest,
+    build_dolphin_texture_pack_preview, build_dolphin_texture_pack_transaction_plan,
+    describe_missing_texture_pack_source, execute_dolphin_texture_pack_apply,
+    inspect_dolphin_texture_pack_zip, inspect_dolphin_texture_pack_zip_in,
+    relocate_dolphin_texture_pack_manifest, validate_dolphin_texture_pack_manifest,
 };
 pub use duckstation_cheat::{
     DUCKSTATION_CHEAT_MAX_BYTES, DUCKSTATION_CHEAT_MAX_LINES, DuckStationCheatApplyPlan,
@@ -627,7 +630,8 @@ pub use duckstation_native::{
     DuckStationNativeWarning, EnableCheatsChange, apply_duckstation_native_plan,
     duckstation_disc_topology_from_media_sets, duckstation_native_batch_from_catalogue,
     duckstation_native_section_digest, plan_duckstation_native, preview_duckstation_native_undo,
-    read_duckstation_native_receipt, resolve_duckstation_folders, undo_duckstation_native,
+    read_duckstation_native_receipt, resolve_duckstation_folders,
+    resolve_duckstation_memory_cards_folder, undo_duckstation_native,
 };
 pub use duckstation_native_history::{
     DUCKSTATION_NATIVE_SOURCE_MODE, GroupedHistoryRow, NativeGroupState, NativeHistoryGroup,
@@ -662,16 +666,18 @@ pub use flycast_cheats::{
     apply_flycast_cheat_preview, build_flycast_cheat_preview, parse_flycast_cheat_file,
 };
 pub use flycast_local::{
-    FLYCAST_MAX_CHEAT_BYTES, FLYCAST_MAX_CONFIG_BYTES, FLYCAST_MAX_DIRECTORY_ENTRIES,
-    FLYCAST_MAX_PROFILES, FLYCAST_MAX_SAVE_CANDIDATES, FLYCAST_MAX_TEXTURE_DEPTH,
-    FLYCAST_MAX_TEXTURE_FILES, FlycastCheatInventory, FlycastConfigInspection, FlycastDiscContext,
-    FlycastDiscoveryError, FlycastExecutable, FlycastGameInspection, FlycastGameKeyMapping,
-    FlycastGameRequest, FlycastHealth, FlycastInstallationType, FlycastLaunchBlocker,
-    FlycastLaunchBlockerKind, FlycastNativeLaunchBinding, FlycastPlatform, FlycastProfile,
-    FlycastProfileDiscovery, FlycastProfileDiscoveryRoots, FlycastSaveStateInventory,
-    FlycastSettings, FlycastSystemFileState, FlycastSystemHealth, FlycastTextureInventory,
-    FlycastVmuInventory, FlycastWarning, FlycastWarningKind, discover_flycast_profiles,
-    inspect_flycast_game, parse_flycast_version, resolve_flycast_native_launch_binding,
+    FLYCAST_APPIMAGE_DIRECTORIES, FLYCAST_MAX_CHEAT_BYTES, FLYCAST_MAX_CONFIG_BYTES,
+    FLYCAST_MAX_DIRECTORY_ENTRIES, FLYCAST_MAX_PROFILES, FLYCAST_MAX_SAVE_CANDIDATES,
+    FLYCAST_MAX_TEXTURE_DEPTH, FLYCAST_MAX_TEXTURE_FILES, FLYCAST_NOT_SET_UP,
+    FlycastCheatInventory, FlycastConfigInspection, FlycastDiscContext, FlycastDiscoveryError,
+    FlycastExecutable, FlycastGameInspection, FlycastGameKeyMapping, FlycastGameRequest,
+    FlycastHealth, FlycastInstallationType, FlycastLaunchBlocker, FlycastLaunchBlockerKind,
+    FlycastNativeLaunchBinding, FlycastPlatform, FlycastProfile, FlycastProfileDiscovery,
+    FlycastProfileDiscoveryRoots, FlycastSaveStateInventory, FlycastSettings,
+    FlycastSystemFileState, FlycastSystemHealth, FlycastTextureInventory, FlycastVmuInventory,
+    FlycastWarning, FlycastWarningKind, discover_flycast_profiles, flycast_profile_dreamcast_bios,
+    flycast_profile_dreamcast_bios_inputs, inspect_flycast_game, is_appimage_executable,
+    parse_flycast_version, resolve_flycast_native_launch_binding,
 };
 pub use fuse_local::{
     FUSE_MAX_PROFILES, FUSE_NATIVE_BINARY_NAMES, FuseExecutable, FuseInstallationType,
@@ -864,7 +870,8 @@ pub use pcsx2::{
 };
 pub use pcsx2_firmware::{
     Pcsx2BiosVerificationOutcome, Pcsx2GameInspectionWithFirmware, Pcsx2VerifiedBios,
-    inspect_pcsx2_game_with_firmware_evidence, resolve_pcsx2_bios,
+    inspect_pcsx2_game_with_firmware_evidence, pcsx2_profile_bios_inputs,
+    pcsx2_profile_bios_verification, resolve_pcsx2_bios,
 };
 pub use pcsx2_identity::{
     Pcsx2GameIdentity, Pcsx2IdentityState, Pcsx2ProfileChoiceError, confirmed_pcsx2_profile,
@@ -886,14 +893,15 @@ pub use pcsx2_local::{
     Pcsx2DirectoryIdentity, Pcsx2DiscoveryError, Pcsx2Executable, Pcsx2GameInspection,
     Pcsx2GameRequest, Pcsx2Health, Pcsx2InspectionError, Pcsx2InspectionWarning,
     Pcsx2InspectionWarningKind, Pcsx2InstallationType, Pcsx2LaunchBlocker, Pcsx2LaunchBlockerKind,
-    Pcsx2MatchResult, Pcsx2MatchState, Pcsx2MemcardInfo, Pcsx2MemcardKind,
-    Pcsx2NativeLaunchBinding, Pcsx2PatchCategory, Pcsx2PatchDirectory, Pcsx2PatchDirectoryState,
-    Pcsx2PnachFile, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileBlocker,
-    Pcsx2ProfileBlockerKind, Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope,
-    Pcsx2SaveStateInventory, Pcsx2SerialMapping, Pcsx2Settings, Pcsx2TextureInventory,
-    Pcsx2UserDirectoryMode, discover_pcsx2_profiles, inspect_pcsx2_game, inspect_pcsx2_profile,
+    Pcsx2MatchResult, Pcsx2MatchState, Pcsx2MemcardInfo, Pcsx2MemcardKind, Pcsx2MemcardSlot,
+    Pcsx2MemcardSlotSource, Pcsx2MemcardSlotState, Pcsx2MemcardSlots, Pcsx2NativeLaunchBinding,
+    Pcsx2PatchCategory, Pcsx2PatchDirectory, Pcsx2PatchDirectoryState, Pcsx2PnachFile,
+    Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileBlocker, Pcsx2ProfileBlockerKind,
+    Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, Pcsx2SaveStateInventory,
+    Pcsx2SerialMapping, Pcsx2Settings, Pcsx2TextureInventory, Pcsx2UserDirectoryMode,
+    discover_pcsx2_profiles, inspect_pcsx2_game, inspect_pcsx2_profile,
     inspect_pcsx2_profile_with_activation, match_pcsx2_inventory, parse_pcsx2_version,
-    resolve_pcsx2_native_launch_binding,
+    resolve_pcsx2_memcard_slots, resolve_pcsx2_native_launch_binding,
 };
 pub use pcsx2_pnach::{
     MAX_MANAGED_PNACH_BLOCKS, MAX_MANAGED_PNACH_BYTES, ManagedPnachCheat, PnachDocument,

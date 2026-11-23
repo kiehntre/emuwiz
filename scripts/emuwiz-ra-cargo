@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# The `cargo` that rust-analyzer runs (scripts/emuwiz-rust-analyzer exports CARGO=<this>).
+#
+# Inside an EmuWiz checkout every cargo invocation goes through the cargo-iso next to
+# this script with --rust-analyzer: same free-space guard, budget admission, lifecycle
+# lock and registry as a normal build, output in <cargo-iso target>/rust-analyzer.
+# It never builds into the worktree's own target/ and never falls back to plain cargo
+# there: if cargo-iso refuses (low disk, legacy target, no git), the error is passed
+# to rust-analyzer and nothing is built.
+#
+# Outside EmuWiz checkouts it runs the real cargo unchanged.
+set -uo pipefail
+
+here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd -P)
+unset CARGO                      # never let the real cargo (or a build script) call us back
+
+real_cargo() {
+  local c="${EMUWIZ_CARGO:-}"
+  if [ -z "$c" ]; then
+    c=$(PATH=$(printf %s "$PATH" | tr ':' '\n' | grep -vx "$here" | paste -sd: -) command -v cargo) || {
+      echo "emuwiz-ra-cargo: no cargo found on PATH" >&2; exit 127; }
+  fi
+  printf %s "$c"
+}
+
+is_emuwiz() { [ -f "$1/Cargo.toml" ] && [ -f "$1/scripts/cargo-iso" ] && [ -d "$1/crates/archivefs-core" ]; }
+# Is this (or the --manifest-path given) inside an EmuWiz tree?  Found by walking up, so a
+# git failure (broken gitfile, pruned admin dir, safe.directory) can never fall through
+# to plain cargo, which would build an in-tree target/.
+starts=("$PWD")
+prev=""
+for arg in "$@"; do
+  [ "$arg" = "--" ] && break
+  case "$arg" in --manifest-path=*) starts+=("$(dirname "${arg#--manifest-path=}")") ;; esac
+  [ "$prev" = "--manifest-path" ] && starts+=("$(dirname "$arg")")
+  prev=$arg
+done
+emuwiz_tree=""
+for start in "${starts[@]}"; do
+  d=$(cd "$start" 2>/dev/null && pwd -P) || continue
+  while :; do
+    if is_emuwiz "$d"; then emuwiz_tree=$d; break 2; fi
+    [ "$d" = / ] && break
+    d=$(dirname "$d")
+  done
+done
+top=$(git rev-parse --show-toplevel 2>/dev/null) && top=$(cd "$top" && pwd -P) || top=""
+if [ -n "$emuwiz_tree" ] && { [ -z "$top" ] || ! is_emuwiz "$top"; }; then
+  echo "emuwiz-ra-cargo: $emuwiz_tree is an EmuWiz tree but its git checkout cannot be resolved; refusing to build (it would land in-tree)" >&2
+  exit 2
+fi
+if [ -n "$top" ] && is_emuwiz "$top"; then
+  # an explicit --target-dir would bypass the managed target; refuse rather than build in-tree
+  for arg in "$@"; do
+    [ "$arg" = "--" ] && break
+    case "$arg" in
+      --target-dir|--target-dir=*)
+        echo "emuwiz-ra-cargo: refusing an explicit --target-dir in an EmuWiz checkout (set rust-analyzer.cargo.targetDir to null)" >&2
+        exit 2 ;;
+    esac
+  done
+  EMUWIZ_CARGO=$(real_cargo) exec "$here/cargo-iso" --rust-analyzer "$@"
+fi
+exec "$(real_cargo)" "$@"

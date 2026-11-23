@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Launch the real rust-analyzer with CARGO pointing at scripts/emuwiz-ra-cargo, so its
+# checks and build scripts in EmuWiz checkouts use the managed cargo-iso target
+# (<target>/rust-analyzer) instead of an unbounded in-tree target/.
+#
+# Configuration is NOT changed by this file. To use it, put a directory containing a
+# `rust-analyzer` symlink to this script ahead of the real one on the editor's PATH,
+# or point the editor/plugin's server path at it (owner decision; see OPERATIONS notes).
+set -uo pipefail
+here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd -P)
+self=$(readlink -f "$0")
+real="${EMUWIZ_REAL_RUST_ANALYZER:-}"
+if [ -z "$real" ]; then
+  IFS=: read -r -a dirs <<<"$PATH"
+  for d in "${dirs[@]}"; do
+    c="$d/rust-analyzer"
+    [ -x "$c" ] || continue
+    [ "$(readlink -f "$c")" = "$self" ] && continue
+    real="$c"; break
+  done
+fi
+[ -n "$real" ] || { echo "emuwiz-rust-analyzer: the real rust-analyzer was not found on PATH" >&2; exit 127; }
+export CARGO="$here/emuwiz-ra-cargo"
+unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+exec "$real" "$@"

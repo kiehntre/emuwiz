@@ -63,6 +63,30 @@ pub(crate) fn scummvm_scan_lines(report: &ScummVmScanReport) -> Vec<String> {
             folder_names(&report.unknown_variants)
         ));
     }
+    if !report.identical_copies.is_empty() {
+        lines.push(format!(
+            "Not added as separate games because each is a byte-for-byte copy of another folder \
+             of the same ScummVM game (both folders are left untouched): {}.",
+            report
+                .identical_copies
+                .iter()
+                .map(|(copy, kept)| format!(
+                    "{} (same as {})",
+                    folder_names(std::slice::from_ref(copy)),
+                    folder_names(std::slice::from_ref(kept))
+                ))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    for (game, folders) in &report.same_game {
+        lines.push(format!(
+            "The same ScummVM game ({game}) was found in {} folders; each is kept and listed, \
+             check whether one is a spare copy: {}.",
+            folders.len(),
+            folder_names(folders)
+        ));
+    }
     if !report.contained_media.is_empty() {
         lines.push(format!(
             "{} recognised game file(s) sit inside confirmed ScummVM game folders and were kept \
@@ -81,15 +105,14 @@ pub(crate) fn scummvm_scan_lines(report: &ScummVmScanReport) -> Vec<String> {
 
 pub(crate) fn format_scan_completion(summary: &ScanPersistSummary) -> String {
     format!(
-        "Scan completed\nSeen: {}\nAdded: {}\nUpdated: {} (including {} restored)\nNewly missing: {}\nUnchanged: {}\nSkipped unsupported: {}\nSkipped ambiguous: {}\nErrors: {}",
+        "Scan completed\nSeen: {}\nAdded: {}\nUpdated: {} (including {} restored)\nNewly missing: {}\nUnchanged: {}\n{}\nErrors: {}",
         summary.counts.archives_seen,
         summary.counts.archives_added,
         summary.counts.archives_updated,
         summary.counts.archives_restored,
         summary.counts.archives_missing,
         summary.counts.archives_unchanged,
-        summary.counts.skipped_unsupported_extension,
-        summary.counts.skipped_ambiguous_platform,
+        skipped_lines(&summary.counts),
         summary.counts.errors_count,
     ) + &scummvm_scan_lines(&summary.scummvm)
         .into_iter()
@@ -97,9 +120,52 @@ pub(crate) fn format_scan_completion(summary: &ScanPersistSummary) -> String {
         .collect::<String>()
 }
 
+/// Skipped-file lines of the scan report, one per reason, from the totals the
+/// scan stored. A run without a stored breakdown says so, never inventing one.
+fn skipped_lines(counts: &archivefs_core::ScanRunCounts) -> String {
+    match counts.skip_reasons {
+        Some(c) => format!(
+            "Skipped unsupported format: {}\nSkipped unsupported variant: {}\nSkipped invalid content: {}\nSkipped ambiguous: {}\nRecognised duplicates (identical copies of catalogued ZIPs, not added twice): {}",
+            c.unsupported_extension,
+            c.unsupported_variant,
+            c.invalid_content,
+            c.ambiguous_platform,
+            c.identical_copy,
+        ),
+        None => format!(
+            "Skipped unsupported, invalid or alternate copies (breakdown not recorded): {}\nSkipped ambiguous: {}",
+            counts.skipped_unsupported_extension, counts.skipped_ambiguous_platform,
+        ),
+    }
+}
+
+/// " (5 unsupported format, 3 recognised duplicates)" for the reasons that
+/// occurred, or nothing when no breakdown was stored or nothing was skipped.
+fn skipped_breakdown(counts: &archivefs_core::ScanRunCounts) -> String {
+    let Some(c) = counts.skip_reasons else {
+        return String::new();
+    };
+    let parts: Vec<String> = [
+        (c.unsupported_extension, "unsupported format"),
+        (c.unsupported_variant, "unsupported variant"),
+        (c.invalid_content, "invalid content"),
+        (c.ambiguous_platform, "ambiguous"),
+        (c.identical_copy, "recognised duplicates"),
+    ]
+    .into_iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, label)| format!("{count} {label}"))
+    .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
 pub(crate) fn format_scan_activity(summary: &ScanPersistSummary) -> String {
     format!(
-        "Scan completed: seen {}, added {}, updated {} (including {} restored), newly missing {}, unchanged {}, skipped {}, errors {}.",
+        "Scan completed: seen {}, added {}, updated {} (including {} restored), newly missing {}, unchanged {}, skipped {}{}, errors {}.",
         summary.counts.archives_seen,
         summary.counts.archives_added,
         summary.counts.archives_updated,
@@ -107,6 +173,7 @@ pub(crate) fn format_scan_activity(summary: &ScanPersistSummary) -> String {
         summary.counts.archives_missing,
         summary.counts.archives_unchanged,
         summary.counts.skipped_unsupported_extension + summary.counts.skipped_ambiguous_platform,
+        skipped_breakdown(&summary.counts),
         summary.counts.errors_count,
     ) + &if summary.scummvm.detector_available {
         format!(
@@ -119,7 +186,33 @@ pub(crate) fn format_scan_activity(summary: &ScanPersistSummary) -> String {
         )
     } else {
         String::new()
+    } + &format_nested_mounts(summary)
+}
+
+/// One sentence about archive mounts inside sources, when there are any.
+fn format_nested_mounts(summary: &ScanPersistSummary) -> String {
+    if summary.nested_mounts.is_empty() {
+        return String::new();
     }
+    let read: Vec<_> = summary
+        .nested_mounts
+        .iter()
+        .filter(|mount| mount.state.indexed())
+        .collect();
+    let games: usize = read.iter().map(|mount| mount.archives).sum();
+    let held = summary
+        .nested_mounts
+        .iter()
+        .filter(|mount| !mount.state.reconciled())
+        .count();
+    format!(
+        " Mounted archive folders: {} read ({games} games){}.",
+        read.len(),
+        match held {
+            0 => String::new(),
+            n => format!(", {n} not checked for missing games this scan (see the scan details)"),
+        }
+    )
 }
 
 pub(crate) fn format_database_upgrade_success(
@@ -164,6 +257,14 @@ mod scummvm_wording_tests {
             rejected: vec![PathBuf::from("/g/Odd")],
             unknown_variants: vec![PathBuf::from("/g/Tapes")],
             contained_media: vec![PathBuf::from("/g/Queen/bonus.gba")],
+            identical_copies: vec![(PathBuf::from("/g/sq4"), PathBuf::from("/g/Space Quest 4"))],
+            same_game: vec![(
+                "sci:qfg1vga".into(),
+                vec![
+                    PathBuf::from("/g/qfg1"),
+                    PathBuf::from("/g/Quest for Glory 1"),
+                ],
+            )],
             errors: vec![(PathBuf::from("/g"), "timed out".into())],
             cache_hits: 1,
             detector_runs: 0,
@@ -175,6 +276,15 @@ mod scummvm_wording_tests {
         assert!(text.contains("own folder check") && text.contains("Odd"));
         assert!(text.contains("only guessed these folders") && text.contains("Tapes"));
         assert!(text.contains("1 recognised game file(s) sit inside"));
+        assert!(
+            text.contains("byte-for-byte copy") && text.contains("sq4 (same as Space Quest 4)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("same ScummVM game (sci:qfg1vga) was found in 2 folders")
+                && text.contains("Quest for Glory 1"),
+            "{text}"
+        );
         assert!(text.contains("could not check /g: timed out"));
     }
 }

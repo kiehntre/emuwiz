@@ -72,8 +72,8 @@ fn unknown_neighbouring_and_decorated_system_text_fails_closed() {
         "Acorn",
         "Commodore",
         "Commodore C64DTV",
-        "commodore c64", // exact, case-sensitive
-        "Commodore C16, C116 & Plus-4",
+        "commodore c64",          // exact, case-sensitive
+        "Commodore C16 & Plus-4", // only the exact TOSEC spelling is reviewed
         "Sinclair ZX81",
         "Sinclair ZX80",
         "Acorn Atom",
@@ -156,8 +156,9 @@ fn only_platforms_that_expect_tosec_have_a_projection() {
 #[test]
 fn the_projection_and_the_coverage_expectation_stay_in_lockstep() {
     for platform in TOSEC_PRIMARY_PLATFORMS {
+        let equivalents = crate::platform::equivalent_platform_ids(platform);
         assert!(
-            rows().any(|(row, _)| row == *platform),
+            rows().any(|(row, _)| row == *platform || equivalents.contains(&row)),
             "{platform} expects TOSEC but has no system projection"
         );
         match expected_authoritative_coverage(Some(platform)) {
@@ -412,5 +413,29 @@ fn tosec_pack_probe() {
         for line in unrecognised.iter().take(3) {
             eprintln!("PROBE   e.g. {line}");
         }
+    }
+}
+
+#[test]
+fn the_c16_plus4_list_belongs_to_both_ted_machines_and_never_to_the_c64() {
+    const SYSTEMS: &[&str] = &["Commodore C16, C116 & Plus-4"];
+    let system = SYSTEMS[0];
+    assert_eq!(
+        platform_for_tosec_system(system),
+        PlatformForTosecSystem::Platform("Commodore 16")
+    );
+    for platform in ["Commodore 16", "Commodore Plus-4", "c16", "plus4"] {
+        assert_eq!(
+            tosec_systems_for_platform(Some(platform)),
+            TosecSystemsForPlatform::Systems(SYSTEMS),
+            "{platform}"
+        );
+    }
+    for platform in ["Commodore 64", "VIC-20", "Commodore 128"] {
+        assert_ne!(
+            tosec_systems_for_platform(Some(platform)),
+            TosecSystemsForPlatform::Systems(SYSTEMS),
+            "{platform}"
+        );
     }
 }

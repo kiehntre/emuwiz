@@ -17,17 +17,30 @@
 //! - **NoUsableEvidence**: no reliable content evidence to compare (including
 //!   archive contents that could not be examined).
 //!
-//! # Every shared algorithm is tried, not just the strongest
+//! # Every shared algorithm is consulted, and their candidates are unioned
 //!
 //! A DAT carries the algorithms its publisher chose; the caller knows whatever
 //! EmuWiz happens to have computed. The two sets overlap but neither contains
 //! the other - a No-Intro DAT publishes CRC32/MD5/SHA-1 and no SHA-256, so
 //! stopping at the strongest hash the *caller* holds reports a perfectly matching
-//! file as absent from the catalogue. Each algorithm is tried in descending order
-//! of strength. Only candidates whose shared, well-formed cryptographic hashes
-//! agree may decide a match; a CRC32 match cannot override such a contradiction.
-//! Missing algorithms are not contradictions. This compares supplied evidence,
-//! not newly read file content, and retains the existing confidence tiers.
+//! file as absent from the catalogue. Worse, *returning* on the first algorithm
+//! that finds something hides every record that publishes only a weaker one
+//! (S03-01): two entries with identical content became a "unique" match for
+//! whichever carried the stronger hash. [`collect_crypto_candidates`] therefore
+//! looks every algorithm up and reports the deduplicated union, in catalogue
+//! order, labelled with the strongest algorithm that confirmed a record. Only
+//! candidates whose shared, well-formed cryptographic hashes agree may decide a
+//! match; a CRC32 match cannot override such a contradiction. Missing algorithms
+//! are not contradictions. This compares supplied evidence, not newly read file
+//! content, and retains the existing confidence tiers.
+//!
+//! # `nodump` and `baddump` records are never identity
+//!
+//! A catalogue record whose `status` is `nodump` or `baddump` describes
+//! content the publisher could not or would not verify (S03-03). A file whose
+//! hash agrees with such a record is a known bad dump or a placeholder hit,
+//! not the game, so the verdict is `Ambiguous` with the record named - never
+//! `Exact` or `Probable`. Weaker evidence is not consulted afterwards.
 
 use serde::Serialize;
 
@@ -201,41 +214,245 @@ pub fn audit_files(known: &[KnownFileEvidence], index: &DatIndex) -> AuditReport
     AuditReport { entries, summary }
 }
 
-pub(crate) fn audit_one(known: &KnownFileEvidence, index: &DatIndex) -> AuditVerdict {
-    // Strongest first, but *every* algorithm the caller holds is tried until one
-    // finds candidates. Returning on the first algorithm the caller happens to
-    // know reports a matching file as absent whenever the DAT does not publish
-    // that particular algorithm.
-    let mut compared_any = false;
-    let mut crypto_conflict = false;
+/// What a catalogue record's `status` attribute says about its hashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DumpStatus {
+    /// `good`, `verified`, or no status: the hashes describe a real dump.
+    Ordinary,
+    /// `nodump`: the catalogue has never seen a dump; any published hash is
+    /// a placeholder and can never confirm a file.
+    NoDump,
+    /// `baddump`: the catalogue knows this exact content and knows it is
+    /// wrong. A file matching it is identified as a known bad dump, never
+    /// as the game.
+    BadDump,
+}
 
-    for (value, algorithm) in [
-        (known.sha256.as_deref(), "SHA-256"),
-        (known.sha1.as_deref(), "SHA-1"),
-        (known.md5.as_deref(), "MD5"),
-    ] {
-        let Some(value) = value else { continue };
+impl DumpStatus {
+    pub fn of(status: Option<&str>) -> Self {
+        match status.map(str::trim) {
+            Some(value) if value.eq_ignore_ascii_case("nodump") => Self::NoDump,
+            Some(value) if value.eq_ignore_ascii_case("baddump") => Self::BadDump,
+            _ => Self::Ordinary,
+        }
+    }
+
+    /// Whether a record with this status may stand as identity evidence.
+    pub fn is_verifiable(self) -> bool {
+        matches!(self, Self::Ordinary)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ordinary => "good",
+            Self::NoDump => "nodump",
+            Self::BadDump => "baddump",
+        }
+    }
+}
+
+/// Every catalogue record that one of the caller's cryptographic hashes
+/// agrees with, collected across **all** shared algorithms.
+///
+/// S03-01 / D3-01: stopping at the first algorithm that found candidates
+/// hid any record that publishes only a weaker algorithm. Two catalogue
+/// entries describing byte-identical content - one with SHA-1 and MD5, one
+/// with MD5 alone - used to collapse into a unique `Exact` match for the
+/// first, because the SHA-1 lookup happened to return before the MD5 lookup
+/// ran. Identity certainty was decided by which hashes each publisher chose
+/// to print. Here every algorithm is consulted and the union is reported,
+/// each record once, in catalogue order, so the ambiguity stays visible.
+#[derive(Debug, Clone, Default)]
+pub struct CryptoCandidates {
+    /// Verifiable records whose shared cryptographic hashes all agree with
+    /// the caller's. Deduplicated, in catalogue declaration order.
+    pub consistent: Vec<super::index::SharedRomRef>,
+    /// The label for the evidence behind `consistent`: the strongest
+    /// algorithm that confirmed **every** consistent record, or, when no
+    /// single algorithm did, the union of those needed (e.g. `"SHA-1/MD5"`).
+    /// `None` when `consistent` is empty.
+    pub algorithm: Option<&'static str>,
+    /// Records a hash matched whose status marks them `nodump`/`baddump`.
+    /// They are identity evidence of the *wrong* kind and never become a
+    /// match, however strong the hash. Deduplicated, in catalogue order.
+    pub unverifiable: Vec<(super::index::SharedRomRef, DumpStatus)>,
+    /// Distinct matched records excluded because another cryptographic hash
+    /// they publish disagrees with the caller's value for the same algorithm.
+    pub contradicted: usize,
+    /// At least one well-formed cryptographic hash was looked up.
+    pub compared_any: bool,
+}
+
+impl CryptoCandidates {
+    /// A one-line account of the excluded `nodump`/`baddump` records.
+    pub fn unverifiable_detail(&self) -> String {
+        self.unverifiable
+            .iter()
+            .map(|(record, status)| {
+                format!(
+                    "{} / {} ({})",
+                    record.game_name,
+                    record.rom_name,
+                    status.label()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+const CRYPTO_ALGORITHM_BITS: [(u8, &str); 3] = [(4, "SHA-256"), (2, "SHA-1"), (1, "MD5")];
+
+/// The evidence label for a set of consistent records, each described by the
+/// bits of the algorithms that confirmed it. A single `Exact` keeps its
+/// familiar strongest-algorithm label; a union label appears only when the
+/// candidate set cannot be explained by any one algorithm, so the GUI's
+/// "this file's {algorithm} hash matches N entries" stays a true sentence.
+fn algorithm_label(confirmed: impl Iterator<Item = u8>) -> Option<&'static str> {
+    let masks: Vec<u8> = confirmed.collect();
+    if masks.is_empty() {
+        return None;
+    }
+    for (bit, algorithm) in CRYPTO_ALGORITHM_BITS {
+        if masks.iter().all(|mask| mask & bit != 0) {
+            return Some(algorithm);
+        }
+    }
+    Some(match masks.iter().fold(0u8, |union, mask| union | mask) {
+        7 => "SHA-256/SHA-1/MD5",
+        6 => "SHA-256/SHA-1",
+        5 => "SHA-256/MD5",
+        3 => "SHA-1/MD5",
+        4 => "SHA-256",
+        2 => "SHA-1",
+        _ => "MD5",
+    })
+}
+
+fn known_value<'a>(known: &'a KnownFileEvidence, algorithm: &str) -> Option<&'a str> {
+    match algorithm {
+        "SHA-256" => known.sha256.as_deref(),
+        "SHA-1" => known.sha1.as_deref(),
+        _ => known.md5.as_deref(),
+    }
+}
+
+fn member_order_key(record: &super::index::DatRomRef) -> (usize, u8, usize, usize, usize) {
+    use super::index::MemberLocation;
+    match record.member_key.location {
+        MemberLocation::TopLevel { rom_index } => (record.game_index, 0, rom_index, 0, 0),
+        MemberLocation::DataArea {
+            part_index,
+            data_area_index,
+            member_index,
+        } => (
+            record.game_index,
+            1,
+            part_index,
+            data_area_index,
+            member_index,
+        ),
+    }
+}
+
+/// Collects [`CryptoCandidates`] for `known` against `index`.
+///
+/// This is the single place the audit, the policy annotation and the
+/// persisted matched-reference list derive their candidate set from, so
+/// none of them can disagree about what the file matched.
+pub fn collect_crypto_candidates(known: &KnownFileEvidence, index: &DatIndex) -> CryptoCandidates {
+    use std::collections::{HashMap, HashSet};
+    let mut out = CryptoCandidates::default();
+    let mut contradicted: HashSet<super::index::DatMemberKey> = HashSet::new();
+    // Which algorithms confirmed each consistent record (one bit each).
+    let mut confirmed_by: HashMap<super::index::DatMemberKey, u8> = HashMap::new();
+    for (bit, algorithm) in CRYPTO_ALGORITHM_BITS {
+        let Some(value) = known_value(known, algorithm) else {
+            continue;
+        };
         let Some(normalised) = normalise_for_lookup(value, algorithm) else {
             continue;
         };
-        compared_any = true;
+        out.compared_any = true;
         let candidates = match algorithm {
             "SHA-256" => index.lookup_sha256(&normalised),
             "SHA-1" => index.lookup_sha1(&normalised),
             _ => index.lookup_md5(&normalised),
         };
-        if !candidates.is_empty() {
-            let consistent: Vec<_> = candidates
-                .iter()
-                .filter(|candidate| !cryptographic_hash_disagrees(known, candidate))
-                .cloned()
-                .collect();
-            if !consistent.is_empty() {
-                return handle_candidates(&consistent, algorithm);
+        for candidate in candidates {
+            if cryptographic_hash_disagrees(known, candidate) {
+                contradicted.insert(candidate.key());
+                continue;
             }
-            crypto_conflict = true;
+            let status = DumpStatus::of(candidate.status.as_deref());
+            if !status.is_verifiable() {
+                if !out
+                    .unverifiable
+                    .iter()
+                    .any(|(seen, _)| seen.key() == candidate.key())
+                {
+                    out.unverifiable.push((candidate.clone(), status));
+                }
+                continue;
+            }
+            *confirmed_by.entry(candidate.key()).or_insert(0) |= bit;
+            if out
+                .consistent
+                .iter()
+                .any(|seen| seen.key() == candidate.key())
+            {
+                continue;
+            }
+            out.consistent.push(candidate.clone());
         }
     }
+    out.contradicted = contradicted.len();
+    out.algorithm = algorithm_label(confirmed_by.values().copied());
+    out.consistent
+        .sort_by_key(|record| member_order_key(record));
+    out.unverifiable
+        .sort_by_key(|(record, _)| member_order_key(record));
+    out
+}
+
+pub(crate) fn audit_one(known: &KnownFileEvidence, index: &DatIndex) -> AuditVerdict {
+    let crypto = collect_crypto_candidates(known, index);
+    if !crypto.consistent.is_empty() {
+        return handle_candidates(
+            &crypto.consistent,
+            crypto
+                .algorithm
+                .expect("a non-empty consistent set always has an evidence label"),
+        );
+    }
+    if !crypto.unverifiable.is_empty() {
+        // S03-03 / D3-03: the hash agrees with a record the catalogue itself
+        // declares unusable. That is a strong statement about what this file
+        // is - a known bad dump, or a placeholder - and it must never be
+        // reported as the game. Nothing weaker (CRC32, filename) is consulted
+        // afterwards: it could only name the same record or a collision.
+        return AuditVerdict::Ambiguous {
+            detail: format!(
+                "the only catalogue record(s) matching this file's cryptographic hash are \
+                 marked unverifiable: {}; a bad dump or a missing dump is never a verified \
+                 identity",
+                crypto.unverifiable_detail()
+            ),
+        };
+    }
+    if crypto.contradicted > 0 {
+        // A cryptographic hash hit whose sibling hash disagrees is a
+        // contradiction about *this* file. A CRC32 that then agrees with some
+        // other record cannot settle it: the module doc promises a CRC32
+        // match never overrides a cryptographic contradiction, so stop here
+        // rather than report a Probable identity for a file in dispute.
+        return AuditVerdict::Ambiguous {
+            detail: "Cryptographic hash matches exist, but their other published cryptographic \
+                     hashes disagree with this file"
+                .into(),
+        };
+    }
+    let mut compared_any = crypto.compared_any;
 
     // CRC32, qualified by size when both are known.
     if let Some(crc) = known.crc32.as_deref()
@@ -260,6 +477,35 @@ pub(crate) fn audit_one(known: &KnownFileEvidence, index: &DatIndex) -> AuditVer
                     ),
                 };
             }
+            // A CRC32 agreeing with a `nodump`/`baddump` record is the same
+            // wrong-kind evidence as above, only weaker.
+            let (verifiable, unverifiable): (
+                Vec<&super::index::SharedRomRef>,
+                Vec<&super::index::SharedRomRef>,
+            ) = uncontradicted
+                .iter()
+                .partition(|candidate| DumpStatus::of(candidate.status.as_deref()).is_verifiable());
+            if verifiable.is_empty() {
+                let detail = unverifiable
+                    .iter()
+                    .map(|candidate: &&super::index::SharedRomRef| {
+                        format!(
+                            "{} / {} ({})",
+                            candidate.game_name,
+                            candidate.rom_name,
+                            DumpStatus::of(candidate.status.as_deref()).label()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return AuditVerdict::Ambiguous {
+                    detail: format!(
+                        "CRC32 {normalised} matches only catalogue record(s) marked unverifiable: \
+                         {detail}; a bad dump or a missing dump is never a verified identity"
+                    ),
+                };
+            }
+            let uncontradicted = verifiable;
             return match known.size_bytes {
                 Some(size) => {
                     let matched: Vec<_> = uncontradicted
@@ -298,12 +544,6 @@ pub(crate) fn audit_one(known: &KnownFileEvidence, index: &DatIndex) -> AuditVer
                 },
             };
         }
-    }
-
-    if crypto_conflict {
-        return AuditVerdict::Ambiguous {
-            detail: "Cryptographic hash matches exist, but their other published cryptographic hashes disagree with this file".into(),
-        };
     }
 
     // Something was comparable and none of it found anything: the file is not in
@@ -850,6 +1090,238 @@ mod tests {
         let index = index_of(vec![("Bad", bad), ("Good", good)]);
         assert!(
             matches!(verdict(file().with_sha1(SHA1_A).with_md5(MD5_B), &index), AuditVerdict::Exact { game_name, algorithm: "MD5", .. } if game_name == "Good")
+        );
+    }
+    // ---- Hard Job #6 / Operation Identity Lock regressions ----------------
+
+    const SHA1_X: &str = "1111111111111111111111111111111111111111";
+    const SHA1_Y: &str = "2222222222222222222222222222222222222222";
+    const MD5_X: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const MD5_Z: &str = "cccccccccccccccccccccccccccccccc";
+
+    fn rom_with(name: &str, sha1: Option<&str>, md5: Option<&str>) -> DatRomEntry {
+        DatRomEntry {
+            name: name.into(),
+            size_bytes: Some(8),
+            sha1: sha1.map(str::to_string),
+            md5: md5.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn file_with(sha1: Option<&str>, md5: Option<&str>) -> KnownFileEvidence {
+        let mut known = file().with_size(8);
+        if let Some(sha1) = sha1 {
+            known = known.with_sha1(sha1);
+        }
+        if let Some(md5) = md5 {
+            known = known.with_md5(md5);
+        }
+        known
+    }
+
+    /// S03-01 / D3-01: a second record with identical content that publishes
+    /// only the weaker hash used to vanish behind the SHA-1 "unique" match.
+    #[test]
+    fn s03_01_identical_content_record_with_only_a_weaker_hash_is_not_hidden() {
+        let index = index_of(vec![
+            ("Game A", rom_with("a.bin", Some(SHA1_X), Some(MD5_X))),
+            ("Game B", rom_with("b.bin", None, Some(MD5_X))),
+        ]);
+        match verdict(file_with(Some(SHA1_X), Some(MD5_X)), &index) {
+            AuditVerdict::ExactMultipleCandidates {
+                algorithm,
+                count,
+                game_names,
+            } => {
+                // MD5 is the one algorithm that confirmed both records, so
+                // "this file's MD5 hash matches 2 entries" is the true label.
+                assert_eq!(algorithm, "MD5");
+                assert_eq!(count, 2);
+                assert_eq!(game_names, vec!["Game A", "Game B"]);
+            }
+            other => panic!("expected both candidates, got {other:?}"),
+        }
+    }
+
+    /// Records confirmed by disjoint algorithms (one publishes SHA-256 only,
+    /// the other SHA-1 only) are both reported, under a union label.
+    #[test]
+    fn s03_01_disjoint_algorithms_are_unioned_with_a_union_label() {
+        let mut only_sha256 = rom_with("a.bin", None, None);
+        only_sha256.sha256 = Some(SHA256_B.into());
+        let only_sha1 = rom_with("b.bin", Some(SHA1_X), None);
+        let index = index_of(vec![("Game A", only_sha256), ("Game B", only_sha1)]);
+        let known = file_with(Some(SHA1_X), None).with_sha256(SHA256_B);
+        match verdict(known, &index) {
+            AuditVerdict::ExactMultipleCandidates {
+                algorithm,
+                count,
+                game_names,
+            } => {
+                assert_eq!(algorithm, "SHA-256/SHA-1");
+                assert_eq!(count, 2);
+                assert_eq!(game_names, vec!["Game A", "Game B"]);
+            }
+            other => panic!("expected both candidates, got {other:?}"),
+        }
+        // A lone record keeps its strongest single-algorithm label.
+        let single = index_of(vec![(
+            "Game A",
+            rom_with("a.bin", Some(SHA1_X), Some(MD5_X)),
+        )]);
+        assert!(matches!(
+            verdict(file_with(Some(SHA1_X), Some(MD5_X)), &single),
+            AuditVerdict::Exact {
+                algorithm: "SHA-1",
+                ..
+            }
+        ));
+    }
+
+    /// A cryptographic contradiction is never settled by a CRC32 that agrees
+    /// with some other record: the file is in dispute, not probably Game B.
+    #[test]
+    fn a_crc32_match_never_overrides_a_cryptographic_contradiction() {
+        let mut disputed = rom("a.bin", 8, "deadbeef");
+        disputed.sha1 = Some(SHA1_X.into());
+        disputed.md5 = Some(MD5_X.into());
+        let other = rom("b.bin", 8, "deadbeef");
+        let index = index_of(vec![("Game A", disputed), ("Game B", other)]);
+        let known = file_with(Some(SHA1_X), Some(MD5_Z)).with_crc32("deadbeef");
+        assert!(matches!(
+            verdict(known, &index),
+            AuditVerdict::Ambiguous { .. }
+        ));
+        let collected = collect_crypto_candidates(&file_with(Some(SHA1_X), Some(MD5_Z)), &index);
+        assert_eq!(collected.contradicted, 1, "one record, counted once");
+    }
+
+    /// The union is reported in catalogue order whichever algorithm found a
+    /// record, so the verdict does not depend on publication choices.
+    #[test]
+    fn s03_01_candidate_order_is_catalogue_order_not_algorithm_order() {
+        let index = index_of(vec![
+            ("Game B", rom_with("b.bin", None, Some(MD5_X))),
+            ("Game A", rom_with("a.bin", Some(SHA1_X), Some(MD5_X))),
+        ]);
+        match verdict(file_with(Some(SHA1_X), Some(MD5_X)), &index) {
+            AuditVerdict::ExactMultipleCandidates { game_names, .. } => {
+                assert_eq!(game_names, vec!["Game B", "Game A"]);
+            }
+            other => panic!("expected both candidates, got {other:?}"),
+        }
+        let collected = collect_crypto_candidates(&file_with(Some(SHA1_X), Some(MD5_X)), &index);
+        assert_eq!(collected.consistent.len(), 2);
+        assert_eq!(collected.algorithm, Some("MD5"));
+        assert!(collected.unverifiable.is_empty());
+        assert_eq!(collected.contradicted, 0);
+    }
+
+    /// A record that shares one hash but disagrees on another is a
+    /// contradiction, never a second candidate.
+    #[test]
+    fn s03_01_sha1_and_md5_disagreement_excludes_the_record() {
+        let index = index_of(vec![
+            ("Game A", rom_with("a.bin", Some(SHA1_X), Some(MD5_X))),
+            ("Game B", rom_with("b.bin", Some(SHA1_Y), Some(MD5_X))),
+        ]);
+        match verdict(file_with(Some(SHA1_X), Some(MD5_X)), &index) {
+            AuditVerdict::Exact {
+                game_name,
+                algorithm,
+                ..
+            } => {
+                assert_eq!(game_name, "Game A");
+                assert_eq!(algorithm, "SHA-1");
+            }
+            other => panic!("expected exact Game A, got {other:?}"),
+        }
+        // The same file against a catalogue whose only record contradicts it.
+        let only_conflict = index_of(vec![(
+            "Game B",
+            rom_with("b.bin", Some(SHA1_X), Some(MD5_Z)),
+        )]);
+        assert!(matches!(
+            verdict(file_with(Some(SHA1_X), Some(MD5_X)), &only_conflict),
+            AuditVerdict::Ambiguous { .. }
+        ));
+    }
+
+    /// S03-03 / D3-03: a `baddump` record's hash agreeing with the file says
+    /// "this is the known bad dump", never "this is the game".
+    #[test]
+    fn s03_03_a_baddump_record_never_becomes_an_exact_identity() {
+        let mut bad = rom_with("game.bin", Some(SHA1_X), Some(MD5_X));
+        bad.status = Some("baddump".into());
+        let index = index_of(vec![("Game", bad)]);
+        let report = audit_files(&[file_with(Some(SHA1_X), Some(MD5_X))], &index);
+        match &report.entries[0].verdict {
+            AuditVerdict::Ambiguous { detail } => {
+                assert!(detail.contains("baddump"), "{detail}");
+                assert!(detail.contains("Game / game.bin"), "{detail}");
+            }
+            other => panic!("expected an ambiguous refusal, got {other:?}"),
+        }
+        assert_eq!(report.summary.exact, 0);
+        assert_eq!(report.summary.ambiguous, 1);
+        assert!(!report.entries[0].verdict.is_confident());
+    }
+
+    /// A `nodump` record reached through CRC32 and size is not Probable either.
+    #[test]
+    fn s03_03_a_nodump_record_never_becomes_a_probable_identity() {
+        let mut placeholder = rom("game.bin", 8, "deadbeef");
+        placeholder.status = Some("NoDump".into());
+        let index = index_of(vec![("Game", placeholder)]);
+        match verdict(file().with_size(8).with_crc32("deadbeef"), &index) {
+            AuditVerdict::Ambiguous { detail } => {
+                assert!(detail.contains("nodump"), "{detail}");
+            }
+            other => panic!("expected an ambiguous refusal, got {other:?}"),
+        }
+    }
+
+    /// A good record and a bad-dump record sharing a hash resolve to the good
+    /// record alone; the bad one is excluded, not counted as a candidate.
+    #[test]
+    fn s03_03_a_good_record_is_not_made_ambiguous_by_a_baddump_twin() {
+        let mut bad = rom_with("bad.bin", Some(SHA1_X), None);
+        bad.status = Some("baddump".into());
+        let index = index_of(vec![
+            ("Game", rom_with("good.bin", Some(SHA1_X), None)),
+            ("Game [b]", bad),
+        ]);
+        match verdict(file_with(Some(SHA1_X), None), &index) {
+            AuditVerdict::Exact { game_name, .. } => assert_eq!(game_name, "Game"),
+            other => panic!("expected exact Game, got {other:?}"),
+        }
+        let collected = collect_crypto_candidates(&file_with(Some(SHA1_X), None), &index);
+        assert_eq!(collected.consistent.len(), 1);
+        assert_eq!(collected.unverifiable.len(), 1);
+        assert_eq!(collected.unverifiable[0].1, DumpStatus::BadDump);
+    }
+
+    /// `good`/`verified`/absent statuses stay ordinary; anything unknown is
+    /// not treated as bad here (set classification owns that question).
+    #[test]
+    fn dump_status_recognises_only_nodump_and_baddump() {
+        assert_eq!(DumpStatus::of(None), DumpStatus::Ordinary);
+        assert_eq!(DumpStatus::of(Some("good")), DumpStatus::Ordinary);
+        assert_eq!(DumpStatus::of(Some("verified")), DumpStatus::Ordinary);
+        assert_eq!(DumpStatus::of(Some(" BADDUMP ")), DumpStatus::BadDump);
+        assert_eq!(DumpStatus::of(Some("nodump")), DumpStatus::NoDump);
+        assert_eq!(DumpStatus::of(Some("odd")), DumpStatus::Ordinary);
+    }
+
+    /// Identical names, different bytes: a hash that compares and misses is
+    /// `NotInDat`; the shared filename never upgrades it.
+    #[test]
+    fn identical_names_with_different_bytes_are_not_in_dat() {
+        let index = index_of(vec![("Game", rom_with("local.bin", Some(SHA1_X), None))]);
+        assert_eq!(
+            verdict(file_with(Some(SHA1_Y), None), &index),
+            AuditVerdict::NotInDat
         );
     }
 }

@@ -170,13 +170,56 @@ impl PinnedOpenRct2 {
     }
 
     /// Re-read the identity, owner and mode from the descriptor itself.
+    ///
+    /// When only ctime moved (removing or renaming the pinned file's last
+    /// name, as a package update does, changes the pinned inode's ctime and
+    /// nothing else), the bytes are hashed again through this descriptor and
+    /// accepted only if the SHA-256 is still the checked one. The launch
+    /// executes this descriptor, so the hash is the binding; nothing else
+    /// about changed metadata is accepted.
     fn confirm_unchanged(&self) -> Result<(), String> {
+        let modified = || Err("the executable was modified while it was being verified".into());
         let now = self.file.metadata().map_err(|e| e.to_string())?;
         check_file_mode(&now)?;
-        if CapturedFileIdentity::capture(&now) != self.identity {
-            return Err("the executable was modified while it was being verified".into());
+        let identity = CapturedFileIdentity::capture(&now);
+        if identity == self.identity {
+            return Ok(());
+        }
+        let only_ctime = |identity: CapturedFileIdentity| {
+            CapturedFileIdentity {
+                changed: self.identity.changed,
+                ..identity
+            } == self.identity
+        };
+        if !only_ctime(identity) || self.hash_through_descriptor()? != self.sha256 {
+            return modified();
+        }
+        // Nothing, not even ctime, may move while the bytes were re-hashed.
+        let after = self.file.metadata().map_err(|e| e.to_string())?;
+        check_file_mode(&after)?;
+        if CapturedFileIdentity::capture(&after) != identity {
+            return modified();
         }
         Ok(())
+    }
+
+    /// SHA-256 of the pinned bytes, read with `pread` so the descriptor's
+    /// offset is left alone.
+    fn hash_through_descriptor(&self) -> Result<[u8; 32], String> {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::FileExt;
+        let mut hash = Sha256::new();
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut offset = 0u64;
+        while offset < self.identity.size {
+            let count = (self.identity.size - offset).min(buffer.len() as u64) as usize;
+            self.file
+                .read_exact_at(&mut buffer[..count], offset)
+                .map_err(|e| format!("the executable could not be read: {e}"))?;
+            hash.update(&buffer[..count]);
+            offset += count as u64;
+        }
+        Ok(hash.finalize().into())
     }
 
     fn proc_path(&self) -> PathBuf {

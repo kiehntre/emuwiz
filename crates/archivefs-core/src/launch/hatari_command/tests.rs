@@ -111,14 +111,30 @@ fn deterministic_native_argv_keeps_selected_path_separate() {
         false,
     );
     let command = plan.command.unwrap();
-    assert_eq!(
-        command.arguments,
-        vec![
-            OsString::from("--configfile"),
-            OsString::from("/tmp/hatari.cfg"),
-            OsString::from("--disk-a"),
-            OsString::from("/games/Game.st")
-        ]
+    // No user configuration is merged in and drive B is switched off; the
+    // selected path is passed separately as the drive A disk.
+    let args: Vec<String> = command
+        .arguments
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(!args.iter().any(|a| a == "--configfile"));
+    let value_of = |flag: &str| {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    assert_eq!(value_of("--machine").as_deref(), Some("st"));
+    assert_eq!(value_of("--drive-b").as_deref(), Some("off"));
+    assert_eq!(value_of("--protect-floppy").as_deref(), Some("on"));
+    assert_eq!(value_of("--disk-a").as_deref(), Some("/games/Game.st"));
+    assert!(
+        command
+            .arguments
+            .iter()
+            .all(|a| a != &OsString::from("/tmp/hatari.cfg")),
+        "the profile config path must never reach the command line"
     );
 }
 

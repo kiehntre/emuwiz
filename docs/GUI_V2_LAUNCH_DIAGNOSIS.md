@@ -27,6 +27,59 @@ Presentation only: nothing here plans, probes or launches. Code:
 | Stale readiness | Recheck (in place, no duplicate, generation-guarded) |
 | Last Play: could not start / closed shortly after starting | Emulator Setup / Activity |
 
+## Exact words for blockers whose meaning is known
+
+Most adapter blockers are grouped by name (`classify_adapter_blocker`), and a name
+that matches no group becomes "EmuWiz can't safely prepare this launch". On
+2026-11-20 that was 86 of the 202 blocker kinds, including a missing Amiga
+Kickstart, and an Xbox ZIP or a PS3 `.pkg` read only "this kind of game file isn't
+supported for launching yet". None of those named a fix.
+
+`diagnosis::specific` now gives these blockers their own title, reason and action:
+
+| Blocker | Says | Action |
+| --- | --- | --- |
+| `XemuContentFormatUnsupported` | xemu can only start an Xbox disc image (.iso); extract or convert, then rescan | Check games folder |
+| `RequiredFirmwareMissing` on xemu (and its missing firmware state) | xemu needs its four Xbox system files, chosen in xemu's own settings | BIOS / Firmware Setup |
+| `Rpcs3ContentFormatUnsupported` | a `.pkg` is an installer: install it in RPCS3 | Problems |
+| `Rpcs3FirmwareUnavailable` | install the PS3 system software (PS3UPDAT.PUP) in RPCS3 | BIOS / Firmware Setup |
+| `FsUaeKickstartUnavailable`, `AmiberryKickstartUnavailable`, `WhdloadKickstartUnavailable` | the Amiga emulator has no Kickstart ROM it can use; where to set it | BIOS / Firmware Setup |
+| `FsUaeIpfBackendUnavailable`, `AmiberryIpfBackendUnavailable` | the `.ipf` image needs the emulator's CAPS (capsimg) plug-in | Emulator Setup |
+| `FsUaeProfileRequired`, `AmiberryProfileRequired` (not `WhdloadProfileMissing`, which also carries refused WHDLoad boot preparation) | the Amiga emulator has no settings EmuWiz can use | Emulator Setup |
+
+Several blockers of one cause still share one finding; the first one with exact
+words speaks for it and the rest stay under Technical details. The other 79
+kinds that fall through to the safety-refusal text are unchanged and are the
+next candidates (arcade set problems, Hatari TOS, DOSBox configuration, the
+`...CandidateRequired` internal refusals).
+
+## Flatpak emulators and the NVIDIA driver
+
+A Flatpak emulator draws with the driver package Flatpak mounts for it
+(`org.freedesktop.Platform.GL.nvidia-<version>`), chosen by the exact version of
+the loaded NVIDIA kernel module. When the system driver is updated and Flatpak is
+not, the package no longer matches and the emulator silently gets Mesa only:
+OpenGL is drawn by the processor and no NVIDIA Vulkan driver exists. Every launch
+check passes, the game starts, and it runs slowly with stuttering sound (xemu) or
+its Vulkan renderer cannot start while OpenGL "works" (RPCS3).
+
+`archivefs_core::launch::flatpak_graphics` reads `/sys/module/nvidia/version`
+and the two standard Flatpak installations (no process is started). When the
+package for the loaded driver is missing and the game's chosen emulator is a
+Flatpak (xemu, RPCS3 or RetroArch, by their existing installation evidence),
+`note_flatpak_graphics` puts a warning first on the readiness card, and so in
+Setup & Doctor's selected-game check: which emulator, which driver version, which
+versions Flatpak has, what to expect, and the fix: `flatpak update`, or, where the
+system-wide install needs an administrator password the person does not have,
+`flatpak install --user flathub <package>`. A package in either the system or
+the user's own installation counts and works. Play stays
+available. EmuWiz never runs the update itself.
+
+Limits: other Flatpak emulators (Dolphin, PCSX2, DuckStation) are not yet
+covered; Library tiles do not show the warning; a `FLATPAK_GL_DRIVERS` override
+and non-standard Flatpak installations are not read; only the NVIDIA proprietary
+driver has a version to match.
+
 ## Backend evidence gaps (recorded, not invented)
 
 1. The plan has no adapter support level (ready / readiness-only / unproven /
@@ -64,3 +117,84 @@ Presentation only: nothing here plans, probes or launches. Code:
 - Structured adapter support/readiness in the plan.
 - Distinct emulator-detection blockers (not installed / not detected / moved /
   unsupported version).
+
+## Game Doctor (Part 1, read-only)
+
+Game Details has a collapsed **Game Doctor** section (`gui_v2/game_doctor.rs`),
+drawn last in the page body so it never moves anything above it, that explains, in one place, what EmuWiz already knows about the selected game.
+It is a projection only: no I/O, probing, hashing, planning, launching,
+persistence or actions.
+
+- **Identity tier** comes from Game Details' own identity answer
+  (`detail_identity::decide`, which applies the DAT current-proof rule), the
+  canonical identity review and the saved catalogue state: *Verified* (current
+  proof only), *Probable* (one likely identity, not verified), *Ambiguous*
+  (several candidates, conflicting evidence, or a saved ambiguous DAT
+  comparison), *Unknown* (file name only, or no trusted system) and *Still
+  being checked* (a saved DAT match whose proof is being re-read).
+- **Launch readiness** is the exact summary the readiness card last displayed
+  for this game and path (a repaint is requested whenever that answer changes,
+  so a Doctor drawn earlier in the frame catches up). Its blockers are listed as
+  *Missing*; a blocked answer with no listed blocker shows the card's own
+  headline and explanation; firmware is *Missing* only when the plan says so
+  (present-but-unverified or unknown firmware is never called missing; the
+  card's own warning is repeated instead). Warnings, a stale answer and the last
+  in-session launch attempt are listed as *Warning*. Until the card has
+  answered, the Doctor says readiness has not been answered yet.
+- Passing checks reads "Launch checks passed", never "Ready to play"; the section always states that
+  EmuWiz keeps no record of gameplay and that recognition and passing launch
+  checks do not prove the game plays.
+
+Not covered yet: repair offers or links (Next Frontier M31 GD-3/GD-4, deferred
+in the Midnight Handoff), a persisted launch-outcome record (NF-38-01), the
+core `diagnostics::Finding` projection (NF-31-01) and a CLI `doctor --game`.
+
+## Setup & Doctor: selected-game launch check
+
+The first card on Setup & Doctor (`gui_v2/doctor_launch_check.rs`) restates
+the launch-readiness answer Blue already holds for the game selected in
+Browse & Play. It runs no check of its own and changes nothing.
+
+- **Ready**: a current answer whose launch checks passed with no findings.
+  Doctor never offers Play.
+- **Unsupported**: every finding is `FormatUnsupported` or
+  `PlatformUnsupported`. If anything else is also wrong, that fixable item
+  leads, as **Needs attention**.
+- **Needs attention**: the first (most actionable) finding's title, reason
+  and existing fix. A stale answer, or a blocked answer with no finding,
+  keeps the readiness card's own headline and action.
+- **Not checked**: no game selected, or its check is still running. This is
+  never reported as Ready.
+
+The one button opens an existing screen through `route_for_action`.
+Play and "Try anyway" open the Launch page, whose preflight and
+confirmations still decide. Recheck and "Look up online" open Game Details.
+
+### Choosing a game
+
+By default the card follows the game last opened in Browse & Play, and only
+reads it. A search box on the card finds any game in the library: every word
+must match its title or platform, and at most 8 matches are listed. Picking a
+game runs the same quick readiness check the Library's selected-game panel
+runs (`note_catalogue_row` + `readiness_projection`, without the whole-file
+checksum).
+
+- While the check runs, the card shows **Checking**.
+- Only an answer that belongs to the picked game (`selected_game_on_screen`)
+  is shown, so another game's result never appears under its title.
+- Opening a different game elsewhere returns the card to following that game.
+
+### Gap: no controller configuration destination
+
+The follow-up asked for an optional "Configure controller" action. It is
+**omitted**, because Blue has no controller configuration screen. The only
+controller surfaces are read-only:
+
+- the Launch page's controller settings evidence, which is PCSX2 only
+  (`launch_readiness_page/controller_readiness.rs`, #101);
+- Hatari's report in Emulator Setup.
+
+Both only say whether settings exist. They bind nothing, and they say so.
+Launch readiness carries no controller fact. When a real controller
+configuration workflow exists, add the button as a secondary action in
+`doctor_launch_check::show`. It must not change the verdict.

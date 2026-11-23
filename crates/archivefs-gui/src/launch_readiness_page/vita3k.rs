@@ -307,6 +307,7 @@ mod tests {
 
     fn entry(root: &Path) -> Vita3kInstalledEntry {
         let identity = CapturedFileIdentity {
+            changed: None,
             device: 1,
             inode: 2,
             size: 3,

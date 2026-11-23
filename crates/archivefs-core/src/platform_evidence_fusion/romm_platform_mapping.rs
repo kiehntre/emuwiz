@@ -36,7 +36,7 @@
 //!
 //! - exactly one slug maps to that canonical platform (a platform named by
 //!   *two different* observed slugs - `Amstrad CPC` via both `acpc` and
-//!   `cpc`; `Commodore 64` via both `c-plus-4` and `c16`; `Sega CD` via both
+//!   `cpc`; `Sega CD` via both
 //!   `sega-cd` and `segacd` - has no single defensible "current" choice
 //!   without guessing, so it is left `Ambiguous` here, not resolved); and
 //! - that slug is not one of the three entries `ROMM_SLUG_ALIASES`'s own

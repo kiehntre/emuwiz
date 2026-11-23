@@ -42,8 +42,8 @@ use archivefs_core::patch_manager::{
     CheatRollbackOptions, CoreSelectionSource, CoverageGameIdentity, DestinationKind,
     DolphinCatalogueLoad, GameHackingFetchOptions, GameHackingGameCubeFetchOptions,
     GameHackingGameCubeProvider, GameHackingProvider, GameHackingWiiFetchOptions,
-    GameHackingWiiProvider, HttpsMetadataFetcher, ProposedDestination, ReadOnlyPcsx2Adapter,
-    RetroArchAdvisoryPlan, WiiGameIdentity, build_cheat_availability_report,
+    GameHackingWiiProvider, HttpsMetadataFetcher, JOURNAL_UNAVAILABLE_REASON, ProposedDestination,
+    ReadOnlyPcsx2Adapter, RetroArchAdvisoryPlan, WiiGameIdentity, build_cheat_availability_report,
     build_cheat_provider_coverage_report, default_dolphin_catalogue_cache_root,
     default_shared_history_root, discover_cheat_history, discover_shared_apply_history,
     execute_cheat_install_run, execute_cheat_rollback_run, import_wii_game_page_bootstrap_file,
@@ -87,15 +87,21 @@ mod bsfree;
 mod cheat_reconcile;
 mod cheat_source;
 mod cheatbase;
+mod continuity;
 mod dat;
+mod diagnose_launch;
 mod discovery;
 mod inspect;
+mod journal_recovery;
+mod launch_history;
 mod mame_evidence;
 mod mame_normalise;
 mod mame_staging;
 mod media_set;
+mod memory_cards;
 mod platform_artwork;
 mod read_only_status;
+mod recovery;
 mod repair;
 mod retroarch_cheat_cache;
 mod retroarch_cheat_setup;
@@ -103,6 +109,8 @@ mod retroarch_cheat_sources;
 mod rom_organise;
 mod romm_identity;
 mod saves;
+#[cfg(target_os = "linux")]
+mod transform;
 
 static LOGGER: StderrLogger = StderrLogger;
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
@@ -157,7 +165,21 @@ fn startup_registration(cli: &CliArgs) -> StartupRegistration {
     }
 }
 
-/// Commands that only read journals, seals and the catalogue.
+/// Commands that never write rename journals or seals, so they register
+/// with the sealed-writer gate as readers. Most only read the catalogue too.
+/// `database-recover-journal` is here because the gate is not what protects
+/// the catalogue from it: with `--apply --confirm` it lets SQLite recover the
+/// library database, under the database's own upgrade lock and only when no
+/// process has the database open. `launch-history` is here whatever it is
+/// asked to do: deleting, clearing and switching change only its own
+/// `launch-diagnostics` folder, so starting it never opens the Undo seal
+/// store, the writer registry in the data directory or the library database.
+/// `memory-cards` likewise: it reads memory cards and creates only new files
+/// (backups, exported saves, new cards); it never opens the library database
+/// and never writes a rename journal or seal. `recovery` likewise: it reads a
+/// game file and creates or removes only its own prepared copies.
+/// `continuity` is the same: it reads saves and writes only new files in its
+/// own snapshot folder or a new folder the person names.
 fn is_read_only_invocation(cli: &CliArgs) -> bool {
     matches!(
         cli.command.as_str(),
@@ -167,7 +189,12 @@ fn is_read_only_invocation(cli: &CliArgs) -> bool {
             | "-h"
             | "--help"
             | "inspect"
+            | "diagnose-launch"
+            | "launch-history"
             | "saves"
+            | "memory-cards"
+            | "recovery"
+            | "continuity"
             | "emulators"
             | "activity"
             | "history"
@@ -176,6 +203,7 @@ fn is_read_only_invocation(cli: &CliArgs) -> bool {
             | "data-dir"
             | "library-status"
             | "database-check"
+            | "database-recover-journal"
     )
 }
 
@@ -315,8 +343,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match command.as_str() {
         "emulators" | "activity" | "history" => read_only_status::run(&command, args.collect())?,
         "inspect" => inspect::run(args.collect())?,
+        "diagnose-launch" => diagnose_launch::run(args.collect())?,
+        "launch-history" => launch_history::run(args.collect())?,
         "discovery" => discovery::run(args)?,
         "saves" => saves::run(args.collect())?,
+        "memory-cards" => memory_cards::run(args.collect())?,
+        "recovery" => recovery::run(args.collect())?,
+        "continuity" => continuity::run(args.collect())?,
         "media-set" => media_set::run(args)?,
         "scan" => {
             let config = load_config()?;
@@ -532,6 +565,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "repair" => {
             repair::run(args.collect())?;
+        }
+        #[cfg(target_os = "linux")]
+        "transform" => {
+            transform::run(args.collect())?;
         }
         "pcsx2-patch-preview" => {
             let mut input_args = args.collect::<Vec<_>>();
@@ -1302,6 +1339,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 print_library_scan(&report);
             }
         }
+        "database-recover-journal" => {
+            print!("{}", journal_recovery::run(args.collect())?);
+        }
         "library-upgrade" => {
             let input_args: Vec<String> = args.collect();
             if let Some(unknown) = input_args.iter().find(|arg| *arg != "--confirm") {
@@ -1840,16 +1880,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     let (view, report) = remove_library_view_default(&identifier, keep_definition)
                         .map_err(|error| error.to_string())?;
+                    // Read back rather than assumed: the definition stays
+                    // when the removal left anything unreconciled.
+                    let definition_removed = load_library_view_configs_default()
+                        .map(|views| !views.iter().any(|candidate| candidate.id == view.id))
+                        .unwrap_or(false);
                     if json {
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&LibraryViewApplyJson {
+                            serde_json::to_string_pretty(&LibraryViewRemoveJson {
                                 view: &view,
-                                report: &report
+                                report: &report,
+                                definition_removed,
                             })?
                         );
                     } else {
-                        print_library_view_remove_report(&view, &report, keep_definition);
+                        print_library_view_remove_report(
+                            &view,
+                            &report,
+                            keep_definition,
+                            definition_removed,
+                        );
+                    }
+                    if !keep_definition && !definition_removed {
+                        return Err(format!(
+                            "view remove left object(s) unreconciled; the definition of '{}' was \
+                             kept (see the report above)",
+                            view.name
+                        )
+                        .into());
                     }
                 }
                 other => {
@@ -2740,7 +2799,21 @@ fn format_cheat_install_run(outcome: &CheatInstallRunOutcome) -> String {
     }
     if let Some(error) = &outcome.journal_error {
         writeln!(&mut output).unwrap();
-        writeln!(&mut output, "Journal write failed: {error}").unwrap();
+        let nothing_written = run
+            .entries
+            .iter()
+            .any(|entry| entry.reason_code == JOURNAL_UNAVAILABLE_REASON)
+            || run.summary.writes_attempted == 0;
+        if nothing_written {
+            writeln!(
+                &mut output,
+                "Nothing was written: the install record (journal) could not be created, so no cheat file was touched."
+            )
+            .unwrap();
+            writeln!(&mut output, "Journal error: {error}").unwrap();
+        } else {
+            writeln!(&mut output, "Journal write failed: {error}").unwrap();
+        }
     }
 
     output
@@ -2815,6 +2888,14 @@ fn format_cheat_inspection(inspection: &CheatJournalInspection) -> String {
         inspection.install_status,
         inspection.entries.len()
     );
+    if inspection.interrupted {
+        output.push_str(&format!(
+            "  INTERRUPTED: this install never finished ({} of {} entries recorded); it is not a success - review and roll back with: emuwiz-cli retroarch-cheat-rollback {} --cheat-destination-root <root> --yes\n",
+            inspection.settled_entries,
+            inspection.entries.len(),
+            inspection.journal_path.display
+        ));
+    }
     if inspection.rollback.ambiguous {
         output.push_str("  rollback journal: ambiguous association\n");
     } else if inspection.rollback.exists {
@@ -2850,6 +2931,14 @@ fn format_cheat_inspection(inspection: &CheatJournalInspection) -> String {
             backup_assessment_name(entry.backup),
             rollback_availability_name(entry.rollback_availability),
         ));
+        match entry.settlement {
+            archivefs_core::patch_manager::CheatInstallEntrySettlement::Settled => {}
+            archivefs_core::patch_manager::CheatInstallEntrySettlement::InFlight => output
+                .push_str("      settlement: in flight when the install was interrupted (resolved from the destination's current content)\n"),
+            archivefs_core::patch_manager::CheatInstallEntrySettlement::NotStarted => {
+                output.push_str("      settlement: never attempted (install interrupted earlier)\n")
+            }
+        }
         for reason in &entry.rollback_reasons {
             output.push_str(&format!("        reason: {reason}\n"));
         }
@@ -3281,6 +3370,9 @@ fn run_library_upgrade(
         return Ok(format!(
             "Library database: {}\nSchema {current} would be upgraded to schema {latest}.\n\
              A verified backup is taken first and kept. Nothing was changed.\n\
+             This is one-way: builds made for schema {current} will refuse the upgraded \
+             library, and going back means restoring that backup of the whole library, \
+             which loses every later change to it.\n\
              To upgrade, run: emuwiz-cli library-upgrade --confirm\n",
             database_path.display()
         ));
@@ -3289,11 +3381,14 @@ fn run_library_upgrade(
     Ok(format!(
         "Upgraded the library database from schema {} to schema {}.\n\
          Backup kept at: {}\nBackup SHA-256: {}\n\
-         Run emuwiz-cli library-scan to refresh the catalogue.\n",
+         Builds made for schema {} will now refuse this library. That backup restores the whole \
+         library as it was before this upgrade, so restoring it loses every later change.\n\
+         No scan was run. Run emuwiz-cli library-scan later, once your source drives are ready.\n",
         report.from_version,
         report.to_version,
         report.backup_path.display(),
-        report.backup_sha256
+        report.backup_sha256,
+        report.from_version
     ))
 }
 
@@ -3616,6 +3711,17 @@ struct LibraryScanReport {
     archives_restored: i64,
     archives_unchanged: i64,
     archives_missing: i64,
+    /// Exact skipped-file totals per reason, as the scan stored them
+    /// (schema 30). `null` only when the run recorded no breakdown.
+    /// Unsupported formats only (not the coarse database column of the
+    /// historical name, which also held variants, invalid content and copies).
+    skipped_unsupported_format: Option<u64>,
+    skipped_unsupported_variant: Option<u64>,
+    skipped_invalid_content: Option<u64>,
+    skipped_ambiguous_platform: Option<u64>,
+    /// Identical copies of catalogued ZIPs: recognised ROMs deliberately not
+    /// catalogued twice, never counted as unsupported.
+    skipped_identical_copies: Option<u64>,
     folder_errors: Vec<FolderErrorView>,
 }
 
@@ -3629,6 +3735,7 @@ impl From<&ScanPersistSummary> for LibraryScanReport {
     fn from(summary: &ScanPersistSummary) -> Self {
         let succeeded = summary.counts.source_folders_scanned;
         let failed = summary.folder_errors.len() as i64;
+        let skip = summary.counts.skip_reasons;
         Self {
             scan_run_id: summary.scan_run_id,
             source_folders_attempted: succeeded + failed,
@@ -3639,6 +3746,11 @@ impl From<&ScanPersistSummary> for LibraryScanReport {
             archives_restored: summary.counts.archives_restored,
             archives_unchanged: summary.counts.archives_unchanged,
             archives_missing: summary.counts.archives_missing,
+            skipped_unsupported_format: skip.map(|c| c.unsupported_extension),
+            skipped_unsupported_variant: skip.map(|c| c.unsupported_variant),
+            skipped_invalid_content: skip.map(|c| c.invalid_content),
+            skipped_ambiguous_platform: skip.map(|c| c.ambiguous_platform),
+            skipped_identical_copies: skip.map(|c| c.identical_copy),
             folder_errors: summary
                 .folder_errors
                 .iter()
@@ -3700,6 +3812,20 @@ fn format_library_scan(report: &LibraryScanReport) -> String {
     output.push_str(&format!("  Restored: {}\n", report.archives_restored));
     output.push_str(&format!("  Unchanged: {}\n", report.archives_unchanged));
     output.push_str(&format!("  Missing: {}\n", report.archives_missing));
+    output.push_str("\nSkipped files:\n");
+    let shown = |value: Option<u64>| value.map_or_else(|| "not recorded".into(), |v| v.to_string());
+    for (label, value) in [
+        ("Unsupported format", report.skipped_unsupported_format),
+        ("Unsupported variant", report.skipped_unsupported_variant),
+        ("Invalid content", report.skipped_invalid_content),
+        ("Ambiguous platform", report.skipped_ambiguous_platform),
+        (
+            "Recognised duplicates (identical copies, not added twice)",
+            report.skipped_identical_copies,
+        ),
+    ] {
+        output.push_str(&format!("  {label}: {}\n", shown(value)));
+    }
     output.push_str("\nErrors:\n");
     if report.folder_errors.is_empty() {
         output.push_str("  none\n");
@@ -3808,12 +3934,37 @@ struct LibraryViewPreviewJson<'a> {
     plan: &'a LibraryViewPlan,
 }
 
-/// `view apply`/`view repair`/`view remove --json` output: the view
-/// alongside the resulting report.
+/// `view apply`/`view repair --json` output: the view alongside the
+/// resulting report.
 #[derive(Debug, Serialize)]
 struct LibraryViewApplyJson<'a> {
     view: &'a LibraryViewConfig,
     report: &'a LibraryViewApplyReport,
+}
+
+/// `view remove --json` output: as `LibraryViewApplyJson`, plus whether the
+/// view definition was actually dropped from configuration (it is kept when
+/// the removal left anything unreconciled, or with `--keep-definition`).
+#[derive(Debug, Serialize)]
+struct LibraryViewRemoveJson<'a> {
+    view: &'a LibraryViewConfig,
+    report: &'a LibraryViewApplyReport,
+    definition_removed: bool,
+}
+
+/// The core's left-untouched notes all start with "left untouched - ";
+/// the heading above the list already says that once.
+fn left_untouched_reason(error: Option<&str>) -> &str {
+    let error = error.unwrap_or("unknown reason");
+    error.strip_prefix("left untouched - ").unwrap_or(error)
+}
+
+fn count_outcome(report: &LibraryViewApplyReport, outcome: LibraryViewApplyOutcome) -> usize {
+    report
+        .results
+        .iter()
+        .filter(|result| result.outcome == outcome)
+        .count()
 }
 
 fn print_library_views(views: &[LibraryViewConfig]) {
@@ -3918,6 +4069,36 @@ fn print_library_view_apply_report(
     println!("  Removed:   {}", report.removed);
     println!("  Unchanged: {}", report.unchanged);
     println!("  Failed:    {}", report.failed);
+    let recovered = count_outcome(report, LibraryViewApplyOutcome::Recovered);
+    if recovered > 0 {
+        println!(
+            "  Recovered: {recovered} (published by an interrupted earlier apply, recorded now)"
+        );
+    }
+    let temp_links = count_outcome(report, LibraryViewApplyOutcome::TempLinkRemoved);
+    if temp_links > 0 {
+        println!("  Removed {temp_links} leftover temporary link(s) of an interrupted apply.");
+    }
+    let user_owned = count_outcome(report, LibraryViewApplyOutcome::UserOwnedKept);
+    if user_owned > 0 {
+        println!("  User-owned, kept: {user_owned} (symlink(s) made outside EmuWiz, not managed)");
+    }
+    let left_untouched: Vec<_> = report
+        .results
+        .iter()
+        .filter(|result| result.outcome == LibraryViewApplyOutcome::LeftUnchanged)
+        .collect();
+    if !left_untouched.is_empty() {
+        println!();
+        println!("Left untouched:");
+        for result in left_untouched {
+            println!(
+                "  {} - {}",
+                result.relative_link_path.display(),
+                left_untouched_reason(result.error.as_deref())
+            );
+        }
+    }
     if report.failed > 0 {
         println!();
         println!("Failures:");
@@ -3936,26 +4117,58 @@ fn print_library_view_apply_report(
 fn print_library_view_remove_report(
     view: &LibraryViewConfig,
     report: &LibraryViewApplyReport,
-    kept_definition: bool,
+    keep_definition: bool,
+    definition_removed: bool,
 ) {
     println!("Library View: {} ({})", view.name, view.id);
-    println!("Removed {} managed symlink(s).", report.removed);
-    println!("EmuWiz did not delete any original archive files.");
-    if kept_definition {
-        println!("The view definition was kept - Preview/Apply will recreate its symlinks.");
+    let recovered = count_outcome(report, LibraryViewApplyOutcome::RecoveredRemoved);
+    if recovered > 0 {
+        println!(
+            "Removed {} managed symlink(s): {} recorded in the manifest, {recovered} recovered \
+             from the intent record of an interrupted apply.",
+            report.removed,
+            report.removed - recovered
+        );
     } else {
-        println!("The view definition was also removed from configuration.");
+        println!("Removed {} managed symlink(s).", report.removed);
     }
+    let temp_links = count_outcome(report, LibraryViewApplyOutcome::TempLinkRemoved);
+    if temp_links > 0 {
+        println!("Removed {temp_links} leftover temporary link(s) of an interrupted apply.");
+    }
+    println!("EmuWiz did not delete any original archive files.");
     let left_untouched: Vec<_> = report
         .results
         .iter()
-        .filter(|result| result.outcome == LibraryViewApplyOutcome::LeftUnchanged)
+        .filter(|result| {
+            matches!(
+                result.outcome,
+                LibraryViewApplyOutcome::LeftUnchanged | LibraryViewApplyOutcome::Failed
+            )
+        })
         .collect();
+    if definition_removed {
+        println!("The view definition was also removed from configuration.");
+    } else if keep_definition {
+        println!("The view definition was kept - Preview/Apply will recreate its symlinks.");
+    } else {
+        println!(
+            "The view definition was KEPT: {} object(s) below could not be reconciled, and \
+             removing the definition would orphan them. Resolve them (restore or remove what \
+             replaced the managed links; move any preserved file out of the temporary name) and \
+             run `view remove` again.",
+            left_untouched.len()
+        );
+    }
     if !left_untouched.is_empty() {
         println!();
-        println!("Left untouched (changed since the last apply):");
+        println!("Left untouched:");
         for result in left_untouched {
-            println!("  {}", result.relative_link_path.display());
+            println!(
+                "  {} - {}",
+                result.relative_link_path.display(),
+                left_untouched_reason(result.error.as_deref())
+            );
         }
     }
 }
@@ -5954,6 +6167,11 @@ fn print_help() {
     println!();
     println!("Commands:");
     println!("{}", read_only_status::HELP);
+    println!("{}", diagnose_launch::HELP);
+    println!("{}", launch_history::HELP);
+    println!(
+        "  recovery <capabilities|diagnose|prepare|list|verify|remove|clean>  Why a game cannot start, and verified preparation of a playable copy (new files only; the game file is only read). See `emuwiz-cli recovery help`."
+    );
     println!("  media-set <inspect|explain|plan>  Read-only optical/floppy/tape topology (JSON)");
     println!(
         "  inspect <path>  Read-only view of what EmuWiz believes one file is, the evidence and provenance, launch topology readiness and why an operation would be blocked. Views: --identity --evidence --readiness --media --provenance (default: all); --json, --platform <name>, --root <dir>. Never opens the database or writes anything."
@@ -6756,6 +6974,7 @@ mod tests {
                     complete: true,
                 },
             app_images: Vec::new(),
+            save_directories: Vec::new(),
             diagnostics: Vec::new(),
         };
 
@@ -7352,6 +7571,9 @@ mod tests {
             &["help"],
             &["inspect", "/x"],
             &["saves", "list"],
+            &["memory-cards", "import", "/card", "/save", "/new"],
+            &["recovery", "prepare", "/game.zip", "--system", "AmigaCD32"],
+            &["continuity", "snapshot", "0123abcd"],
             &["history", "--json"],
             &["emulators"],
             &["activity", "--json"],
@@ -7360,6 +7582,10 @@ mod tests {
             &["config-check"],
             &["config-dir"],
             &["data-dir"],
+            &["launch-history"],
+            &["launch-history", "clear"],
+            &["launch-history", "off"],
+            &["launch-history", "delete", "20270115T080000Z-0123abcd"],
         ] {
             assert!(invocation(read_only), "{read_only:?}");
         }
@@ -7772,6 +7998,10 @@ mod tests {
 
         let preview = run_library_upgrade(&database_path, false).unwrap();
         assert!(preview.contains("Schema 16 would be upgraded"), "{preview}");
+        assert!(
+            preview.contains("builds made for schema 16 will refuse"),
+            "{preview}"
+        );
         assert!(preview.contains("Nothing was changed"), "{preview}");
         assert_eq!(std::fs::read(&database_path).unwrap(), original);
         assert_eq!(names(&root), before, "a preview created a file");
@@ -7955,9 +8185,79 @@ mod tests {
                 "existing JSON field {field} must remain"
             );
         }
-        assert_eq!(object.len(), 10, "scan JSON compatibility surface changed");
+        // Per-reason skip totals (follow-up 8), added without renaming any field.
+        for field in [
+            "skipped_unsupported_format",
+            "skipped_unsupported_variant",
+            "skipped_invalid_content",
+            "skipped_ambiguous_platform",
+            "skipped_identical_copies",
+        ] {
+            // Recorded by every scan this version makes: exact numbers, never null.
+            assert!(json[field].is_u64(), "skip total {field}: {}", json[field]);
+        }
+        assert_eq!(object.len(), 15, "scan JSON compatibility surface changed");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every skip reason is reported apart from the stored totals; identical
+    /// copies are never shown as unsupported formats.
+    #[test]
+    fn library_scan_report_shows_each_stored_skip_reason_apart() {
+        let summary = ScanPersistSummary {
+            scummvm: Default::default(),
+            scan_run_id: 211,
+            counts: archivefs_core::ScanRunCounts {
+                source_folders_scanned: 1,
+                skipped_unsupported_extension: 277_617,
+                skipped_ambiguous_platform: 996,
+                skip_reasons: Some(archivefs_core::SkipReasonCounts {
+                    unsupported_extension: 277_000,
+                    unsupported_variant: 200,
+                    invalid_content: 61,
+                    ambiguous_platform: 996,
+                    identical_copy: 356,
+                }),
+                ..Default::default()
+            },
+            folder_errors: Vec::new(),
+            platform_assignment_warnings: Vec::new(),
+            preservation_fingerprint_warnings: Vec::new(),
+            skipped_files: Vec::new(),
+            ingestion_stats: Default::default(),
+            ingestion_skip_reasons: Default::default(),
+            ingestion_platform_counts: Default::default(),
+            arcade_ingestion: Default::default(),
+            nested_mounts: Vec::new(),
+            ingestion_skipped: Vec::new(),
+            ingestion_recognised_sample: Vec::new(),
+        };
+        let report = LibraryScanReport::from(&summary);
+        let text = format_library_scan(&report);
+        for line in [
+            "  Unsupported format: 277000\n",
+            "  Unsupported variant: 200\n",
+            "  Invalid content: 61\n",
+            "  Ambiguous platform: 996\n",
+            "  Recognised duplicates (identical copies, not added twice): 356\n",
+        ] {
+            assert!(text.contains(line), "{line:?} in {text}");
+        }
+        let json: serde_json::Value =
+            serde_json::from_str(&format_library_scan_json(&report).unwrap()).unwrap();
+        assert_eq!(json["skipped_identical_copies"], 356);
+        assert_eq!(json["skipped_unsupported_format"], 277_000);
+        // A run without a stored breakdown says so instead of inventing zeros.
+        let mut legacy = summary;
+        legacy.counts.skip_reasons = None;
+        let report = LibraryScanReport::from(&legacy);
+        assert!(format_library_scan(&report).contains(
+            "  Recognised duplicates (identical copies, not added twice): not recorded\n"
+        ));
+        let json: serde_json::Value =
+            serde_json::from_str(&format_library_scan_json(&report).unwrap()).unwrap();
+        assert!(json["skipped_identical_copies"].is_null());
     }
 
     #[test]
@@ -9893,6 +10193,8 @@ mod tests {
             catalogue_source: "local-catalogue".into(),
             destination_root: Some(CheatInstallPath::from_path(Path::new("/retroarch/cheats"))),
             install_status: CheatInstallRunStatus::Success,
+            interrupted: false,
+            settled_entries: 1,
             install_summary: CheatInstallSummary {
                 requested: 1,
                 eligible: 1,
@@ -9911,6 +10213,7 @@ mod tests {
                 ))),
                 original_outcome: CheatInstallOutcome::InstalledNew,
                 applied: true,
+                settlement: archivefs_core::patch_manager::CheatInstallEntrySettlement::Settled,
                 previous_hash: None,
                 installed_hash: Some("abc".into()),
                 backup_path: None,

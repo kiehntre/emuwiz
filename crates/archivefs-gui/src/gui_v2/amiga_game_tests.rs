@@ -471,3 +471,136 @@ fn a_verified_disk_set_never_promises_disk_swapping() {
     );
     assert!(!readiness.launch_route_exists);
 }
+
+fn zipped(machine: AmigaCdMachine, copy: PreparedCopy) -> AmigaGameReadiness {
+    let mut readiness = assess_amiga_game(machine, Path::new("g.zip"), false, None, None);
+    apply_prepared_copy(&mut readiness, copy);
+    readiness
+}
+
+fn row(
+    readiness: &AmigaGameReadiness,
+    kind: AmigaCheckKind,
+) -> &archivefs_core::amiga_game_readiness::AmigaCheck {
+    readiness
+        .checks
+        .iter()
+        .find(|check| check.kind == kind)
+        .expect("the row is present")
+}
+
+#[test]
+fn a_zipped_cd32_disc_with_a_prepared_copy_is_shown_as_ready_from_it() {
+    let readiness = zipped(AmigaCdMachine::Cd32, PreparedCopy::Ready);
+    let media = row(&readiness, AmigaCheckKind::Media);
+    assert_eq!(media.state, AmigaCheckState::Ready);
+    assert_eq!(media.detail, PREPARED_COPY_READY);
+    let play = row(&readiness, AmigaCheckKind::Play);
+    assert_eq!(play.state, AmigaCheckState::Warning);
+    assert_eq!(play.detail, PREPARED_COPY_PLAY);
+    let (text, _) = rendered(&readiness);
+    assert!(text.contains("Ready from a prepared copy"), "{text}");
+    assert!(!text.contains("not started from inside a ZIP"), "{text}");
+    assert!(!text.contains("Extract the disc image"), "{text}");
+
+    // With no FS-UAE or Amiberry set up, an unprepared disc says so; a
+    // prepared one, which those emulators do not start, shows no red row.
+    let none_set_up = facts(Vec::new());
+    let mut unprepared = assess_amiga_game(
+        AmigaCdMachine::Cd32,
+        Path::new("g.zip"),
+        false,
+        None,
+        Some(&none_set_up),
+    );
+    let mut prepared = unprepared.clone();
+    apply_prepared_copy(&mut unprepared, PreparedCopy::Missing);
+    assert_eq!(
+        row(&unprepared, AmigaCheckKind::Emulator).state,
+        AmigaCheckState::Blocked
+    );
+    apply_prepared_copy(&mut prepared, PreparedCopy::Ready);
+    assert!(
+        prepared
+            .checks
+            .iter()
+            .all(|check| check.state != AmigaCheckState::Blocked),
+        "{prepared:?}"
+    );
+}
+
+#[test]
+fn a_zipped_cd32_disc_without_a_usable_copy_keeps_its_warning_and_points_to_game_recovery() {
+    // Never prepared, or prepared and since gone stale: the lookup answers
+    // "missing" for both (the journey tests prove the stale half on disk).
+    let readiness = zipped(AmigaCdMachine::Cd32, PreparedCopy::Missing);
+    let media = row(&readiness, AmigaCheckKind::Media);
+    assert_eq!(media.state, AmigaCheckState::Blocked);
+    assert!(media.detail.contains("not started from inside a ZIP"));
+    assert!(media.detail.contains("Game recovery"), "{}", media.detail);
+    assert_eq!(
+        row(&readiness, AmigaCheckKind::Play).state,
+        AmigaCheckState::Blocked
+    );
+    let (text, _) = rendered(&readiness);
+    assert!(!text.contains("Ready from a prepared copy"), "{text}");
+}
+
+#[test]
+fn a_prepared_copy_changes_nothing_for_other_amiga_entries() {
+    let cases: [(AmigaCdMachine, &str); 5] = [
+        (AmigaCdMachine::OrdinaryAmiga, "g.zip"),
+        (AmigaCdMachine::OrdinaryAmiga, "a.adf"),
+        (AmigaCdMachine::OrdinaryAmiga, "g.lha"),
+        (AmigaCdMachine::Cd32, "g.cue"),
+        (AmigaCdMachine::Cd32, "a.adf"),
+    ];
+    for (machine, name) in cases {
+        let plain = assess_amiga_game(machine, Path::new(name), false, None, None);
+        for copy in [
+            PreparedCopy::Ready,
+            PreparedCopy::Missing,
+            PreparedCopy::NotApplicable,
+        ] {
+            let mut changed = plain.clone();
+            apply_prepared_copy(&mut changed, copy);
+            assert_eq!(changed, plain, "{machine:?} {name} {copy:?}");
+        }
+    }
+    // Game recovery has nothing for a CDTV ZIP: its refusal stays as it was.
+    let cdtv = assess_amiga_game(AmigaCdMachine::Cdtv, Path::new("g.zip"), false, None, None);
+    let mut same = cdtv.clone();
+    apply_prepared_copy(&mut same, PreparedCopy::NotApplicable);
+    assert_eq!(same, cdtv);
+    // Nor would the card change it if it were ever told a copy is ready.
+    for copy in [PreparedCopy::Ready, PreparedCopy::Missing] {
+        let mut same = cdtv.clone();
+        apply_prepared_copy(&mut same, copy);
+        assert_eq!(same, cdtv, "{copy:?}");
+    }
+    assert_eq!(
+        prepared_copy(Path::new("/nowhere/g.zip"), "Amiga", false),
+        PreparedCopy::NotApplicable
+    );
+    assert_eq!(
+        prepared_copy(Path::new("/nowhere/g.cue"), "AmigaCD32", false),
+        PreparedCopy::NotApplicable
+    );
+}
+
+#[test]
+fn a_cd32_zip_whose_scan_did_not_finish_keeps_its_scan_warning() {
+    // The Launch page does not use a prepared copy for such a file, so the
+    // card must not call it ready or point at game recovery either.
+    assert_eq!(
+        prepared_copy(Path::new("/nowhere/g.zip"), "AmigaCD32", true),
+        PreparedCopy::NotApplicable
+    );
+    let unfinished = assess_amiga_game(AmigaCdMachine::Cd32, Path::new("g.zip"), true, None, None);
+    let media = row(&unfinished, AmigaCheckKind::Media);
+    assert_eq!(media.state, AmigaCheckState::Blocked);
+    assert!(media.detail.contains("could not finish reading"));
+    let mut shown = unfinished.clone();
+    apply_prepared_copy(&mut shown, PreparedCopy::NotApplicable);
+    assert_eq!(shown, unfinished);
+}

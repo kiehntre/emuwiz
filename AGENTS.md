@@ -98,11 +98,25 @@ Keeping builds warm (a target is only reused by the same worktree path):
   `scripts/cargo-iso --designate-dev` (undo: `--undesignate-dev`). Order of precedence:
   `--incremental`/`--no-incremental`, then `EMUWIZ_CARGO_INCREMENTAL=1|0`, then the
   designation, then off. A designated worktree overrides an inherited `CARGO_INCREMENTAL=0`.
-  Measured on `archivefs-gui --lib` tests: edit-to-rebuild 97.5 s -> ~28 s, at a one-off
-  ~5 min priming build and ~3x the target size, so designate only the worktrees you build
-  in all day. `--sccache` builds a designated worktree non-incremental; `--sccache` with an
-  explicit `--incremental` is refused. `--print-target` shows the decision. CI and
-  `scripts/build-release.sh` never go through `cargo-iso` and are unaffected.
+  Measured on `archivefs-gui --lib` tests: edit-to-rebuild 106 s -> ~41 s (2026-11-13), at a
+  one-off ~5 min priming build and ~2x the target size, so designate only the worktrees you
+  build in all day. **At most two worktrees may be designated in total across target roots**
+  (`~/.cache` and `/mnt/nvme2` together, not two per drive: records reading `on` in every
+  known `<root>.incremental-mode/`, counted under one shared lock;
+  `EMUWIZ_CARGO_MAX_DEV_WORKTREES`, default 2):
+  `--designate-dev` is refused (exit 3) at the limit. Prefer reusing an already designated,
+  idle, coordinated worktree over designating a new one. Release and other non-dev profiles
+  (`--release`, `--profile X`) are never incremental unless asked explicitly. Opt-in
+  automatic designation of a new branch worktree on its first build:
+  `EMUWIZ_CARGO_AUTO_DESIGNATE=1` (off by default; detached, release, `--sccache` and
+  explicit choices are never designated; the limit applies). `--sccache` builds a designated
+  worktree non-incremental; `--sccache` with an explicit `--incremental` is refused.
+  `--print-target` shows the decision. CI and `scripts/build-release.sh` never go through
+  `cargo-iso` and are unaffected.
+- At most two `cargo-iso` builds run at once (`EMUWIZ_CARGO_MAX_BUILDS`, default 2; `0` = no
+  limit), across all worktrees and target roots: a third waits on a lock and starts the
+  moment a slot frees (no sleep loop; it says so once). This limits concurrent builds, not
+  jobs per build. `--rust-analyzer` takes no slot.
 - Debug mode is recorded per target and kept. A target with no compiler output to keep
   (new worktree, or retired with a verified receipt: `worktree-check --cargo-state-only`
   says CLEAR) builds
@@ -135,6 +149,85 @@ overrides it (and prints a one-line note), so using the wrapper is always safe. 
 `cargo` in such a shell would still use the shared target, so do not use it. In an
 interactive shell you can also run `unset CARGO_TARGET_DIR`. Once the global defaults are
 removed (a separate, coordinated step), new shells no longer carry it.
+
+## Coding sessions and code indexing
+
+Start every coding session at the root of the worktree assigned to the task
+(`cd <worktree> && claude`). Never start one in the home directory (`/home/davedap` on
+the maintainer's machine), in a folder that holds several checkouts, or in a
+subdirectory of the worktree unless you mean to (see below).
+
+Why: Claude Code starts the `rust-analyzer` language server the first time a session
+edits a `.rs` file with Edit or Write, rooted at the directory the session was started
+in. Started from a home directory with 198 Cargo workspaces under it, one server loaded
+all 198 and reached 24 GB of memory plus 20 GB of swap; three of them filled the
+machine twice in one night (measured 2026-11-14).
+
+The language server is off by default in this repository. `.claude/settings.json`
+disables the `rust-analyzer-lsp` plugin for a session started at the root of a worktree
+whose branch contains that file. Before the first `.rs` edit, `claude plugin list` run
+from the directory the session was started in must say `disabled`. Search with
+`grep`/`rg`. Take build and correctness evidence only from `scripts/cargo-iso check`,
+`clippy` and `test`; nothing a language server reports counts as validation.
+
+An enabled server rooted in one worktree loads only that workspace, but it is still
+heavy: more than 6 GB within its first 30 seconds on this repository, and in that time
+it compiled at least 0.5 GB of build scripts and proc macros with plain `cargo` into
+`<worktree>/target`, outside `cargo-iso` and the Cargo budget. That is a cost to know
+about, not permission to build there. `scripts/emuwiz-rust-analyzer` is the managed
+route that keeps those builds in the `cargo-iso` target; the plugin uses it only when a
+`rust-analyzer` link to it is first on the session's `PATH`, which is the owner's
+decision and is not set up by this file.
+
+When a task genuinely needs code navigation (go to definition, find references):
+
+1. Treat it like a build. Tell the owner, or note it in the maintainer's coordination
+   ledger (`COORDINATION.md`), first. One language server at a time on the machine:
+   `pgrep -x rust-analyzer` must print nothing before you start.
+2. Start that one session in a subdirectory of the worktree, for example
+   `<worktree>/crates`. Claude Code reads `.claude/settings.json` only from the
+   directory a session starts in, so that session alone has the plugin on. Check that
+   `claude plugin list` run there says `enabled`. If it says `disabled`, the owner has
+   turned the plugin off for every worktree on that machine: ask the owner, and do not
+   enable it yourself. In that session the worktree root is outside the working
+   directory: run repository scripts by path (`../scripts/cargo-iso …`; it finds the
+   worktree itself) and expect approval prompts outside the subdirectory. Do not add
+   the root with `--add-dir` or `/add-dir`: that loads `enabledPlugins` from its
+   `.claude/settings.json`.
+3. End that session when the task is done, then check that no `rust-analyzer` of yours
+   is left: `ps -o pid,ppid,lstart,cmd -C rust-analyzer` (yours has your session's
+   `claude` process as its parent). Stop a leftover of your own only by that verified
+   PID. Never stop a language server that belongs to another session; ask its owner.
+
+Do not use `claude plugin enable` for this. With `--scope local` it writes the main
+checkout's `.claude/settings.local.json`, which every linked worktree reads, so it turns
+the plugin on for sessions in every worktree. With `--scope project` it edits the
+tracked file.
+
+Know these limits:
+
+- A session started in a subdirectory does not read `.claude/settings.json` and has the
+  plugin on.
+- A worktree whose branch does not contain `.claude/settings.json` still has the plugin
+  on. It gets the file when its branch next takes `main` in the normal course; do not
+  merge or rebase only for this. Turning it off for all existing worktrees at once (one
+  `claude plugin disable rust-analyzer-lsp@claude-plugins-official --scope local`, which
+  also turns it off in subdirectories) is the owner's decision.
+- A session that was already running when a setting changed may keep the plugin. Only
+  ending that session is certain; `/reload-plugins`, typed by the person at that
+  session, is the documented alternative.
+- `claude --settings '{"enabledPlugins":…}'` and `--plugin-dir` did not turn it on over
+  the project setting (tested with Claude Code 2.1.325).
+- This changes nothing in `cargo-iso`, `sccache`, the Cargo budget, or
+  `~/.config/rust-analyzer`.
+- On the maintainer's machine the plugin is also off for sessions started from the home
+  directory (`~/.claude/settings.local.json`) and, since 2026-11-14, for every worktree
+  of this repository, subdirectories included (the main checkout's
+  `.claude/settings.local.json`). Each file has a backup beside it. The first only
+  catches a stray session; it is not a reason to start one there.
+- Never delete an existing `<worktree>/target` because of this section. Its owner and
+  whether it is in use must be established first (see the Cargo cache release rules
+  below).
 
 ## Temporary files
 
@@ -174,6 +267,32 @@ scripts/check-working-tree-scope.sh --baseline-file /tmp/emuwiz-task.txt \
 
 If a required file is already dirty, do not work around the ownership boundary
 by overwriting it. Stop and report the exact path and overlap.
+
+## Proportionate risk policy (owner directive 2026-11-17)
+
+This section takes precedence over any older process rule in this file that asks
+for more review, testing or approval than it does. The owner explicitly accepts
+reasonable, recoverable risk so that development is fast. A working application
+matters more than process and paperwork.
+
+| Risk | Examples | How to work |
+|---|---|---|
+| **Low** | UI work, ordinary fixes, tests, docs, inactive build caches, recoverable development artefacts (scratch fixtures, sandboxes, your own targets) | Implement, run focused tests, push, open a PR and merge it (head pinned) when CI passes. No separate approval, review or full local test run. |
+| **Medium** | Recoverable application installs, database migrations with a backup, service changes | Take a backup or rollback point, then act on an existing owner approval for that kind of work. Don't ask again for every step. Report the rollback path. |
+| **High** | Irreplaceable data, unique source, other people's collections, genuinely destructive operations | Keep the full safeguards: read-only by default, journal, backup, rollback and explicit owner approval. |
+
+Stop doing:
+- Independent reviews of low-risk changes. Keep them for high-risk preservation,
+  filesystem, transaction and recovery code.
+- Repeated full test runs. Run focused tests locally and let CI run the rest.
+- Speculative investigations, research phases and plans that nobody asked for.
+- Approval loops for steps the owner already approved, and handoffs that leave work
+  half-finished.
+
+These protections stay non-negotiable: game files and source archives are
+read-only, real user data is never used for destructive tests, the HOLD lists and
+guard hooks are never weakened or bypassed, no virtual input devices, stop only your
+own processes, no `gh pr merge --auto`, and hints never become verified identity.
 
 ## Automatic repair and security policy
 
@@ -291,8 +410,10 @@ blockers, including an unresolved defect requiring architectural reconsideration
 after the attempt limit. Explain the blocker and the evidence or decision needed
 to proceed. Read-only assignments retain their own review/report completion path.
 
-Never push, merge, release or enable dangerous operations without explicit
-permission. A local candidate commit is not permission to promote or publish it.
+Low-risk work (see "Proportionate risk policy") is pushed, opened as a PR and
+merged with its head pinned once CI passes, without separate permission. Releases,
+installs and dangerous operations still need owner approval, and an existing
+approval for that kind of work covers every step of it.
 
 ### Reporting
 
@@ -320,13 +441,19 @@ rules; efficiency never overrides those guarantees.
 2. Default to one active implementation agent per task. Use additional active
    implementers only for explicitly authorised parallel work with disjoint file
    sets. Do not launch subagents automatically for routine work. Reserve
-   independent review for high-risk preservation, filesystem, transaction,
-   recovery and other safety-critical changes, or an explicit review requirement.
+   independent review for high-risk preservation, filesystem, transaction and
+   recovery changes, or an explicit review requirement. Low-risk changes get none.
 3. Never repeatedly poll builds, process lists, logs or Cargo locks using AI
    model turns. Use bounded shell waiters that write completion status and
    results to disk; inspect the result after completion or the bounded timeout.
-4. Run focused tests during implementation. Freeze the candidate before running
-   the full relevant final gate.
+   Run long builds in the background and wait for the completion notification
+   instead of foreground `sleep`/`until` loops. For GUI automation never use a
+   fixed `sleep 90`-`sleep 120` before a screenshot or click: wait on a condition
+   with `scripts/qa/gui_wait.py` (`--window NAME --stable 2`, `--window-gone`,
+   `--log FILE --pattern RE --new-only`, `--pid-exit PID`, bounded `--timeout`),
+   or `xdotool search --sync`.
+4. Run focused tests during implementation. For low-risk changes, CI is the final
+   gate; don't repeat the full suite locally.
 5. Reuse successful test and review evidence. Repeat it only when subsequent
    changes invalidate that evidence; safety-sensitive changes still require
    independent review of the exact final commit.
@@ -346,22 +473,30 @@ rules; efficiency never overrides those guarantees.
 11. Use appropriately priced models and reasoning levels for routine tasks when
     model selection is available and authorised. Reserve expensive reasoning for
     difficult or safety-sensitive work.
-12. Avoid overlapping full builds. Respect the existing shared Cargo heavy-build
-    lock as well as worktree-specific Cargo targets and retention rules.
+12. Avoid overlapping full builds. `cargo-iso` lets at most two builds run at once and
+    queues the rest; do not bypass it (`EMUWIZ_CARGO_MAX_BUILDS=0`) to jump the queue.
+    Respect worktree-specific Cargo targets and retention rules.
 13. Never sacrifice correctness, required independent safety review, final
     validation or preservation guarantees to save usage.
 14. Do not start a new development campaign while assigned work is unfinished
     unless explicitly authorised.
-15. After focused local tests and required source checks, push only when authorised,
-    open/update the PR, verify CI targets the exact reviewed head, and check once
-    for immediate failures. If checks remain running, report the PR, full head SHA,
-    run links and PENDING, then end the development session. Never use
-    `gh run watch`, repeated status/log polling or artifact downloads to wait for CI.
-    GitHub's completion notifier handles the final notification; see
-    `docs/ci-notifications.md`. After completion, perform a separate short
-    merge-readiness check using completed results for that exact head. Collect
-    detailed logs only for failures or a specific evidence requirement. Never
-    claim green CI early or merge without approval; all security, preservation,
+15. After focused local tests and required source checks, push (low-risk work is
+    pre-authorised; see "Proportionate risk policy"), open/update the PR, and verify CI targets the exact reviewed head. Then
+    (owner policy 2026-11-17):
+    - Prefer GitHub's completion notification (`docs/ci-notifications.md`).
+    - For an authorised long-running job, monitor with sensible cadence: first check
+      after about 10 minutes, then every 5 minutes, until it finishes or a defined
+      timeout. On the maintainer's machine this is exactly one
+      `~/.claude/bin/ci-wait pr <N> --repo OWNER/NAME --sha <full head>` run in the
+      background, which enforces that cadence, the timeout and one monitor per PR.
+    - Never use `gh run watch`, `gh pr checks --watch`, hand-rolled `sleep`+`gh`
+      loops, a loop around the monitor, duplicate monitors, repeated log polling or
+      artifact downloads; a guard hook denies them. This applies equally to subagents.
+    - When CI passes, complete an already-authorised merge only after verifying the
+      exact head SHA, the required checks and the merge state on GitHub.
+    - When CI fails, report the actual failure (failing job and log excerpt) instead
+      of checking again.
+    Never claim green CI early or merge without approval; all security, preservation,
     reproducibility and exact-head merge protections remain mandatory.
 
 ### Completion standard

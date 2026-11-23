@@ -109,6 +109,8 @@ fn snapshot(state: ProviderState, enabled: bool, configured: bool) -> RommSnapsh
             source: config(enabled, configured),
             page_size: Some(100),
             import_timeout_seconds: None,
+            rename_updates_title: false,
+            title_token_path: None,
         },
         status,
         artwork: artwork_stats(39, 2_434_474),
@@ -1067,6 +1069,61 @@ fn romm_import_result_surfaces_platform_conflict_for_review() {
 }
 
 #[test]
+fn romm_import_result_shows_romm_disagreeing_with_a_verified_dat_platform() {
+    use archivefs_core::platform::identity::{
+        PlatformIdentityConfidence, PlatformIdentityEvidence, PlatformIdentitySource,
+    };
+
+    let mut summary = import_summary(true, 1);
+    summary.platform_enrichment = Some(Box::new(
+        archivefs_core::PlatformIdentityEnrichmentSummary {
+            romm_disagreements: 1,
+            romm_disagreement_details: vec![archivefs_core::PlatformIdentityConflictDetail {
+                archive_id: 1,
+                evidence: vec![
+                    PlatformIdentityEvidence::canonical(
+                        "PSX",
+                        PlatformIdentitySource::VerifiedDat,
+                        PlatformIdentityConfidence::Verified,
+                        1,
+                        "DAT fixture",
+                    )
+                    .unwrap(),
+                    PlatformIdentityEvidence::canonical(
+                        "PSP",
+                        PlatformIdentitySource::Romm,
+                        PlatformIdentityConfidence::High,
+                        1,
+                        "RomM fixture",
+                    )
+                    .unwrap(),
+                ],
+            }],
+            ..Default::default()
+        },
+    ));
+    let view = build_result_view(
+        &RommOperation::FullImport,
+        Ok(&RommOperationOutcome::Import(Box::new(summary))),
+        false,
+    );
+    assert!(view.rows.iter().any(
+        |row| row.label == "RomM disagrees with a verified catalogue"
+            && row.value.contains("verified platform kept")
+    ));
+    assert!(view.notes.iter().any(|note| {
+        note.contains("Verified DAT: Sony PlayStation")
+            && note.contains("RomM: Sony PlayStation Portable")
+    }));
+    assert!(
+        !view
+            .rows
+            .iter()
+            .any(|row| row.label == "Platform conflicts")
+    );
+}
+
+#[test]
 fn a_published_import_states_atomic_publication_and_the_cache_path() {
     let view = build_result_view(
         &RommOperation::FullImport,
@@ -1420,4 +1477,79 @@ fn bytes_are_formatted_readably() {
     assert_eq!(human_bytes(52_574_568), "50.1 MiB");
     assert_eq!(human_bytes(1024 * 1024 * 1024), "1 GiB");
     assert_eq!(human_bytes(1024 * 1024 * 1024 * 3 / 2), "1.5 GiB");
+}
+
+#[test]
+fn romm_import_result_shows_romm_suggesting_another_platform_for_review() {
+    let mut summary = import_summary(true, 1);
+    summary.platform_enrichment = Some(Box::new(
+        archivefs_core::PlatformIdentityEnrichmentSummary {
+            romm_suggestions: 1,
+            romm_suggestion_details: vec![archivefs_core::RommPlatformSuggestion {
+                archive_id: 1,
+                current_platform: "PSX".into(),
+                current_source: "folder_alias".into(),
+                proposed_platform: "PSP".into(),
+                reason: "RomM disagrees with the platform EmuWiz found from the game's folder or files",
+            }],
+            ..Default::default()
+        },
+    ));
+    let view = build_result_view(
+        &RommOperation::FullImport,
+        Ok(&RommOperationOutcome::Import(Box::new(summary))),
+        false,
+    );
+    assert!(
+        view.rows
+            .iter()
+            .any(|row| row.label == "RomM suggests a different platform"
+                && row.value.contains("EmuWiz's platform kept"))
+    );
+    assert!(view.notes.iter().any(|note| note
+        == "Kept Sony PlayStation (from its folder); RomM proposes Sony PlayStation Portable. \
+            RomM disagrees with the platform EmuWiz found from the game's folder or files."));
+}
+
+#[test]
+fn romm_import_result_says_how_many_review_items_are_not_shown() {
+    let view_for = |count: usize| {
+        let mut summary = import_summary(true, 1);
+        summary.platform_enrichment = Some(Box::new(
+            archivefs_core::PlatformIdentityEnrichmentSummary {
+                romm_suggestions: count,
+                romm_suggestion_details: (0..count)
+                    .map(|index| archivefs_core::RommPlatformSuggestion {
+                        archive_id: index as i64,
+                        current_platform: "PSX".into(),
+                        current_source: "folder_alias".into(),
+                        proposed_platform: "PSP".into(),
+                        reason: "RomM disagrees",
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        ));
+        build_result_view(
+            &RommOperation::FullImport,
+            Ok(&RommOperationOutcome::Import(Box::new(summary))),
+            false,
+        )
+    };
+    let five = view_for(5);
+    assert_eq!(
+        five.notes
+            .iter()
+            .filter(|note| note.starts_with("Kept "))
+            .count(),
+        3
+    );
+    assert!(
+        five.notes
+            .iter()
+            .any(|note| note.starts_with("+2 more not shown here"))
+    );
+    assert!(five.rows.iter().any(|row| row.value.starts_with("5 ")));
+    let three = view_for(3);
+    assert!(!three.notes.iter().any(|note| note.starts_with('+')));
 }

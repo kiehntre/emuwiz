@@ -186,6 +186,11 @@ pub const MAX_MAGIC_OFFSET: u64 = 0x8008;
 pub const SHARED_EXTENSIONS: &[&str] = &[
     "bin", "cue", "iso", "img", "rom", "zip", "7z", "rar", "dsk", "tap", "cas", "adf", "chd",
     "mdf", "ccd", "sna", "ipf",
+    // A Commodore program file: a two-byte load address and the program.
+    // C64, C128, VIC-20, C16 and Plus/4 all use it, and the load address does
+    // not separate them (`$1001` is both an unexpanded VIC-20 and a C16/Plus/4),
+    // so it never names a system by itself.
+    "prg",
 ];
 
 /// Whether `extension` (lowercased, no dot) is one of the shared extensions
@@ -207,6 +212,9 @@ pub const EQUIVALENT_PLATFORM_IDS: &[(&str, &str)] = &[
     // The same computer family. `NEC PC-9801` is the identifier this build
     // shipped first; `PC-98` is the spelling real folder names use.
     ("PC-98", "NEC PC-9801"),
+    // The C16/C116 and the Plus/4 share the TED chip and their software, and
+    // TOSEC catalogues them together ("Commodore C16, C116 & Plus-4").
+    ("Commodore 16", "Commodore Plus-4"),
 ];
 
 /// Every canonical identifier equivalent to `id`, excluding `id` itself.
@@ -564,6 +572,19 @@ pub const PLATFORMS: &[Platform] = &[
         explanation: "`.cdt` tapes are CPC-specific. `.dsk` is shared with the BBC Micro, Atari ST, Apple II and PC-98, so a disk image alone is never enough.",
     },
     Platform {
+        id: "AmstradGX4000",
+        display_name: "Amstrad GX4000",
+        folder_aliases: &["amstradgx4000", "gx4000"],
+        filename_aliases: &[],
+        strong_extensions: &[],
+        weak_extensions: &["bin"],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &[],
+        preferred_emulator: None,
+        explanation: "GX4000 cartridges are raw `.bin` dumps (16 KiB multiples up to 512 KiB); only folder evidence names the system.",
+    },
+    Platform {
         id: "Apple II",
         display_name: "Apple II",
         folder_aliases: &[
@@ -777,6 +798,19 @@ pub const PLATFORMS: &[Platform] = &[
         explanation: "Acorn DFS disk images (`.ssd`/`.dsd`) are shared with the Acorn Electron, so the extension and even a valid DFS catalogue remain family-level evidence; folder context separates the canonical platform. `.uef` tapes are shared too.",
     },
     Platform {
+        id: "CasioLoopy",
+        display_name: "Casio Loopy",
+        folder_aliases: &["casioloopy", "loopy"],
+        filename_aliases: &[],
+        strong_extensions: &[],
+        weak_extensions: &["bin"],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &[],
+        preferred_emulator: None,
+        explanation: "Loopy cartridges are raw `.bin` dumps (512 KiB multiples); only folder evidence names the system.",
+    },
+    Platform {
         id: "ColecoVision",
         display_name: "ColecoVision",
         folder_aliases: &["colecovision", "coleco", "colecovisioncv"],
@@ -802,6 +836,32 @@ pub const PLATFORMS: &[Platform] = &[
         preferred_emulator: None,
         explanation: "1571/1581 images (`.d71`/`.d81`) are C128-era formats. A plain `.d64`/`.g64` is far more often a C64 image, so both are only weak evidence here; a 1571 drive can read GCR `.g64` images too.",
     },
+    // The TED machines. The C16, C116 and Plus/4 run the same software and
+    // TOSEC keeps them in one list, so the two identifiers are separate (a
+    // person's folder says which machine they mean) but declared equivalent
+    // in `EQUIVALENT_PLATFORM_IDS`. Neither is ever a C64 or a VIC-20: a `$1001`
+    // load address is shared with the unexpanded VIC-20, so files need folder,
+    // TAP-header or catalogue evidence.
+    Platform {
+        id: "Commodore 16",
+        display_name: "Commodore 16",
+        folder_aliases: &[
+            "commodore16",
+            "c16",
+            "commodorec16",
+            "c116",
+            "commodore116",
+            "commodorec116",
+        ],
+        filename_aliases: &[],
+        strong_extensions: &[],
+        weak_extensions: &["prg", "tap", "d64"],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &["Commodore 64", "VIC-20"],
+        preferred_emulator: None,
+        explanation: "The C16 and C116 share `.prg`/`.tap`/`.d64` with the rest of the Commodore range, so they are recognised from folder evidence, a TAP header's machine byte or a C16/Plus-4 catalogue. Plus/4 software is treated as the same family.",
+    },
     Platform {
         id: "Commodore 64",
         display_name: "Commodore 64",
@@ -814,10 +874,15 @@ pub const PLATFORMS: &[Platform] = &[
         ],
         filename_aliases: &[],
         strong_extensions: &["t64", "crt", "g64", "d81ns"],
-        weak_extensions: &["tap", "cas", "bin", "zip"],
+        weak_extensions: &["tap", "cas", "bin", "zip", "prg"],
         magic: &[],
         layout: &[],
-        conflicts_with: &["Commodore 128", "VIC-20"],
+        conflicts_with: &[
+            "Commodore 128",
+            "VIC-20",
+            "Commodore 16",
+            "Commodore Plus-4",
+        ],
         preferred_emulator: None,
         explanation: "`.d64`/`.t64`/`.crt` are Commodore-specific but shared across the 8-bit Commodore range, so folder evidence is what separates C64 from C128 and VIC-20.",
     },
@@ -861,6 +926,19 @@ pub const PLATFORMS: &[Platform] = &[
         explanation: "CDTV discs carry no distinctive extension and are recognised from folder evidence. Kept separate from CD32, which is different hardware.",
     },
     Platform {
+        id: "Commodore Plus-4",
+        display_name: "Commodore Plus/4",
+        folder_aliases: &["plus4", "commodoreplus4", "cplus4", "commodorecplus4"],
+        filename_aliases: &[],
+        strong_extensions: &[],
+        weak_extensions: &["prg", "tap", "d64"],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &["Commodore 64", "VIC-20"],
+        preferred_emulator: None,
+        explanation: "The Plus/4 shares `.prg`/`.tap`/`.d64` with the rest of the Commodore range, so it is recognised from folder evidence, a TAP header's machine byte or a C16/Plus-4 catalogue. C16 software is treated as the same family.",
+    },
+    Platform {
         id: "VIC-20",
         display_name: "Commodore VIC-20",
         folder_aliases: &["vic20", "commodorevic20", "vic"],
@@ -869,7 +947,7 @@ pub const PLATFORMS: &[Platform] = &[
         weak_extensions: &["prg", "tap", "cas", "d64"],
         magic: &[],
         layout: &[],
-        conflicts_with: &["Commodore 64"],
+        conflicts_with: &["Commodore 64", "Commodore 16", "Commodore Plus-4"],
         preferred_emulator: None,
         explanation: "The VIC-20 shares `.prg`/`.crt`/`.tap` with the rest of the Commodore range and has no extension of its own, so it is recognised from folder evidence.",
     },
@@ -1457,6 +1535,24 @@ pub const PLATFORMS: &[Platform] = &[
         explanation: "The ISO 9660 system identifier is what separates a CD-i disc from any other ISO: CD-i names `CD-RTOS`, where a PlayStation disc names `PLAYSTATION`. Extension alone is never enough.",
     },
     Platform {
+        id: "Videopac",
+        display_name: "Philips Videopac / Magnavox Odyssey²",
+        folder_aliases: &[
+            "videopac",
+            "philipsvideopac",
+            "odyssey2",
+            "magnavoxodyssey2",
+        ],
+        filename_aliases: &[],
+        strong_extensions: &[],
+        weak_extensions: &["bin"],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &[],
+        preferred_emulator: None,
+        explanation: "Videopac cartridges are raw `.bin` dumps of 2-16 KiB; only folder evidence names the system.",
+    },
+    Platform {
         id: "ScummVM",
         display_name: "ScummVM",
         folder_aliases: &["scummvm", "scumm", "scummvmgames", "sci", "sierrasci"],
@@ -1657,6 +1753,25 @@ pub const PLATFORMS: &[Platform] = &[
         conflicts_with: &["MegaDrive", "Sega 32X", "PSX", "AmigaCD32"],
         preferred_emulator: None,
         explanation: "The `SEGADISCSYSTEM` boot signature is what separates a Mega-CD image from any other `.bin`/`.iso`. Kept as its own canonical platform, never folded into Mega Drive.",
+    },
+    // Sega Pico (owner approval 2026-11-10, development only: the live
+    // library is not rescanned or reclassified by this entry). The Pico
+    // cartridge header names `PICO` at 0x100..0x110 but begins with `SEGA`
+    // like a Mega Drive's, so no magic rule is registered: the bytes would
+    // only ever corroborate both. Pico-versus-Mega Drive is decided by the
+    // launch-time header check (`launch::unverified_media::is_sega_pico_rom`).
+    Platform {
+        id: "Sega Pico",
+        display_name: "Sega Pico",
+        folder_aliases: &["segapico", "pico", "kidspico", "segatoyspico"],
+        filename_aliases: &[],
+        strong_extensions: &[],
+        weak_extensions: &["md", "bin", "zip"],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &["MegaDrive"],
+        preferred_emulator: None,
+        explanation: "A Pico ROM is a Mega Drive-format cartridge whose header names the Pico; only a folder name or that header tells them apart. `.md`, `.bin` and `.zip` are weak and shared with the Mega Drive.",
     },
     Platform {
         id: "Saturn",

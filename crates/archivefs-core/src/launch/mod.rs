@@ -68,11 +68,15 @@ pub mod amiberry_cd_execution;
 pub mod amiberry_cd_profile;
 pub mod amiberry_command;
 pub mod amiberry_execution;
+pub mod amiga_caps_plugin;
+pub mod amiga_hdf_working_copy;
 pub mod amiga_whdload_command;
 pub mod amiga_whdload_execution;
 pub mod amiga_whdload_trainer_launch;
 #[cfg(target_os = "linux")]
 pub mod atari800;
+#[cfg(target_os = "linux")]
+pub mod atari800_setup;
 pub mod azahar_command;
 pub mod azahar_execution;
 pub mod azahar_homebrew;
@@ -93,6 +97,7 @@ pub mod dosbox_command;
 pub mod dosbox_execution;
 pub mod dosbox_sandbox;
 pub mod dosbox_target;
+pub mod unverified_media;
 pub use dosbox_target::{DosBoxLaunchIdentity, UserApprovedDosBoxTarget};
 pub mod duckstation_command;
 pub mod duckstation_execution;
@@ -105,6 +110,7 @@ pub mod evidence_freshness;
 pub mod execution;
 pub mod fbneo_command;
 pub mod fbneo_execution;
+pub mod flatpak_graphics;
 pub mod flycast_command;
 pub mod flycast_execution;
 pub mod flycast_gdi_readiness;
@@ -115,6 +121,7 @@ pub mod fsuae_execution;
 pub mod fuse_command;
 pub mod hatari_command;
 pub mod hatari_execution;
+pub mod hatari_session;
 pub mod input_projection;
 pub mod integration;
 pub mod mame_command;
@@ -145,6 +152,7 @@ pub mod planning;
 pub mod platform_map;
 pub mod ppsspp_command;
 pub mod ppsspp_execution;
+pub mod process_log;
 pub mod process_spawn;
 pub mod retroarch_cheat_candidates;
 pub mod retroarch_overrides;
@@ -164,6 +172,7 @@ pub mod installation_support;
 pub mod readiness;
 pub mod resource_grants;
 pub mod retroarch_command;
+pub mod retroarch_launch_diagnostics;
 pub mod retroarch_launch_visibility;
 pub mod retroarch_resource_projection;
 pub mod rmg_command;
@@ -347,9 +356,11 @@ pub use evidence_freshness::{
 pub use execution::{
     LAUNCH_STDERR_CAPTURE_LIMIT, LaunchCommandFacts, LaunchContentIdentity, LaunchExecutionError,
     LaunchExitReport, LaunchPreflightError, LaunchPreflightErrorKind, LaunchSpawnError,
-    LaunchedRetroArchProcess, RetroArchLaunchRequest, preflight_and_launch_retroarch,
+    LaunchedRetroArchProcess, PreparedRetroArchLaunch, RetroArchLaunchRequest,
+    apply_zipped_cartridge_save_safety, preflight_and_launch_retroarch,
     preflight_and_launch_retroarch_with_playlist, preflight_retroarch_launch,
-    preflight_retroarch_launch_with_playlist, spawn_retroarch,
+    preflight_retroarch_launch_with_playlist, prepare_retroarch_launch_with_playlist,
+    spawn_retroarch, zipped_cartridge_save_findings,
 };
 pub use fbneo_command::{
     FBNEO_SUPPORTED_PLATFORM_ID, FbneoCommand, FbneoCommandPlan, FbneoIdentityEvidence,
@@ -414,6 +425,7 @@ pub use integration::{
 };
 pub use mame_command::{
     MAME_SUPPORTED_PLATFORM_IDS, MameCommand, MameCommandPlan, build_mame_command_plan,
+    build_mame_command_plan_with_extra,
 };
 pub use mame_execution::{
     MameLaunchExecutionError, MameLaunchPreflightError, MameLaunchRequest,
@@ -467,8 +479,8 @@ pub use pcsx2_execution::{
 pub use planning::{
     CandidatePreference, CanonicalIdentityStatus, LaunchCandidate, LaunchContainerKind,
     LaunchContentKind, LaunchContentRef, LaunchPlan, LaunchPlanSummary, LaunchTarget,
-    RememberedPreference, ResolvedIdentity, StandaloneProfileInput, VerifiedWHDLoadContent,
-    build_launch_plan,
+    RETROARCH_RECHECK_HINT, RememberedPreference, ResolvedIdentity, StandaloneProfileInput,
+    VerifiedWHDLoadContent, build_launch_plan,
 };
 pub use platform_map::{
     LAUNCH_COMPATIBILITY, LaunchCompatibility, MappingConfidence, extension_narrows_candidate,
@@ -649,6 +661,7 @@ pub mod nkit_readiness;
 
 /// Explicit user choice between tied launch candidates.
 pub mod launch_choice;
+pub mod remembered_launch_system;
 
 /// Dolphin profiles are launch options only with a provable binding.
 pub mod dolphin_binding_readiness;

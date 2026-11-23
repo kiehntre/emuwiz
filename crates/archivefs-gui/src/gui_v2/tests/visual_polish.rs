@@ -269,6 +269,11 @@ fn visual_polish_layouts_render_at_both_requested_sizes() {
 fn visual_polish_native_preview() {
     let route = match std::env::var("EMUWIZ_VISUAL_PAGE").as_deref() {
         Ok("details") => Route::Game(2),
+        // Identity wording: a verified game, a name-hint-only game and a game
+        // whose system is unknown.
+        Ok("details-verified") => Route::Game(3),
+        Ok("details-hint") => Route::Game(5),
+        Ok("details-unknown") => Route::Game(7),
         Ok("health") => Route::Tool(super::super::routes::ToolPage::NeedsAttention),
         Ok("selected") => Route::BrowsePlayGame(2),
         _ => Route::BrowsePlay,
@@ -294,9 +299,57 @@ fn visual_polish_native_preview() {
         options,
         Box::new(move |cc| {
             let mut app = populated(&cc.egui_ctx);
+            identity_variant(&mut app, &route);
             app.router.current = route;
             Ok(Box::new(Preview(app)))
         }),
     )
     .unwrap();
+}
+
+/// The identity states the native preview's `details-*` pages show. The
+/// verification panel's answer is set here, so no worker reads a catalogue.
+#[cfg(target_os = "linux")]
+fn identity_variant(app: &mut App, route: &Route) {
+    use super::super::game_verification_guidance::{Action, Guidance};
+    let answer = |reason, action| Guidance {
+        reason,
+        explanation: String::new(),
+        action,
+    };
+    match route {
+        Route::Game(3) => {
+            Arc::make_mut(&mut app.library).games[2].mark_dat_exact(Some("No-Intro"));
+            app.review.verification_guidance.set_for_test(
+                3,
+                None,
+                Some(answer("Verified", Action::Review)),
+            );
+        }
+        Route::Game(5) => app.review.verification_guidance.set_for_test(
+            5,
+            None,
+            Some(answer("Audit not yet performed", Action::Audit)),
+        ),
+        Route::Game(7) => {
+            app.library = Arc::new(Library::new(
+                (1..=18)
+                    .map(|id| {
+                        let title =
+                            format!("{id:02} {}", if id % 2 == 0 { LONG } else { "Short title" });
+                        archive(id, &title, (id != 7).then_some("SNES"))
+                    })
+                    .collect(),
+            ));
+            app.review.verification_guidance.set_for_test(
+                7,
+                None,
+                Some(answer(
+                    "Catalogue system coverage unresolved",
+                    Action::Review,
+                )),
+            );
+        }
+        _ => {}
+    }
 }

@@ -77,8 +77,8 @@ pub(crate) fn platform_asset_category(platform: &str) -> PlatformAssetCategory {
     match platform.id {
         "3DO" | "ColecoVision" | "Dreamcast" | "GameCube" | "Intellivision" | "MasterSystem"
         | "MegaDrive" | "N64" | "NeoGeo" | "NeoGeo64" | "NES" | "PSX" | "PS2" | "PS3" | "PS4"
-        | "Saturn" | "Sega 32X" | "SNES" | "Switch" | "Vectrex" | "Wii" | "WiiU" | "Xbox"
-        | "Xbox360" => PlatformAssetCategory::Console,
+        | "Saturn" | "Sega 32X" | "Sega Pico" | "SNES" | "Switch" | "Vectrex" | "Wii" | "WiiU"
+        | "Xbox" | "Xbox360" => PlatformAssetCategory::Console,
         "Atari Lynx"
         | "Game Boy"
         | "Game Boy Advance"
@@ -100,15 +100,19 @@ pub(crate) fn platform_asset_category(platform: &str) -> PlatformAssetCategory {
         | "Psion EPOC32"
         | "Psion SIBO" => PlatformAssetCategory::Handheld,
         "Acorn Archimedes" | "Acorn Electron" | "Amiga" | "Amstrad CPC" | "Apple II"
-        | "Atari 8-bit" | "AtariST" | "BBC Micro" | "Commodore 128" | "Commodore 64" | "DOS"
-        | "Enterprise" | "FM Towns" | "Macintosh" | "MSX" | "MSX2" | "NEC PC-8801"
-        | "NEC PC-9801" | "Oric" | "PC" | "PC-98" | "ScummVM" | "Sharp X68000" | "VIC-20"
-        | "Thomson MO" | "Thomson TO" | "ZX Spectrum" => PlatformAssetCategory::Computer,
+        | "Atari 8-bit" | "AtariST" | "BBC Micro" | "Commodore 128" | "Commodore 64"
+        | "Commodore 16" | "Commodore Plus-4" | "DOS" | "Enterprise" | "FM Towns" | "Macintosh"
+        | "MSX" | "MSX2" | "NEC PC-8801" | "NEC PC-9801" | "Oric" | "PC" | "PC-98" | "ScummVM"
+        | "Sharp X68000" | "VIC-20" | "Thomson MO" | "Thomson TO" | "ZX Spectrum" => {
+            PlatformAssetCategory::Computer
+        }
         "Arcade" => PlatformAssetCategory::Arcade,
         "AmigaCD32" | "Commodore CDTV" | "Neo Geo CD" | "PC Engine CD" | "PC-FX"
         | "Philips CD-i" | "Sega CD" => PlatformAssetCategory::OpticalDisc,
         "Atari2600" | "Atari5200" | "Atari7800" | "Atari Jaguar" | "PC Engine"
-        | "TurboGrafx-16" => PlatformAssetCategory::Cartridge,
+        | "TurboGrafx-16" | "AmstradGX4000" | "CasioLoopy" | "Videopac" => {
+            PlatformAssetCategory::Cartridge
+        }
         _ => PlatformAssetCategory::Unknown,
     }
 }

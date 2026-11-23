@@ -98,6 +98,21 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         retroarch_core_hints: &["vice_x64sc"],
         confidence: MappingConfidence::Exact,
     },
+    // The TED machines run through RetroArch's VICE xplus4 core, whose own
+    // `.info` names `PLUS/4` / `Commodore - Plus-4`. The native VICE adapter
+    // stays C64-only.
+    LaunchCompatibility {
+        platform_id: "Commodore 16",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["vice_xplus4"],
+        confidence: MappingConfidence::Exact,
+    },
+    LaunchCompatibility {
+        platform_id: "Commodore Plus-4",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["vice_xplus4"],
+        confidence: MappingConfidence::Exact,
+    },
     LaunchCompatibility {
         platform_id: "PSX",
         standalone_adapters: &["duckstation"],
@@ -209,7 +224,12 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
     LaunchCompatibility {
         platform_id: "NES",
         standalone_adapters: &["mesen"],
-        retroarch_core_hints: &["nestopia"],
+        // Reviewed preference, in this order of intent: Nestopia, FCEUmm,
+        // Mesen. Many distributions install Nestopia/FCEUmm only as symlinks to
+        // Mesen, which are (correctly) not counted as separate cores, so
+        // Mesen must be nameable or an install with just Mesen, FixNES and
+        // QuickNES has no preferred core at all.
+        retroarch_core_hints: &["nestopia", "fceumm", "mesen"],
         confidence: MappingConfidence::StronglyKnown,
     },
     LaunchCompatibility {
@@ -294,6 +314,14 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         retroarch_core_hints: &["picodrive"],
         confidence: MappingConfidence::StronglyKnown,
     },
+    // PicoDrive is the only core whose `.info` database lists `Sega - PICO`
+    // (Genesis Plus GX does not); it emulates the pen and Storyware pages.
+    LaunchCompatibility {
+        platform_id: "Sega Pico",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["picodrive"],
+        confidence: MappingConfidence::StronglyKnown,
+    },
     LaunchCompatibility {
         platform_id: "ColecoVision",
         standalone_adapters: &[],
@@ -324,6 +352,16 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         platform_id: "Dragon / Tandy CoCo",
         standalone_adapters: &["xroar"],
         retroarch_core_hints: &[],
+        confidence: MappingConfidence::StronglyKnown,
+    },
+    // Native Atari800 (disposable ATR sessions, see `atari800_setup`) and the
+    // libretro core of the same name stay separate candidates. The core hint
+    // keeps RetroArch a cheat route here; it is NOT a launch preference (see
+    // `CHEAT_ROUTE_ONLY_CORE_HINTS`).
+    LaunchCompatibility {
+        platform_id: "Atari 8-bit",
+        standalone_adapters: &["atari800"],
+        retroarch_core_hints: &["atari800"],
         confidence: MappingConfidence::StronglyKnown,
     },
     LaunchCompatibility {
@@ -386,6 +424,24 @@ pub fn launch_compatibility_for_platform(
     LAUNCH_COMPATIBILITY
         .iter()
         .find(|entry| entry.platform_id == platform_id)
+}
+
+/// Platforms whose `retroarch_core_hints` exist only so RetroArch stays a
+/// cheat route beside a standalone adapter (see
+/// `crate::patch_manager::cheat_route`). The hint was never reviewed as a
+/// launch preference, so it must not pick a winner between installed cores:
+/// a tie between different cores stays a choice for the person.
+const CHEAT_ROUTE_ONLY_CORE_HINTS: &[&str] = &["Atari 8-bit"];
+
+/// The reviewed RetroArch core preference used when planning a LAUNCH for
+/// `platform_id`: the row's hints, except where they are cheat-route only.
+pub fn retroarch_launch_core_hints(platform_id: &str) -> &'static [&'static str] {
+    if CHEAT_ROUTE_ONLY_CORE_HINTS.contains(&platform_id) {
+        return &[];
+    }
+    launch_compatibility_for_platform(platform_id)
+        .map(|entry| entry.retroarch_core_hints)
+        .unwrap_or(&[])
 }
 
 /// Every reviewed row whose `standalone_adapters` names `adapter_id` - the
@@ -604,6 +660,29 @@ mod tests {
     }
 
     #[test]
+    fn atari_8bit_maps_to_native_atari800_and_keeps_the_retroarch_core() {
+        let entry = launch_compatibility_for_platform("Atari 8-bit").unwrap();
+        assert_eq!(entry.standalone_adapters, &["atari800"]);
+        assert_eq!(entry.retroarch_core_hints, &["atari800"]);
+        // Kept for cheat routing only: launch planning sees no core preference,
+        // exactly as before this platform had a row.
+        assert!(retroarch_launch_core_hints("Atari 8-bit").is_empty());
+        assert_eq!(retroarch_launch_core_hints("Atari2600"), &["stella"]);
+        assert!(retroarch_launch_core_hints("No Such Platform").is_empty());
+        assert_eq!(
+            platforms_for_standalone_adapter("atari800"),
+            vec!["Atari 8-bit"]
+        );
+        // The 5200 shares the chipset but is not launched by this adapter.
+        assert!(
+            launch_compatibility_for_platform("Atari5200")
+                .unwrap()
+                .standalone_adapters
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn n64_maps_to_rmg_exactly() {
         let entry = launch_compatibility_for_platform("N64").unwrap();
         assert_eq!(entry.standalone_adapters, &["rmg"]);
@@ -703,8 +782,43 @@ mod tests {
             } else {
                 assert!(row.standalone_adapters.is_empty(), "{platform_id}");
             }
-            assert_eq!(row.retroarch_core_hints.len(), 1, "{platform_id}");
+            if platform_id == "NES" {
+                // A ranked reviewed list (first installed name wins): Nestopia
+                // and FCEUmm are often installed only as aliases of Mesen.
+                assert_eq!(
+                    row.retroarch_core_hints,
+                    &["nestopia", "fceumm", "mesen"],
+                    "{platform_id}"
+                );
+            } else {
+                assert_eq!(row.retroarch_core_hints.len(), 1, "{platform_id}");
+            }
             assert_eq!(row.confidence, MappingConfidence::StronglyKnown);
+        }
+    }
+
+    #[test]
+    fn vice_xplus4_runs_the_ted_machines_and_never_the_c64() {
+        // The installed core's own `.info` text (vice_xplus4_libretro.info).
+        let xplus4 = found(Some("PLUS/4"), Some("Commodore - Plus-4"));
+        assert_eq!(
+            retroarch_platform_candidate(&xplus4),
+            Some("Commodore Plus-4")
+        );
+        assert!(retroarch_platform_matches(&xplus4, "Commodore Plus-4"));
+        assert!(retroarch_platform_matches(&xplus4, "Commodore 16"));
+        assert!(!retroarch_platform_matches(&xplus4, "Commodore 64"));
+        assert!(!retroarch_platform_matches(&xplus4, "VIC-20"));
+        // vice_x64sc_libretro.info stays C64-only.
+        let x64sc = found(Some("C64"), Some("Commodore - 64"));
+        assert_eq!(retroarch_platform_candidate(&x64sc), Some("Commodore 64"));
+        assert!(!retroarch_platform_matches(&x64sc, "Commodore Plus-4"));
+        assert!(!retroarch_platform_matches(&x64sc, "Commodore 16"));
+        for platform in ["Commodore 16", "Commodore Plus-4"] {
+            let row = launch_compatibility_for_platform(platform).expect("reviewed row");
+            assert_eq!(row.retroarch_core_hints, &["vice_xplus4"], "{platform}");
+            assert!(row.standalone_adapters.is_empty(), "{platform}");
+            assert!(extension_narrows_candidate("prg", platform), "{platform}");
         }
     }
 
@@ -922,5 +1036,31 @@ mod tests {
         assert!(retroarch_platform_matches(&snes9x, "SNES"));
         assert!(!retroarch_platform_matches(&snes9x, "NES"));
         assert!(!retroarch_platform_matches(&snes9x, "Game Boy"));
+    }
+
+    #[test]
+    fn only_a_core_listing_the_pico_database_runs_sega_pico() {
+        let picodrive = found(
+            Some("Sega 8/16-bit + 32X (Various)"),
+            Some(
+                "Sega - Master System - Mark III|Sega - Game Gear|Sega - Mega-CD - Sega CD|Sega - Mega Drive - Genesis|Sega - PICO|Sega - 32X",
+            ),
+        );
+        let genesis_plus_gx = found(
+            Some("Sega 8/16-bit (Various)"),
+            Some(
+                "Sega - Master System - Mark III|Sega - Game Gear|Sega - Mega Drive - Genesis|Sega - Mega-CD - Sega CD",
+            ),
+        );
+        assert!(retroarch_platform_matches(&picodrive, "Sega Pico"));
+        assert!(!retroarch_platform_matches(&genesis_plus_gx, "Sega Pico"));
+        // PicoDrive still runs the Mega Drive; the Pico entry takes nothing away.
+        assert!(retroarch_platform_matches(&picodrive, "MegaDrive"));
+        assert_eq!(
+            launch_compatibility_for_platform("Sega Pico")
+                .unwrap()
+                .retroarch_core_hints,
+            &["picodrive"]
+        );
     }
 }

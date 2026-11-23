@@ -113,6 +113,9 @@ pub(crate) fn poll_and_reconcile(app: &mut ArchiveFsApp, context: &egui::Context
     app.poll_duckstation_resolution();
     app.poll_ppsspp_resolution();
     app.poll_pcsx2_firmware_evidence();
+    // BIOS answers verified again off this thread wake the interface.
+    app.emulator_readiness.pcsx2_bios_cache.wake_with(context);
+    app.emulator_readiness.flycast_bios_cache.wake_with(context);
     app.poll_cheat_workflow(context);
     app.cheatbase_page.poll(context);
     app.emulator_download_page.poll(context);

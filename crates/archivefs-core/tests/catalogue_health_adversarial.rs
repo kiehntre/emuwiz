@@ -200,7 +200,8 @@ fn coverage_states_fail_closed_except_complete() {
         let run = f.proof(state, 0);
         let folder = f.db.list_source_folders().unwrap()[0].id;
         assert_eq!(
-            f.db.mark_unseen_archives_missing(run, folder, &[]).unwrap(),
+            f.db.mark_unseen_archives_missing(run, folder, &[], &[])
+                .unwrap(),
             i64::from(state == "complete")
         );
         assert_eq!(f.flag(id).is_some(), state == "complete");
@@ -219,7 +220,7 @@ fn legitimate_root_replacement_is_reprovable_on_new_scan() {
     fs::rename(&f.roots[0], &saved).unwrap();
     fs::create_dir(&f.roots[0]).unwrap();
     assert!(
-        f.db.mark_unseen_archives_missing(old_run, folder, &[])
+        f.db.mark_unseen_archives_missing(old_run, folder, &[], &[])
             .is_err()
     );
     assert_eq!(f.flag(id), None);
@@ -416,7 +417,7 @@ fn source_disappearing_after_root_preflight_must_preserve_evidence() {
         std::env::set_var("EMUWIZ_FAULT_PATH", &p);
         std::env::set_var("EMUWIZ_FAULT_ROOT", &f.roots[0]);
     }
-    let result = f.db.mark_unseen_archives_missing(run, folder, &[]);
+    let result = f.db.mark_unseen_archives_missing(run, folder, &[], &[]);
     unsafe {
         std::env::remove_var("EMUWIZ_FAULT_PATH");
         std::env::remove_var("EMUWIZ_FAULT_ROOT");

@@ -28,10 +28,56 @@ pub fn parse_mame_listxml(path: &Path, limits: DatLimits) -> Result<ParseOutcome
     parse_mame_listxml_with_sink(path, limits, super::EntrySink::collect())
 }
 
+/// Document root a MAME machine catalogue is required to have. Each entry
+/// point accepts exactly one root; any other root is rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MameDocumentRoot {
+    /// Current `mame -listxml` output: `<mame build="...">`.
+    ListXml,
+    /// Logiqx-shaped MAME export: `<datafile>` with a `<header>` and
+    /// `<machine>` entries (the pinned MAME 0.174 Arcade XML DAT).
+    LogiqxDatafile,
+}
+
+impl MameDocumentRoot {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::ListXml => "mame",
+            Self::LogiqxDatafile => "datafile",
+        }
+    }
+}
+
+/// Parses a `<datafile>`-rooted MAME machine export with exactly the same
+/// bounded, complete-document validation and machine projection as
+/// [`parse_mame_listxml`]; only the required root differs. Not used for
+/// format detection: the only caller is the checksum-pinned MAME 0.174 join
+/// (`load_verified_mame_0174`), which also asserts the internal header.
+pub(crate) fn parse_mame_logiqx_datafile(
+    path: &Path,
+    limits: DatLimits,
+) -> Result<ParseOutcome, ParseError> {
+    parse_mame_document(
+        path,
+        limits,
+        super::EntrySink::collect(),
+        MameDocumentRoot::LogiqxDatafile,
+    )
+}
+
 pub(super) fn parse_mame_listxml_with_sink(
     path: &Path,
     limits: DatLimits,
+    games: super::EntrySink<'_>,
+) -> Result<ParseOutcome, ParseError> {
+    parse_mame_document(path, limits, games, MameDocumentRoot::ListXml)
+}
+
+fn parse_mame_document(
+    path: &Path,
+    limits: DatLimits,
     mut games: super::EntrySink<'_>,
+    root: MameDocumentRoot,
 ) -> Result<ParseOutcome, ParseError> {
     let metadata = std::fs::metadata(path).map_err(|error| ParseError::Io {
         path: path.to_path_buf(),
@@ -62,7 +108,7 @@ pub(super) fn parse_mame_listxml_with_sink(
             Ok(Event::Start(e)) => {
                 validate_attributes(&e)?;
                 let tag = tag(&e)?;
-                validate_element(&tag, depth, root_seen)?;
+                validate_element(&tag, depth, root_seen, root)?;
                 if depth == 0 {
                     root_seen = true;
                 }
@@ -112,7 +158,7 @@ pub(super) fn parse_mame_listxml_with_sink(
             Ok(Event::Empty(e)) => {
                 validate_attributes(&e)?;
                 let tag = tag(&e)?;
-                validate_element(&tag, depth, root_seen)?;
+                validate_element(&tag, depth, root_seen, root)?;
                 if depth + 1 > limits.max_xml_depth {
                     return Err(ParseError::XmlDepthExceeded {
                         depth: depth + 1,
@@ -255,15 +301,23 @@ fn malformed(detail: impl Into<String>) -> ParseError {
 
 // Track document structure without buffering the catalogue. quick-xml checks
 // matching end tags, but token-boundary EOF and multiple roots need this guard.
-fn validate_element(tag: &str, depth: usize, root_seen: bool) -> Result<(), ParseError> {
+fn validate_element(
+    tag: &str,
+    depth: usize,
+    root_seen: bool,
+    root: MameDocumentRoot,
+) -> Result<(), ParseError> {
     if depth == 0 {
         if root_seen {
             return Err(malformed("Multiple document roots in MAME catalogue"));
         }
-        if tag != "mame" {
-            return Err(malformed("Expected a MAME document root"));
+        if tag != root.tag() {
+            return Err(malformed(format!(
+                "Expected a MAME document root <{}>, found <{tag}>",
+                root.tag()
+            )));
         }
-    } else if tag == "mame" {
+    } else if tag == "mame" || tag == "datafile" {
         return Err(malformed("Nested MAME document root"));
     }
     if tag == "machine" && depth != 1 {
@@ -582,6 +636,124 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, contents).unwrap();
         path
+    }
+
+    const LOGIQX_MAME: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE datafile PUBLIC "-//Logiqx//DTD ROM Management Datafile//EN" "http://www.logiqx.com/Dats/datafile.dtd">
+<datafile>
+	<header>
+		<name>MAME</name>
+		<description>MAME Arcade 0.174</description>
+		<clrmamepro/>
+	</header>
+	<machine name="005" sourcefile="segag80r.cpp">
+		<description>005</description>
+		<year>1981</year>
+		<manufacturer>Sega</manufacturer>
+		<rom name="1346b.cpu-u25" size="2048" crc="8e68533e" sha1="a257c556d31691068ed5c991f1fb2b51da4826db"/>
+		<driver status="imperfect"/>
+	</machine>
+	<machine name="clone1" cloneof="005" romof="005">
+		<description>Clone</description>
+		<rom name="1346b.cpu-u25" merge="1346b.cpu-u25" size="2048" crc="8e68533e" sha1="a257c556d31691068ed5c991f1fb2b51da4826db"/>
+		<disk name="clone1" sha1="ede873b22957f2a707bbd3039e962ef2ca5aedbd" optional="yes"/>
+	</machine>
+</datafile>
+"#;
+
+    #[test]
+    fn logiqx_datafile_mame_export_parses_like_listxml() {
+        let dir = tempfile::tempdir().unwrap();
+        let datafile = write(dir.path(), "mame0174.dat", LOGIQX_MAME);
+        let as_listxml = write(
+            dir.path(),
+            "mame0174.xml",
+            &LOGIQX_MAME
+                .replace("<!DOCTYPE datafile PUBLIC \"-//Logiqx//DTD ROM Management Datafile//EN\" \"http://www.logiqx.com/Dats/datafile.dtd\">", "")
+                .replace("<datafile>", "<mame build=\"0.174\">")
+                .replace("</datafile>", "</mame>"),
+        );
+        let parsed = parse_mame_logiqx_datafile(&datafile, DatLimits::default())
+            .unwrap()
+            .dat;
+        let names: Vec<_> = parsed.games.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["005", "clone1"]);
+        assert_eq!(parsed.games[1].clone_of.as_deref(), Some("005"));
+        assert_eq!(
+            parsed.games[0]
+                .original_metadata
+                .fields
+                .get("driver.status")
+                .map(String::as_str),
+            Some("imperfect")
+        );
+        assert_eq!(parsed.games[1].disks.len(), 1);
+        let listxml = parse_mame_listxml(&as_listxml, DatLimits::default())
+            .unwrap()
+            .dat;
+        assert_eq!(parsed.games, listxml.games);
+    }
+
+    #[test]
+    fn listxml_entry_point_still_rejects_datafile_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "mame0174.dat", LOGIQX_MAME);
+        let err = parse_mame_listxml(&path, DatLimits::default()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Expected a MAME document root <mame>, found <datafile>"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn datafile_entry_point_rejects_incompatible_and_malformed_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "listxml.xml",
+                r#"<mame build="0.174"><machine name="a"/></mame>"#,
+                "found <mame>",
+            ),
+            (
+                "softlist.xml",
+                r#"<softwarelist name="x"/>"#,
+                "found <softwarelist>",
+            ),
+            (
+                "nested.xml",
+                r#"<datafile><datafile><machine name="a"/></datafile></datafile>"#,
+                "Nested MAME document root",
+            ),
+            (
+                "nested-mame.xml",
+                r#"<datafile><mame><machine name="a"/></mame></datafile>"#,
+                "Nested MAME document root",
+            ),
+            (
+                "deep.xml",
+                r#"<datafile><header><machine name="a"/></header></datafile>"#,
+                "direct child",
+            ),
+            (
+                "two.xml",
+                r#"<datafile><machine name="a"/></datafile><datafile/>"#,
+                "Multiple document roots",
+            ),
+            (
+                "text.xml",
+                r#"junk<datafile/>"#,
+                "outside the MAME document root",
+            ),
+        ];
+        for (name, body, expected) in cases {
+            let path = write(dir.path(), name, body);
+            let err = parse_mame_logiqx_datafile(&path, DatLimits::default()).unwrap_err();
+            assert!(err.to_string().contains(expected), "{name}: {err}");
+        }
+        let truncated = &LOGIQX_MAME[..LOGIQX_MAME.find("</datafile>").unwrap()];
+        let path = write(dir.path(), "truncated.xml", truncated);
+        assert!(parse_mame_logiqx_datafile(&path, DatLimits::default()).is_err());
     }
 
     #[test]

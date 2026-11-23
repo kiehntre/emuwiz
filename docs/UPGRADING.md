@@ -57,10 +57,14 @@ library look empty without deleting anything.
 ## The database
 
 The catalogue database upgrades forward only, in steps. The current schema is
-**26**; the `v0.9.0` tag used schema 16, so upgrading from it applies several
+**28**; the `v0.9.0` tag used schema 16, so upgrading from it applies several
 steps. Later versions may use a higher number.
 
-Starting EmuWiz only reads the database. If it is older than this version, the
+Starting EmuWiz does not upgrade the database. At schema 28, loading the library
+can save a Favourites or collection item against a game's new entry, but only
+when EmuWiz's own finished rename record proves the move
+([details](FAVOURITES_AND_COLLECTIONS.md)). If the database is older than this
+version, the
 app shows an **Outdated** state and does not change it. Upgrade it in the app
 from **All Tools > Database status > Scan and upgrade library**. A plain
 `emuwiz-cli library-scan` refuses an outdated database and does not upgrade it.
@@ -93,6 +97,26 @@ manifest (a list of what to back up). It does not copy files or change the
 database. Add `--json PATH` for a machine-readable report, or use
 `--config-root`, `--data-root`, `--legacy-config-root` and `--legacy-data-root`
 to inspect other locations. Run it with `--help` to see every option.
+
+### Schema 28: Favourites and collections
+
+Schema 28 adds two tables and changes nothing that already exists. It is still
+a one-way step, so choose when to take it:
+
+- It needs the explicit upgrade above. A build at schema 28 will not open a
+  schema 27 library until that has been done, and never does it by itself.
+- After the upgrade, every build made for schema 27 refuses the library. That
+  includes older installs and any build from a branch without this migration.
+- `emuwiz-cli library-upgrade --confirm` upgrades without scanning.
+  **Scan and upgrade library** also scans every game folder, so do not use it
+  while a drive, mount or migration is in doubt. The checks to run before and
+  after are in
+  [Upgrading a live library without a scan](FAVOURITES_AND_COLLECTIONS.md#upgrading-a-live-library-without-a-scan).
+
+The backup holds the whole library, so going back loses every later change to
+it, not only Favourites: scans, imports, metadata, verification results and more.
+What that involves is in
+[Favourites and collections](FAVOURITES_AND_COLLECTIONS.md#going-back-to-schema-27).
 
 ## Upgrade checklist
 

@@ -7,6 +7,7 @@ mod arcade_compat_panel;
 mod arcade_input_details;
 mod archive_inspector;
 mod artwork;
+mod artwork_fallback;
 mod backend;
 mod bezel;
 mod bezel_history;
@@ -16,11 +17,13 @@ mod browse_play;
 mod card_restore;
 mod cheat_extras_page;
 pub(crate) mod classic_trainers;
+mod collections;
 #[cfg(test)]
 mod dat_exact_tests;
 mod database_recovery;
 mod database_status_page;
 mod detail_identity;
+mod doctor_launch_check;
 mod documents;
 mod dreamcast_ipbin;
 mod duplicate_undo;
@@ -32,7 +35,10 @@ mod folder_check;
 mod game_dat_check;
 mod game_detail_blue;
 mod game_detail_facts;
+mod game_doctor;
 mod game_documents;
+mod game_recovery;
+mod game_rename;
 mod game_verification_guidance;
 #[cfg(test)]
 mod glyph_coverage_tests;
@@ -55,6 +61,7 @@ mod legacy;
 pub(crate) mod library;
 mod library_failure;
 mod library_reconciliation;
+mod library_selection;
 mod library_views_page;
 mod local_artwork_folders;
 mod mame_collection_health;
@@ -63,6 +70,7 @@ mod manual_viewer;
 mod media_sets;
 mod media_sets_tool;
 mod media_sources;
+mod memory_cards;
 mod missing_review;
 mod mod_discovery;
 mod mods;
@@ -76,11 +84,17 @@ mod nkit;
 mod onboarding;
 mod optical_compare;
 mod organisation;
+mod organise;
 mod osk;
 mod pad_mouse;
 mod pad_shell;
+#[cfg(target_os = "linux")]
+mod relocation_page;
+mod romm_title;
+mod saved_recheck;
 mod suggest;
 pub(crate) use pad_shell::mark_secret;
+mod amiga_hdf_storage;
 mod pages;
 mod patch_composition;
 mod patch_package_preview;
@@ -93,6 +107,7 @@ mod psp_iso_analyser;
 mod quarantine_confirm;
 mod quarantine_outcome;
 mod r2_rename;
+mod recently_played;
 mod recording_integrity;
 #[cfg(test)]
 mod retroarch_journey_tests;
@@ -100,15 +115,19 @@ mod romm_library;
 mod routes;
 mod saturn_manifest;
 mod save_compatibility;
+mod save_continuity_page;
 mod save_snapshots;
 mod save_state_guidance;
 mod saves_states;
+mod scan_history;
 #[cfg(test)]
 mod scummvm_journey_tests;
+mod session_tracking;
 mod setup_portability;
 #[cfg(test)]
 #[path = "tests/shared_scroll.rs"]
 mod shared_scroll_tests;
+mod shortcuts;
 mod simple_shell;
 mod single_file_restore;
 mod source_impact;
@@ -346,6 +365,8 @@ enum CanonicalOrganisationJobKind {
     Preview,
     Apply,
     Rollback,
+    /// Re-read and re-walk the configured source folders (read-only).
+    Rescan,
 }
 
 #[derive(Clone, Debug)]
@@ -370,6 +391,8 @@ pub(super) struct App {
     library: SharedLibrary,
     indices: Vec<usize>,
     filter: Filter,
+    collections: collections::State,
+    game_rename: game_rename::State,
     filter_generation: u64,
     filter_inflight: bool,
     big_picture: Option<Box<big_picture::BigPicture>>,
@@ -383,12 +406,17 @@ pub(super) struct App {
     artwork: Artwork,
     imagery: imagery::Imagery,
     load_job: Option<u64>,
+    /// The `load_job` when it is a folder scan (a catalogue writer), so the
+    /// native Sources page refuses its own writers meanwhile (Night Watch S06-04).
+    scan_job: Option<u64>,
     artwork_job: Option<u64>,
     /// Picture totals for this session, shown on one grouped Activity entry.
     artwork_totals: activity::ArtworkTotals,
     index_job: Option<u64>,
     /// How many shelf cards Browse & Play draws, and the scope it was chosen for.
     browse_play: browse_play::BrowsePlayState,
+    /// Ctrl/Shift multi-select over the Library list (read-only bulk actions).
+    library_selection: library_selection::LibrarySelection,
     batch_selection: multi_selection::MultiSelection,
     batch_state: crate::screenscraper_batch_enrichment_page::ScreenScraperBatchState,
     batch_open: bool,
@@ -406,6 +434,7 @@ pub(super) struct App {
     moved_game: Option<i64>,
     review: identity_review_page::ReviewUi,
     game_dat_check: game_dat_check::State,
+    saved_recheck: saved_recheck::State,
     folder_check: folder_check::State,
     hasheous_check: hasheous_check::State,
     notice: Option<Notice>,
@@ -457,6 +486,8 @@ pub(super) struct App {
     discovery_import_history: history_discovery_import::State,
     database_recovery: database_recovery::State,
     duckstation_history: history_duckstation::State,
+    /// Home's "Continue playing" row, from RetroArch's own history.
+    recently_played: recently_played::State,
     canonical_organisation_generation: u64,
     canonical_organisation_history:
         Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
@@ -469,6 +500,8 @@ pub(super) struct App {
     welcome_dismissed: bool,
     beginner_hints_enabled: bool,
     doctor_platform: Option<String>,
+    /// Setup & Doctor's chosen game for its launch check.
+    doctor_picker: doctor_launch_check::Picker,
     guidance: guidance::GuidanceState,
     saves_states: saves_states::SavesStatesState,
     archive_inspector: archive_inspector::ArchiveInspectorPageState,
@@ -490,6 +523,7 @@ pub(super) struct App {
     document_cache: Option<(i64, std::path::PathBuf, Vec<documents::GameDocument>)>,
     document_refresh: game_documents::DocumentRefresh,
     setup_portability: setup_portability::SetupPortabilityState,
+    amiga_hdf_storage: amiga_hdf_storage::AmigaHdfStorageState,
     update_check: update_check::UpdateCheckState,
     missing: missing_review::MissingReviewState,
     equiv: equivalent_duplicates::EquivalentState,
@@ -513,6 +547,11 @@ impl App {
             library: Arc::new(Library::default()),
             indices: Vec::new(),
             filter: Filter::default(),
+            collections: collections::State::with_database(
+                archivefs_core::default_database_path().ok(),
+                context.clone(),
+            ),
+            game_rename: game_rename::State::default(),
             filter_generation: 0,
             filter_inflight: false,
             big_picture: None,
@@ -526,10 +565,12 @@ impl App {
             artwork: Artwork::start(context),
             imagery: imagery::Imagery::default(),
             load_job: None,
+            scan_job: None,
             artwork_job: None,
             artwork_totals: activity::ArtworkTotals::default(),
             index_job: None,
             browse_play: Default::default(),
+            library_selection: Default::default(),
             batch_selection: multi_selection::MultiSelection::with_limit(
                 archivefs_core::screenscraper_enrichment::MAX_EXPLICIT_BATCH_SIZE,
             ),
@@ -545,6 +586,7 @@ impl App {
             moved_game: None,
             review: Default::default(),
             game_dat_check: Default::default(),
+            saved_recheck: Default::default(),
             folder_check: Default::default(),
             hasheous_check: Default::default(),
             notice: None,
@@ -584,12 +626,16 @@ impl App {
             classic_trainers: classic_trainers::State::default(),
             recording_integrity: recording_integrity::State::default(),
             game_detail_facts: game_detail_facts::State::default(),
-            canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::load(),
+            // The candidate walk runs on the worker at the first Preview, never
+            // on the GUI thread at start-up (Night Watch S06-02).
+            canonical_organisation:
+                crate::rom_organisation_page::RomOrganisationPageState::load_deferred(),
             canonical_organisation_job: None,
             history_view: Default::default(),
             discovery_import_history: Default::default(),
             database_recovery: Default::default(),
             duckstation_history: Default::default(),
+            recently_played: Default::default(),
             canonical_organisation_generation: 0,
             canonical_organisation_history: Vec::new(),
             mods: ModsPageState::default(),
@@ -600,6 +646,7 @@ impl App {
             welcome_dismissed: false,
             beginner_hints_enabled: true,
             doctor_platform: None,
+            doctor_picker: Default::default(),
             guidance: guidance::GuidanceState::default(),
             saves_states: saves_states::SavesStatesState::default(),
             archive_inspector: archive_inspector::ArchiveInspectorPageState::default(),
@@ -620,6 +667,7 @@ impl App {
             document_cache: None,
             document_refresh: Default::default(),
             setup_portability: setup_portability::SetupPortabilityState::default(),
+            amiga_hdf_storage: amiga_hdf_storage::AmigaHdfStorageState::default(),
             update_check: update_check::UpdateCheckState::default(),
             missing: Default::default(),
             equiv: Default::default(),
@@ -794,8 +842,13 @@ impl App {
         // unreadable folders is "Needs attention",
         // never a plain success (Night Watch S06-06).
         let loaded = format!(
-            "{} games available to browse. Original game files were not changed.",
-            library.games.len()
+            "{} games available to browse. Original game files were not changed.{}",
+            library.games.len(),
+            library
+                .scan_note
+                .as_deref()
+                .map(|note| format!(" {note}"))
+                .unwrap_or_default()
         );
         match &library.scan_warning {
             Some(warning) => {
@@ -809,6 +862,7 @@ impl App {
             None => self.activity.finish(id, loaded, None),
         }
         self.library = library;
+        self.collections.library_changed(&self.library);
         self.recording_integrity.clear();
         // Remembered pages may name a game by an older catalogue
         // entry; point them at the current copy.
@@ -855,9 +909,17 @@ impl App {
             });
             return;
         }
+        // So does a Sources-page action on the embedded native app (Night Watch S06-04).
+        if scan && self.native_catalogue_writer_busy() {
+            self.notice = Some(Notice {
+                message: "A Sources action is still running. Scan again when it has finished; nothing was started.".into(),
+                technical: "Refused: the native Sources page holds the catalogue writer.".into(),
+            });
+            return;
+        }
         let id = self.activity.queue(
             if scan {
-                "Scanning your game folders"
+                scan_history::SCAN_JOB_TITLE
             } else {
                 "Loading your library"
             },
@@ -865,7 +927,29 @@ impl App {
             false,
         );
         self.load_job = Some(id);
-        self.send(id, Command::Load { scan });
+        self.scan_job = scan.then_some(id);
+        if scan && let Some(workflows) = &mut self.native_workflows {
+            // Close the one-frame window before the next per-frame sync.
+            workflows.app.external_catalogue_writer_busy = true;
+        }
+        if !self.send(id, Command::Load { scan }) {
+            // load_job keeps its existing contract (the refused job stays
+            // recorded, as the disconnected-backend tests rely on). Only the
+            // scan state added for the writer gate is released, so a refused
+            // scan cannot hold the native Sources writers forever.
+            self.scan_job = None;
+            if let Some(workflows) = &mut self.native_workflows {
+                workflows.app.external_catalogue_writer_busy = false;
+            }
+        }
+    }
+    /// Whether the embedded native app is writing the catalogue (a Sources
+    /// action, an alias or platform change, a missing-entry removal, or a
+    /// database load). Blue's own scan must not start meanwhile.
+    fn native_catalogue_writer_busy(&self) -> bool {
+        self.native_workflows
+            .as_ref()
+            .is_some_and(|workflows| !workflows.app.native_writers_idle())
     }
     fn refresh_environment(&mut self, context: &egui::Context) {
         if self.environment_job.is_some() {
@@ -946,6 +1030,17 @@ impl App {
         self.saves_states.single_file.job = Some(id);
         if !self.send(id, Command::SingleFileRestore(Box::new(job))) {
             self.saves_states.single_file.job = None;
+        }
+    }
+    /// Records how a save, card or snapshot step ended. A refused or failed
+    /// step is "Needs attention" in Activity and Home, never a green
+    /// "Finished": the message is what the person was shown inline.
+    fn settle_save_step(&mut self, id: u64, message: String, ok: bool) {
+        if ok {
+            self.activity.finish(id, message, None);
+        } else {
+            self.activity
+                .settle(id, message.clone(), activity::Settled::Failed(message));
         }
     }
     fn start_saves_inventory(&mut self) {
@@ -1134,6 +1229,7 @@ impl App {
             simple_shell: self.simple.enabled,
             classic_view: !self.simple.enabled,
             ui_scale: self.simple.ui_scale,
+            collection_sort: self.collections.sort,
         }
     }
 
@@ -1158,6 +1254,7 @@ impl App {
                 self.router.current = preferences.route;
             }
             self.filter = preferences.filter;
+            self.collections.sort = preferences.collection_sort;
             self.filter_dirty = Some(Instant::now());
         }
         self.preferences_restored = true;
@@ -1336,6 +1433,7 @@ impl App {
                 CanonicalOrganisationJobKind::Preview => "Planning verified-game organisation",
                 CanonicalOrganisationJobKind::Apply => "Organising verified games",
                 CanonicalOrganisationJobKind::Rollback => "Undoing game organisation",
+                CanonicalOrganisationJobKind::Rescan => "Finding your game files",
             },
             Route::Section(Section::Build),
             match kind {
@@ -1345,6 +1443,8 @@ impl App {
                 CanonicalOrganisationJobKind::Apply => activity::CancelPolicy::AfterCurrentStep,
                 // Undo must run to the end so the library is left consistent.
                 CanonicalOrganisationJobKind::Rollback => activity::CancelPolicy::NotCancellable,
+                // A bounded read-only walk; it finishes on its own.
+                CanonicalOrganisationJobKind::Rescan => activity::CancelPolicy::NotCancellable,
             },
         );
         let cancel = self.job_cancel_flag(id);
@@ -1472,6 +1572,9 @@ impl App {
                     CanonicalOrganisationJobKind::Preview => {
                         "The organisation preview could not be completed. Nothing was changed."
                     }
+                    CanonicalOrganisationJobKind::Rescan => {
+                        "The source folders could not be re-scanned. Nothing was changed."
+                    }
                     CanonicalOrganisationJobKind::Apply if new_transaction.is_some() => {
                         "The organisation stopped before finishing. Some changes may have been made; Undo is available on this page and History records it for review."
                     }
@@ -1499,7 +1602,44 @@ impl App {
                 "Organisation preview ready. Review every move, rename, link and blocker before confirming.".into(),
                 None,
             );
+        } else if kind == CanonicalOrganisationJobKind::Rescan {
+            let incomplete = self.canonical_organisation.source_scan_incomplete().len();
+            if incomplete == 0 {
+                self.activity.finish(
+                    job.id,
+                    "Source folders re-scanned. Nothing was changed.".into(),
+                    None,
+                );
+            } else {
+                self.activity.finish(
+                    job.id,
+                    format!("Source folders re-scanned, but the scan stopped early ({incomplete} reason(s)). Apply stays off until a complete scan. Nothing was changed."),
+                    Some(self.canonical_organisation.source_scan_incomplete().join("; ")),
+                );
+            }
         } else if complete {
+            // Undoing one game's rename puts its old name back: its catalogue
+            // result is tied to the name, so that game is checked again.
+            if kind == CanonicalOrganisationJobKind::Rollback
+                && let Some(undone) = previous_transaction_id.as_deref().and_then(|id| {
+                    self.canonical_organisation_history
+                        .iter()
+                        .find(|item| item.transaction_id == id)
+                })
+                // The one library game (saves renamed with it have no row).
+                && let [entry] = undone
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.unknown.contains_key("organisation_catalogue_v1"))
+                    .collect::<Vec<_>>()
+                    .as_slice()
+            {
+                let restored = entry.source_path.clone();
+                let transaction_id = undone.transaction_id.clone();
+                self.start_rename_recheck(game_rename::RecheckTarget::Path(restored));
+                // The RomM title, if EmuWiz changed it for this rename.
+                self.start_romm_title(romm_title::RommTitleAction::AfterUndo { transaction_id });
+            }
             self.activity.finish(
                 job.id,
                 match kind {
@@ -1902,6 +2042,8 @@ impl App {
         self.organisation.frontend_export.poll(context);
         self.artwork.begin_frame(context);
         self.imagery.begin_frame(context);
+        let library = self.library.clone();
+        self.collections.poll(&library);
         for _ in 0..32 {
             let Ok(event) = self.backend.rx.try_recv() else {
                 break;
@@ -1913,6 +2055,7 @@ impl App {
                     let was_load_job = self.load_job == Some(id);
                     if was_load_job {
                         self.load_job = None;
+                        self.scan_job = None;
                     }
                     if self.problem_summary_job == Some(id) {
                         self.problem_summary_job = None;
@@ -1993,12 +2136,13 @@ impl App {
                                     );
                                 }
                                 Payload::SingleFileRestore(outcome) => {
-                                    let message = single_file_restore::receive(self, id, *outcome);
-                                    self.activity.finish(id, message, None);
+                                    let (message, ok) =
+                                        single_file_restore::receive(self, id, *outcome);
+                                    self.settle_save_step(id, message, ok);
                                 }
                                 Payload::CardRestore(outcome) => {
-                                    let message = card_restore::receive(self, id, *outcome);
-                                    self.activity.finish(id, message, None);
+                                    let (message, ok) = card_restore::receive(self, id, *outcome);
+                                    self.settle_save_step(id, message, ok);
                                 }
                                 Payload::SaveSnapshotCreated { result } => {
                                     let panel = &mut self.saves_states.snapshots;
@@ -2015,7 +2159,7 @@ impl App {
                                         Err(error) => error.clone(),
                                     };
                                     panel.feedback = Some((result.is_ok(), message.clone()));
-                                    self.activity.finish(id, message, None);
+                                    self.settle_save_step(id, message, result.is_ok());
                                 }
                                 Payload::Library(library) => {
                                     self.library_loaded(id, library);
@@ -2123,6 +2267,9 @@ impl App {
                                 Payload::MissingApplied(result) => self.missing_apply_done(*result),
                                 Payload::MissingUndone(restored) => {
                                     self.missing_undo_done(restored)
+                                }
+                                Payload::MissingReceipts(receipts) => {
+                                    self.missing_receipts_loaded(receipts)
                                 }
                                 Payload::Preferences(preferences) => {
                                     self.restore_preferences(preferences)
@@ -2249,6 +2396,9 @@ impl App {
                             if self.saves_states.card_restore.job == Some(id) {
                                 card_restore::job_failed(self, &error);
                             }
+                            if self.saves_states.single_file.job == Some(id) {
+                                single_file_restore::job_failed(self, &error);
+                            }
                             if self.saves_states.snapshots.create_job == Some(id) {
                                 self.saves_states.snapshots.create_job = None;
                                 self.saves_states.snapshots.loaded_for = None;
@@ -2267,6 +2417,10 @@ impl App {
                             }
                             if self.missing.job == Some(id) {
                                 self.missing_failed(&error);
+                            }
+                            if id == 0 && self.missing.receipts_inflight {
+                                // Untracked jobs share id 0; the flag says ours was out.
+                                self.missing_receipts_failed();
                             }
                             if self.equiv.job == Some(id) {
                                 self.equivalent_failed(&error);
@@ -2510,9 +2664,31 @@ impl eframe::App for App {
         // A finished one-game check saves new evidence even when its page is
         // no longer showing; reload so Game Details reads it.
         self.game_dat_check.poll();
+        self.poll_rename_recheck();
+        self.poll_romm_title();
+        self.saved_recheck.poll();
         self.folder_check.poll();
+        self.folder_check.organise.poll();
+        if self.load_job.is_none() && self.folder_check.organise.take_library_changed() {
+            // Moved games have new paths: reload, and check again from fresh.
+            reload_library = true;
+            self.folder_check.ran = false;
+            self.folder_check.findings.clear();
+            self.folder_check.unknown.clear();
+            self.folder_check.candidates.clear();
+            self.folder_check.next = 0;
+            // Picked folders and sets were part of that run.
+            self.folder_check.picked_files.clear();
+            self.folder_check.picked_folders.clear();
+        }
         self.hasheous_check.poll();
         if self.load_job.is_none() && self.game_dat_check.take_saved() {
+            reload_library = true;
+        }
+        if self.load_job.is_none() && self.saved_recheck.take_saved() {
+            reload_library = true;
+        }
+        if self.load_job.is_none() && std::mem::take(&mut self.game_rename.reload_pending) {
             reload_library = true;
         }
         if reload_library {
@@ -2523,7 +2699,7 @@ impl eframe::App for App {
         }
         self.poll(ui.ctx());
         self.note_window_resize(ui.ctx());
-        self.show(ui.ctx());
+        self.show_with_shortcuts(ui.ctx());
         self.simple.paint_focus_ring(ui.ctx());
         self.finish_frame();
     }

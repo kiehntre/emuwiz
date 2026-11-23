@@ -197,9 +197,20 @@ fn native_files(
     if header.len() < 12 {
         return Err("Flycast executable header is truncated".into());
     }
-    if &header[..4] != b"\x7fELF" || &header[8..10] == b"AI" {
+    // A native ELF build or the official type-2 Flycast AppImage (itself an
+    // ELF that uses the same native XDG roots). Shell wrappers and any other
+    // AppImage flavour are refused.
+    let named_flycast_appimage = request
+        .expected_executable
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|n| n.starts_with("flycast") && n.ends_with(".appimage"));
+    if &header[..4] != b"\x7fELF"
+        || (&header[8..10] == b"AI" && !(named_flycast_appimage && header[10] == 2))
+    {
         return Err(
-            "Only a native ELF Flycast executable is supported; wrappers and AppImages are refused"
+            "Only a native ELF Flycast executable or the official Flycast AppImage is supported; wrappers are refused"
                 .into(),
         );
     }

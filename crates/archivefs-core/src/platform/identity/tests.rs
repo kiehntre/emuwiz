@@ -180,10 +180,48 @@ fn agreeing_dat_and_romm_resolve_once_and_retain_both_sources() {
 }
 
 #[test]
-fn conflicting_dat_and_romm_require_review() {
-    let resolution = resolve_platform_identity(GENERATION, [dat("PSX"), romm("PSP")]);
+fn a_verified_dat_platform_outranks_conflicting_romm_metadata() {
+    // In either order: RomM is external metadata, the DAT verification is
+    // EmuWiz's own exact evidence.
+    for evidence in [[dat("PSX"), romm("PSP")], [romm("PSP"), dat("PSX")]] {
+        let resolution = resolve_platform_identity(GENERATION, evidence);
+        let (platform, evidence) = resolved(&resolution);
+        assert_eq!(platform, "PSX");
+        assert!(
+            evidence
+                .iter()
+                .all(|item| item.source == PlatformIdentitySource::VerifiedDat),
+            "the disagreeing RomM record is not part of the answer: {evidence:?}"
+        );
+    }
+    // Manual still outranks both.
+    let manual = PlatformIdentityEvidence::manual("PSP", GENERATION).unwrap();
+    let resolution = resolve_platform_identity(GENERATION, [manual, dat("PSX"), romm("PSP")]);
+    assert_eq!(resolution.platform(), Some("PSP"));
+}
+
+#[test]
+fn without_a_dat_verification_conflicting_evidence_still_needs_review() {
+    // Two DATs disagreeing: no current, unambiguous verification, so RomM
+    // does not settle it either.
+    let resolution = resolve_platform_identity(GENERATION, [dat("PSX"), dat("PSP"), romm("PSP")]);
     assert!(resolution.is_conflict());
-    assert_eq!(resolution.platform(), None);
+    // A non-exact DAT verdict is not evidence at all, so RomM stands alone
+    // and strong local evidence against it still needs review.
+    let probable = PlatformIdentityEvidence::from_verified_dat(
+        &dat_outcome(
+            Some("PSX"),
+            AuditVerdict::Probable {
+                game_name: "Game".to_string(),
+                rom_name: "Game.cso".to_string(),
+            },
+        ),
+        Path::new("/library/Game.cso"),
+        GENERATION,
+    );
+    assert!(probable.is_none());
+    let resolution = resolve_platform_identity(GENERATION, [strong("PSX"), romm("PSP")]);
+    assert!(resolution.is_conflict());
 }
 
 #[test]

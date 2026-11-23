@@ -198,8 +198,34 @@ impl LaunchCandidate {
         match self.readiness {
             LaunchReadiness::Ready => self.warnings.is_empty(),
             LaunchReadiness::ReadyWithWarnings => {
+                // A save-folder warning alone never withdraws Play (owner
+                // decision 2026-11-13): judge the rest exactly as if it were
+                // absent, so it cannot hide or add any other condition.
+                let others: Vec<&LaunchWarning> = self
+                    .warnings
+                    .iter()
+                    .filter(|w| w.kind != LaunchWarningKind::RetroArchSaveDirectoryUnusable)
+                    .collect();
+                if others.is_empty() {
+                    return !self.warnings.is_empty();
+                }
+                // The firmware warning needs unverified-but-present firmware
+                // behind it. Without it (the identity warning on its own) the
+                // firmware must already be fine: never missing or unknown.
+                let firmware_warned = self
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.kind == LaunchWarningKind::FirmwarePresentUnverified);
+                let firmware_ok = if firmware_warned {
+                    self.firmware == FirmwareReadiness::PresentUnverified
+                } else {
+                    matches!(
+                        self.firmware,
+                        FirmwareReadiness::NotRequired | FirmwareReadiness::Verified
+                    )
+                };
                 !self.warnings.is_empty()
-                    && self.firmware == FirmwareReadiness::PresentUnverified
+                    && firmware_ok
                     && self
                         .warnings
                         .iter()
@@ -424,6 +450,15 @@ fn build_standalone_candidates(
     profiles
         .iter()
         .filter(|profile| compat.standalone_adapters.contains(&profile.adapter_id))
+        // Native Atari800 is given `.atr` disks only; for any other Atari
+        // 8-bit format it is not a route at all, ready or blocked.
+        .filter(|profile| {
+            profile.adapter_id != "atari800"
+                || content.resolved_path.as_deref().is_some_and(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("atr"))
+                })
+        })
         .map(|profile| {
             let mut blockers = Vec::new();
             let mut warnings = Vec::new();
@@ -461,6 +496,17 @@ struct RetroArchCoreMatch {
     profile: ProfileRef,
     core_stem: String,
     info: CoreInfoFinding,
+}
+
+/// Whether any installed RetroArch core in `environment` resolves to
+/// `platform_id` - the route an unidentified game's one-time try or
+/// remembered launch choice can use. Says nothing about firmware, content or
+/// any other check, which the plan still performs.
+pub fn retroarch_core_installed_for(
+    platform_id: &str,
+    environment: &RetroArchEnvironmentReport,
+) -> bool {
+    !matching_retroarch_cores(platform_id, environment).is_empty()
 }
 
 fn matching_retroarch_cores(
@@ -515,13 +561,130 @@ fn psx_chd_content(content: &LaunchContentRef) -> bool {
         })
 }
 
+/// Drops cores whose own `.info` does not list the content's file extension,
+/// but only when at least one matching core does. A core that cannot open the
+/// file is never a valid "second choice" (and made unrelated cores look like
+/// an ambiguity: `.fds` on an install whose only FDS-capable core is Mesen),
+/// while unusual containers nothing lists (for example ZIP) are untouched.
+fn narrow_cores_by_extension(matches: &mut Vec<RetroArchCoreMatch>, content: &LaunchContentRef) {
+    let Some(extension) = content
+        .resolved_path
+        .as_deref()
+        .and_then(|path| path.extension())
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+    else {
+        return;
+    };
+    // RetroArch extracts archives for cores that never list them, so an
+    // archive extension says nothing about which core can play the game.
+    if matches!(extension.as_str(), "zip" | "7z") {
+        return;
+    }
+    let supports = |info: &CoreInfoFinding| match info {
+        CoreInfoFinding::Found {
+            supported_extensions,
+            ..
+        } => {
+            supported_extensions.is_empty()
+                || supported_extensions
+                    .iter()
+                    .any(|listed| listed.eq_ignore_ascii_case(&extension))
+        }
+        _ => true,
+    };
+    if matches.iter().any(|m| supports(&m.info)) {
+        matches.retain(|m| supports(&m.info));
+    }
+}
+
+/// Readiness reflects the last RetroArch scan, so every save-folder finding
+/// says how to re-check after a fix (owner decision 2026-11-13).
+pub const RETROARCH_RECHECK_HINT: &str =
+    "After fixing this folder or changing RetroArch settings, refresh RetroArch to check again.";
+
+/// Visible warnings for the save-file/save-state folders a launch of
+/// `found` would use: the core's per-core override value when it sets one,
+/// otherwise `retroarch.cfg`'s. Folders that are usable, or that RetroArch
+/// leaves at its own default, produce nothing.
+fn retroarch_save_directory_warnings(
+    environment: &RetroArchEnvironmentReport,
+    found: &RetroArchCoreMatch,
+) -> Vec<LaunchWarning> {
+    use crate::emulator_environment::retroarch::{PathPurpose, SaveDirectoryStatus};
+    let Some(profile) = environment.profiles.iter().find(|profile| {
+        profile.profile_kind == found.profile.profile_kind && profile.scope == found.profile.scope
+    }) else {
+        return Vec::new();
+    };
+    let core_name = match &found.info {
+        CoreInfoFinding::Found { core_name, .. } => core_name.as_deref(),
+        _ => None,
+    };
+    let mut warnings = Vec::new();
+    for purpose in [PathPurpose::Saves, PathPurpose::SaveStates] {
+        let of = |name: Option<&str>| {
+            profile
+                .save_directories
+                .iter()
+                .find(|f| f.purpose == purpose && f.core_name.as_deref() == name)
+        };
+        let Some(finding) = core_name
+            .and_then(|name| of(Some(name)))
+            .or_else(|| of(None))
+        else {
+            continue;
+        };
+        let (what, menu, at_risk) = if purpose == PathPurpose::Saves {
+            ("save-file folder", "Save Files", "In-game progress")
+        } else {
+            ("save-state folder", "Save States", "Save states")
+        };
+        let source = match &finding.core_name {
+            Some(core) => format!("the {core} core override {}", finding.settings_file.display),
+            None => format!("RetroArch's settings {}", finding.settings_file.display),
+        };
+        let key = finding.config_key;
+        let folder = finding
+            .directory
+            .as_ref()
+            .map_or_else(String::new, |dir| format!(" {}", dir.display));
+        let fix =
+            format!("choose an existing folder in RetroArch under Settings > Directory > {menu}");
+        let detail = match finding.status {
+            SaveDirectoryStatus::Usable => continue,
+            SaveDirectoryStatus::Missing => format!(
+                "RetroArch's {what}{folder} (`{key}` in {source}) does not exist. RetroArch ignores a missing folder and writes beside the game file instead, where saves may be lost or not found. Create the folder, or {fix}."
+            ),
+            SaveDirectoryStatus::NotADirectory => format!(
+                "RetroArch's {what}{folder} (`{key}` in {source}) is not a folder, so RetroArch ignores it and writes beside the game file instead. Remove or rename what is there and create the folder, or {fix}."
+            ),
+            SaveDirectoryStatus::Symlink => format!(
+                "RetroArch's {what}{folder} (`{key}` in {source}) is a symbolic link, which EmuWiz does not follow, so it cannot confirm saves will be kept. Point the setting at the real folder, or {fix}."
+            ),
+            SaveDirectoryStatus::NotWritable => format!(
+                "RetroArch's {what}{folder} (`{key}` in {source}) cannot be written by your user account, so RetroArch cannot store saves there. Give your account write permission on the folder, or {fix}."
+            ),
+            SaveDirectoryStatus::Uncheckable => format!(
+                "EmuWiz could not check RetroArch's {what}{folder} (`{key}` in {source}), so it cannot confirm saves will be kept. Make sure the setting names an existing folder you can write to, or {fix}."
+            ),
+        };
+        warnings.push(LaunchWarning::new(
+            LaunchWarningKind::RetroArchSaveDirectoryUnusable,
+            format!("{at_risk} may fail to save. {detail} {RETROARCH_RECHECK_HINT}"),
+        ));
+    }
+    warnings
+}
+
 fn build_retroarch_candidates(
     platform_id: &'static str,
     content: &LaunchContentRef,
     environment: &RetroArchEnvironmentReport,
     core_hints: &[&'static str],
 ) -> Vec<LaunchCandidate> {
-    let matches = matching_retroarch_cores(platform_id, environment);
+    let mut matches = matching_retroarch_cores(platform_id, environment);
+    narrow_cores_by_extension(&mut matches, content);
     if matches.is_empty() {
         return Vec::new();
     }
@@ -532,11 +695,14 @@ fn build_retroarch_candidates(
     // (ranking only - it never decided the platform, only which
     // already-valid core to prefer); otherwise automatic selection would
     // be unsafe and every tied candidate is blocked as ambiguous.
-    let hinted: Vec<String> = distinct_stems
+    // `core_hints` is an ordered, reviewed preference: the first named core
+    // that is actually installed wins. (Every platform but NES names exactly
+    // one core, so this is the same rule as before for them.)
+    let hinted: Vec<String> = core_hints
         .iter()
-        .filter(|stem| core_hints.contains(&stem.as_str()))
-        .cloned()
-        .collect();
+        .find(|hint| distinct_stems.contains(**hint))
+        .map(|hint| vec![(*hint).to_string()])
+        .unwrap_or_default();
     let ambiguous = distinct_stems.len() > 1 && hinted.len() != 1;
 
     matches
@@ -569,6 +735,7 @@ fn build_retroarch_candidates(
                     ),
                 ));
             }
+            warnings.extend(retroarch_save_directory_warnings(environment, &found));
             if retroarch_chd_support_unconfirmed(platform_id, &found.core_stem, content) {
                 warnings.push(LaunchWarning::new(
                     LaunchWarningKind::RetroArchChdSupportUnconfirmed,
@@ -600,6 +767,11 @@ fn build_retroarch_candidates(
         })
         .collect()
 }
+
+/// Standalone adapters added beside an already working route for the same
+/// platform. Becoming ready must never take over (or stall) the Play action
+/// of a game that another emulator already starts: see `apply_preference`.
+const OPT_IN_STANDALONE_ADAPTERS: &[&str] = &["atari800"];
 
 /// Applies remembered-profile preference to standalone candidates, and
 /// surfaces [`LaunchWarningKind::MultipleEligibleProfiles`] when more than
@@ -640,6 +812,47 @@ fn apply_preference(candidates: &mut [LaunchCandidate], remembered: &[Remembered
         candidates[index].preference = CandidatePreference::Remembered;
         return;
     }
+
+    // Opt-in native routes never compete for the automatic choice. A game
+    // that already has another ready route keeps it for Play; the native
+    // route stays an explicit choice ("Use once" / a saved default), and it
+    // becomes the automatic route only when there is no other route.
+    let opt_in = |candidate: &LaunchCandidate| {
+        matches!(
+            &candidate.target,
+            LaunchTarget::Standalone { adapter_id, .. }
+                if OPT_IN_STANDALONE_ADAPTERS.contains(adapter_id)
+        )
+    };
+    // "Another route" is one that is ready, or one that only waits for the
+    // person to pick between tied RetroArch cores. That tie is a question for
+    // the person: a ready native route must not answer it by default.
+    let waits_for_core_choice = |candidate: &LaunchCandidate| {
+        !candidate.blockers.is_empty()
+            && candidate
+                .blockers
+                .iter()
+                .all(|blocker| blocker.kind == LaunchBlockerKind::AmbiguousCore)
+    };
+    let another_route = candidates.iter().any(|candidate| {
+        !opt_in(candidate)
+            && (candidate.readiness != LaunchReadiness::Blocked || waits_for_core_choice(candidate))
+    });
+    let eligible_indices: Vec<usize> = if another_route {
+        eligible_indices
+            .into_iter()
+            .filter(|&index| {
+                if opt_in(&candidates[index]) {
+                    candidates[index].preference = CandidatePreference::Undetermined;
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect()
+    } else {
+        eligible_indices
+    };
 
     // PlayStation CHD content: prefer the route with the strongest CHD
     // evidence, but only when that route can really start. Tier 0 is a known
@@ -788,7 +1001,6 @@ pub fn build_launch_plan(
         };
     };
 
-    let compat = launch_compatibility_for_platform(&resolved.platform_id);
     let mut candidates =
         build_standalone_candidates(&resolved.platform_id, content, standalone_profiles);
 
@@ -797,9 +1009,7 @@ pub fn build_launch_plan(
             platform.id,
             content,
             retroarch,
-            compat
-                .map(|entry| entry.retroarch_core_hints)
-                .unwrap_or(&[]),
+            crate::launch::platform_map::retroarch_launch_core_hints(&resolved.platform_id),
         ));
     }
 
@@ -923,5 +1133,91 @@ mod missing_firmware_detail_tests {
             missing_firmware_detail(&info),
             "required firmware/BIOS is missing: scph5500.bin, scph5501.bin, scph5502.bin"
         );
+    }
+}
+
+#[cfg(test)]
+mod identity_unverified_eligibility_tests {
+    use super::*;
+    use crate::launch::readiness::{LaunchWarning, LaunchWarningKind};
+
+    fn candidate(
+        firmware: FirmwareReadiness,
+        readiness: LaunchReadiness,
+        warnings: Vec<LaunchWarning>,
+    ) -> LaunchCandidate {
+        LaunchCandidate {
+            target: LaunchTarget::Standalone {
+                adapter_id: "fixture",
+                profile_id: "fixture".into(),
+                profile_path: None,
+            },
+            content: LaunchContentRef {
+                kind: None,
+                container: Some(LaunchContainerKind::PlainFile),
+                resolved_path: Some("/g/game.tap".into()),
+                requires_mount: false,
+                provenance: "fixture".into(),
+            },
+            firmware,
+            blockers: vec![],
+            warnings,
+            readiness,
+            preference: CandidatePreference::SoleEligible,
+        }
+    }
+
+    fn warn(kind: LaunchWarningKind) -> LaunchWarning {
+        LaunchWarning::new(kind, "fixture")
+    }
+
+    #[test]
+    fn the_identity_warning_alone_permits_retroarch_play_without_firmware() {
+        let identity = candidate(
+            FirmwareReadiness::NotRequired,
+            LaunchReadiness::ReadyWithWarnings,
+            vec![warn(LaunchWarningKind::IdentityUnverified)],
+        );
+        assert!(identity.retroarch_play_eligible());
+        // A blocker always wins.
+        let mut blocked = identity.clone();
+        blocked.blockers.push(LaunchBlocker::new(
+            LaunchBlockerKind::ContentNotResolved,
+            "fixture",
+        ));
+        assert!(!blocked.retroarch_play_eligible());
+        // The identity warning never waives missing or unknown firmware.
+        for firmware in [FirmwareReadiness::Missing, FirmwareReadiness::Unknown] {
+            let c = candidate(
+                firmware,
+                LaunchReadiness::ReadyWithWarnings,
+                vec![warn(LaunchWarningKind::IdentityUnverified)],
+            );
+            assert!(!c.retroarch_play_eligible(), "{firmware:?}");
+        }
+    }
+
+    #[test]
+    fn firmware_and_other_warnings_keep_their_existing_rules() {
+        // Firmware warning still needs present-but-unverified firmware.
+        let firmware = |fw| {
+            candidate(
+                fw,
+                LaunchReadiness::ReadyWithWarnings,
+                vec![warn(LaunchWarningKind::FirmwarePresentUnverified)],
+            )
+        };
+        assert!(firmware(FirmwareReadiness::PresentUnverified).retroarch_play_eligible());
+        assert!(!firmware(FirmwareReadiness::NotRequired).retroarch_play_eligible());
+        // Identity warning combined with any non-allow-listed warning withdraws Play.
+        let mixed = candidate(
+            FirmwareReadiness::NotRequired,
+            LaunchReadiness::ReadyWithWarnings,
+            vec![
+                warn(LaunchWarningKind::IdentityUnverified),
+                warn(LaunchWarningKind::MultipleEligibleProfiles),
+            ],
+        );
+        assert!(!mixed.retroarch_play_eligible());
     }
 }

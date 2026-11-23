@@ -318,6 +318,7 @@ fn captured(
     modified_unix: Option<u64>,
 ) -> CapturedFileIdentity {
     CapturedFileIdentity {
+        changed: None,
         device,
         inode,
         size,
@@ -467,6 +468,7 @@ fn observed_fact(
 
 fn captured_at(device: u64, inode: u64, size: u64, modified: Duration) -> CapturedFileIdentity {
     CapturedFileIdentity {
+        changed: None,
         device,
         inode,
         size,

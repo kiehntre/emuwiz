@@ -282,11 +282,34 @@ fn equivalent_names_for_one_machine_are_not_ambiguous() {
     );
 }
 
+/// Casio Loopy, Amstrad GX4000 and Philips Videopac joined the registry with
+/// loose `.bin` cartridge support (owner-approved): their own catalogues map
+/// to them, and their neighbours keep their existing mappings.
+#[test]
+fn newly_supported_cartridge_systems_map_to_themselves_only() {
+    assert_eq!(no_intro("Casio - Loopy"), games("CasioLoopy"));
+    assert_eq!(no_intro("Magnavox - Odyssey 2"), games("Videopac"));
+    assert_eq!(no_intro("Philips - Videopac"), games("Videopac"));
+    assert_eq!(tosec("Amstrad GX4000 - Games"), games("AmstradGX4000"));
+    // Neighbours are unchanged, never pulled onto the new systems.
+    assert_eq!(no_intro("Amstrad - CPC"), games("Amstrad CPC"));
+    for name in ["Magnavox - Odyssey", "Casio - PV-1000", "Philips - CD-i"] {
+        let recognition = no_intro(name);
+        assert!(
+            !matches!(
+                recognition.platform(),
+                Some("CasioLoopy" | "Videopac" | "AmstradGX4000")
+            ),
+            "{name}: {recognition:?}"
+        );
+    }
+}
+
 #[test]
 fn unsupported_systems_are_not_mapped_to_a_neighbour() {
     for name in [
         "Sony - PlayStation Mobile (PSN)",
-        "Casio - Loopy",
+        "Epoch - Super Cassette Vision",
         "Sega - SG-1000 - SC-3000",
         "Microsoft - Xbox One (Digital) (CDN)",
         "Totally Unknown Maker - Imaginary Console",
@@ -309,6 +332,101 @@ fn tosec_game_lists_are_recognised() {
         ("Acorn BBC - Games - [SSD]", "BBC Micro"),
     ] {
         assert_eq!(tosec(name), games(platform), "{name}");
+    }
+}
+
+#[test]
+fn tosec_game_lists_split_by_a_reviewed_genre_are_ordinary_game_lists() {
+    for (name, platform) in [
+        ("Commodore C64 - Games - Sports - [D64]", "Commodore 64"),
+        (
+            "Commodore C64 - Games - Shoot'em Up - [T64]",
+            "Commodore 64",
+        ),
+        ("Commodore C64 - Games - Misc - [CRT]", "Commodore 64"),
+        ("Commodore C64 - Games - Arcade", "Commodore 64"),
+        (
+            "Sinclair ZX Spectrum - Games - Adventure - [TZX]",
+            "ZX Spectrum",
+        ),
+        ("Commodore VIC20 - Games - [PRG] - Singlepart", "VIC-20"),
+        ("Commodore Amiga - Games - [ADF] - Multipart", "Amiga"),
+    ] {
+        assert_eq!(tosec(name), games(platform), "{name}");
+    }
+}
+
+#[test]
+fn tosec_headings_outside_the_reviewed_genres_stay_extras() {
+    for (name, platform, what) in [
+        (
+            "Commodore C64 - Games - Boulder Dash - [D64]",
+            "Commodore 64",
+            "Boulder Dash",
+        ),
+        (
+            "Commodore Amiga - Games - Emerald Mine",
+            "Amiga",
+            "Emerald Mine",
+        ),
+        (
+            "Atari ST - Games - Save Disks - [ST]",
+            "AtariST",
+            "Save Disks",
+        ),
+        (
+            "Commodore Amiga - Games - Public Domain - [EXE]",
+            "Amiga",
+            "Public Domain",
+        ),
+        (
+            "Commodore C128 - Games - CPM - [D71]",
+            "Commodore 128",
+            "CPM",
+        ),
+        // A genre followed by another heading narrows the list further.
+        (
+            "Commodore C64 - Games - Sports - Unreleased - [D64]",
+            "Commodore 64",
+            "Sports",
+        ),
+        // Exact text only: a differently written heading is not reviewed.
+        (
+            "Commodore C64 - Games - sports - [D64]",
+            "Commodore 64",
+            "sports",
+        ),
+        (
+            "Commodore C64 - Games - Shoot-em Up - [D64]",
+            "Commodore 64",
+            "Shoot-em Up",
+        ),
+    ] {
+        assert_eq!(
+            extras(&tosec(name), platform),
+            format!("\u{201c}{what}\u{201d}"),
+            "{name}"
+        );
+    }
+    // Compilations stay compilations even when split by genre.
+    assert_eq!(
+        extras(
+            &tosec("Commodore C64 - Compilations - Games - Sports - [D64]"),
+            "Commodore 64"
+        ),
+        "compilations"
+    );
+}
+
+#[test]
+fn a_reviewed_genre_never_makes_an_unsupported_system_usable() {
+    for name in [
+        "Commodore C64DTV - Games - Sports",
+        "Tandy Radio Shack TRS-80 Model 4 - Games - Arcade",
+        "Acorn Atom - Games - Adventure - [UEF]",
+    ] {
+        let recognition = tosec(name);
+        assert_eq!(recognition.safe_platform(), None, "{name}: {recognition:?}");
     }
 }
 
@@ -471,4 +589,24 @@ fn reviewed_tosec_names_with_two_spellings_stay_game_lists() {
     ] {
         assert_eq!(tosec(name), games(platform), "{name}");
     }
+}
+
+#[test]
+fn c16_and_plus4_catalogues_are_recognised_for_the_ted_machines_never_the_c64() {
+    for name in [
+        "Commodore C16, C116 & Plus-4 - Games - [PRG]",
+        "Commodore C16, C116 & Plus-4 - Games - [TAP]",
+    ] {
+        let recognition = tosec(name);
+        assert_eq!(recognition, games("Commodore 16"), "{name}");
+        assert!(recognition.is_for("Commodore 16"), "{name}");
+        assert!(recognition.is_for("Commodore Plus-4"), "{name}");
+        for other in ["Commodore 64", "VIC-20", "Commodore 128"] {
+            assert!(!recognition.is_for(other), "{name} must not be for {other}");
+        }
+    }
+    let plus4 = no_intro("Commodore - Plus-4");
+    assert_eq!(plus4, games("Commodore Plus-4"));
+    assert!(plus4.is_for("Commodore 16"));
+    assert!(!plus4.is_for("Commodore 64"));
 }

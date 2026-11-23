@@ -153,6 +153,7 @@ fn adapter_name(adapter_id: &str) -> &'static str {
         "dosbox" => "DOSBox",
         "dosbox-staging" => "DOSBox Staging",
         "stella" => "Stella",
+        "atari800" => "Atari800",
         "vice" => "VICE",
         "openmsx" => "openMSX",
         "fuse" => "Fuse",

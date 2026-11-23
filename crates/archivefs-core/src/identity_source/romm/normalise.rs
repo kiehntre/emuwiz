@@ -1036,10 +1036,26 @@ mod tests {
     }
 
     #[test]
-    fn c16_and_plus_four_slugs_remain_unresolved_without_canonical_rows() {
-        assert_eq!(canonical_platform_for_romm_slug("c16"), None);
-        assert_eq!(canonical_platform_for_romm_slug("c-plus-4"), None);
-        assert_eq!(canonical_platform_for_romm_slug("commodore-16"), None);
-        assert_eq!(canonical_platform_for_romm_slug("plus-4"), None);
+    fn c16_and_plus_four_slugs_resolve_to_their_own_systems_never_c64() {
+        assert_eq!(
+            canonical_platform_for_romm_slug("c16"),
+            Some("Commodore 16")
+        );
+        assert_eq!(
+            canonical_platform_for_romm_slug("commodore-16"),
+            Some("Commodore 16")
+        );
+        assert_eq!(
+            canonical_platform_for_romm_slug("c-plus-4"),
+            Some("Commodore Plus-4")
+        );
+        assert_eq!(
+            canonical_platform_for_romm_slug("plus-4"),
+            Some("Commodore Plus-4")
+        );
+        assert_eq!(
+            canonical_platform_for_romm_slug("c64"),
+            Some("Commodore 64")
+        );
     }
 }

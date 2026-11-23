@@ -142,6 +142,7 @@ impl LibraryViewPlanFilter {
                     | LibraryViewPlanAction::SkipMissingSourceArchive
                     | LibraryViewPlanAction::SkipInvalidPath
                     | LibraryViewPlanAction::SkipPreservationOnly
+                    | LibraryViewPlanAction::UserOwnedKept
             ),
         }
     }
@@ -561,5 +562,16 @@ impl ArchiveFsApp {
             }
         }
         context.request_repaint();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skip_filter_includes_user_owned_kept() {
+        assert!(LibraryViewPlanFilter::Skip.matches(LibraryViewPlanAction::UserOwnedKept));
+        assert!(!LibraryViewPlanFilter::Create.matches(LibraryViewPlanAction::UserOwnedKept));
     }
 }

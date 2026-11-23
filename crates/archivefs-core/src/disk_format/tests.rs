@@ -1980,9 +1980,10 @@ fn a_mega_drive_rom_is_still_confirmed_from_its_header() {
 /// records), 0019 (explicit ScreenScraper enrichment receipts), 0020 (media
 /// topology evidence), 0021 (physical MAME member evidence), 0022 (source
 /// scan coverage), 0023 (catalogue safety bindings), 0024 (source enablement), and 0025
-/// (discovery-import history for guarded Undo), and 0026 (DAT inventory digest) are already
-/// accounted for as legitimate
-/// unrelated additions.
+/// (discovery-import history for guarded Undo), 0026 (DAT inventory digest), and 0027
+/// (kept DAT evidence and re-check notes), 0028 (game collections), 0029
+/// (catalogue-set "listed in none" records) and 0030 (per-run skip-reason
+/// totals) are already accounted for as legitimate unrelated additions.
 #[test]
 fn the_database_schema_and_migrations_are_unchanged() {
     let versions = crate::database::migration_versions_for_tests();
@@ -1990,7 +1991,7 @@ fn the_database_schema_and_migrations_are_unchanged() {
         versions,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26
+            24, 25, 26, 27, 28, 29, 30
         ],
         "migrations must remain contiguous and registered"
     );

@@ -327,6 +327,25 @@ fn single_atari_2600_bin_member_is_verified_as_local_identity() {
 }
 
 #[test]
+fn headerless_nes_unh_member_is_staged_as_nes_with_bytes_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let rom: Vec<u8> = (0..32_768u32).map(|i| (i * 7) as u8).collect();
+    let zip = write_zip(
+        dir.path(),
+        "Homebrew.zip",
+        &[("Homebrew (World).unh", &rom)],
+    );
+    assert!(!refused(&inspect(&zip, "NES")));
+    #[cfg(unix)]
+    {
+        let staged = crate::zip_cartridge_stage::stage_zip_cartridge_for_launch(&zip, "NES")
+            .expect("stages");
+        assert_eq!(staged.path().file_name().unwrap(), "Homebrew (World).nes");
+        assert_eq!(fs::read(staged.path()).unwrap(), rom);
+    }
+}
+
+#[test]
 fn atari_2600_bin_zip_refusals_are_honest() {
     let dir = tempfile::tempdir().unwrap();
     for len in [0usize, 1, 1000, 1024, 2049, 4097, 10_494, 262_144 + 1024] {
@@ -499,7 +518,7 @@ fn both_zip_flows_recheck_freshness_only_through_the_safe_reopen() {
         ),
         (
             include_str!("../zip_cartridge_stage.rs"),
-            "pub fn stage_zip_cartridge_for_launch(",
+            "pub fn stage_zip_cartridge_for_launch_checked(",
         ),
     ] {
         let body = &source[source.find(start).expect(start)..];

@@ -4529,6 +4529,10 @@ fn plan_proposal(
         sanitisation_notes: Vec::new(),
         actionable: state == ProposalState::Suggested,
         audited_identity: None,
+        // Bound like a planner-built proposal: observed when the file exists.
+        audited_fingerprint: archivefs_core::identity_source::hashing::FileFingerprint::observe(
+            std::path::Path::new(source),
+        ),
         is_outer_archive: false,
     }
 }
@@ -6608,6 +6612,30 @@ fn redump_bios_enable_actions_configure_ps1_ps2_and_xbox_independently_and_persi
             .iter()
             .all(|row| row.configured)
     );
+}
+
+#[test]
+fn a_partial_tosec_pack_inventory_is_refused_and_nothing_is_saved() {
+    let fixture = Fixture::new();
+    let pack = fixture.dir("huge-tosec-pack");
+    for index in 0..=archivefs_core::dat::tosec_release_pack::MAX_PACK_DATS {
+        fixture.write(
+            &format!("huge-tosec-pack/D{index:05} - Games (TOSEC).dat"),
+            "x",
+        );
+    }
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::ImportTosecReleasePack { root: pack });
+
+    let view = page.view();
+    assert!(
+        view.tosec_packs.is_empty(),
+        "a partial inventory must not be saved"
+    );
+    let error = view.tosec_action_error.expect("the refusal must be shown");
+    assert!(error.starts_with("Nothing imported"), "{error}");
+    let reloaded = fixture.page();
+    assert!(reloaded.view().tosec_packs.is_empty());
 }
 
 #[test]

@@ -355,7 +355,7 @@ fn artwork_does_not_hide_a_missing_game_file_or_promote_a_stale_dat_match() {
     assert!(has(&strings, "Not found"), "{strings:?}");
     assert!(has(&strings, "The file was moved or removed"));
     assert!(
-        has(&strings, "Needs a recheck."),
+        has(&strings, "Not confirmed as current."),
         "a saved DAT match stays unconfirmed"
     );
     assert!(!has(&strings, "From the verified match"));

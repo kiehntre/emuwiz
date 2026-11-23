@@ -247,3 +247,89 @@ fn history_undo_of_an_unloaded_receipt_says_so() {
     let notice = app.history_view.notice.clone().unwrap();
     assert!(notice.contains("no longer loaded"), "{notice}");
 }
+
+#[test]
+fn partial_scan_warning_names_the_real_reason_not_a_disconnected_drive() {
+    use archivefs_core::{NestedMountOutcome, NestedMountState, ScanPersistSummary};
+    use std::path::PathBuf;
+    let mount = |path: &str, state, archives, detail: Option<&str>| NestedMountOutcome {
+        source: PathBuf::from("/games"),
+        path: PathBuf::from(path),
+        state,
+        archives,
+        detail: detail.map(str::to_string),
+    };
+    let warning = crate::gui_v2::backend::scan_warning_text;
+    let note = crate::gui_v2::backend::scan_mount_note;
+
+    // Every mount read and trusted: no warning, an informational count.
+    let healthy = ScanPersistSummary {
+        nested_mounts: vec![
+            mount(
+                "/games/gba/ratarmount",
+                NestedMountState::Verified,
+                1228,
+                None,
+            ),
+            mount(
+                "/games/psx/ratarmount",
+                NestedMountState::Restarted,
+                265,
+                None,
+            ),
+        ],
+        ..Default::default()
+    };
+    assert_eq!(warning(&healthy), None);
+    assert_eq!(
+        note(&healthy).as_deref(),
+        Some("Read 2 mounted archive folders (1493 games).")
+    );
+
+    // A new mount is read; missing games there wait for the next scan.
+    let new = ScanPersistSummary {
+        nested_mounts: vec![mount(
+            "/games/gba/ratarmount",
+            NestedMountState::New,
+            3,
+            None,
+        )],
+        ..Default::default()
+    };
+    assert_eq!(warning(&new), None);
+    assert!(note(&new).unwrap().contains("checked from the next scan"));
+
+    // An unreadable or vanished mount needs attention, with its reason.
+    let gone = ScanPersistSummary {
+        nested_mounts: vec![mount(
+            "/games/saturn/ratarmount",
+            NestedMountState::Unavailable,
+            0,
+            Some("not mounted now; its games were kept as they were"),
+        )],
+        ..Default::default()
+    };
+    let text = warning(&gone).unwrap();
+    assert!(
+        text.starts_with("1 mounted folder inside your game folders was not fully read"),
+        "{text}"
+    );
+    assert!(
+        text.contains("/games/saturn/ratarmount: not mounted now"),
+        "{text}"
+    );
+    assert!(text.contains("not marked missing"), "{text}");
+    assert!(!text.contains("Reconnect"), "{text}");
+
+    // A failed source folder keeps its own sentence.
+    let failed = ScanPersistSummary {
+        folder_errors: vec![(PathBuf::from("/games"), "source unavailable".into())],
+        ..Default::default()
+    };
+    assert!(
+        warning(&failed)
+            .unwrap()
+            .starts_with("1 game folder was not fully scanned.")
+    );
+    assert_eq!(warning(&ScanPersistSummary::default()), None);
+}

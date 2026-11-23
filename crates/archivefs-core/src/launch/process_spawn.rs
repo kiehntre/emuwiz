@@ -42,6 +42,44 @@ use std::time::{Duration, Instant, SystemTime};
 /// `run_command_os_with_timeout`).
 pub const PROCESS_STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
 
+/// How much of the *end* of a diagnostic capture is kept, in addition to
+/// the first [`PROCESS_STDERR_CAPTURE_LIMIT`] bytes. See
+/// [`OutputCapture::Diagnostic`].
+pub const DIAGNOSTIC_TAIL_CAPTURE_LIMIT: usize = 64 * 1024;
+
+/// Start of the one line a diagnostic capture inserts where it left output
+/// out. The line is `[emuwiz: N bytes of output omitted here]`.
+pub const OUTPUT_OMITTED_MARKER_PREFIX: &str = "[emuwiz: ";
+/// End of that line.
+pub const OUTPUT_OMITTED_MARKER_SUFFIX: &str = " bytes of output omitted here]";
+
+/// What is kept of a launched process's output. Whatever the choice, the
+/// output is always read to its end on a background thread, so a process
+/// that prints without limit is never blocked and never grows this
+/// process's memory past the stated bound. Nothing is written to disk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OutputCapture {
+    /// Standard output is discarded. The first
+    /// [`PROCESS_STDERR_CAPTURE_LIMIT`] bytes of standard error are kept.
+    /// This is what every launch did before diagnostic capture existed.
+    #[default]
+    StderrStart,
+    /// Standard output and standard error share one pipe, so what is kept
+    /// is in the order the program wrote it to that pipe (a program that
+    /// buffers its standard output writes those lines later than it
+    /// produced them). The first
+    /// [`PROCESS_STDERR_CAPTURE_LIMIT`] bytes and the last
+    /// [`DIAGNOSTIC_TAIL_CAPTURE_LIMIT`] bytes are kept: the start says how
+    /// the program came up, the end says how it went down. When output had
+    /// to be left out in between, both kept parts are cut back to whole
+    /// lines and a single marker line says how many bytes are missing.
+    ///
+    /// Best-effort: if the shared pipe cannot be created the launch goes
+    /// ahead and its output is handled exactly as
+    /// [`OutputCapture::StderrStart`].
+    Diagnostic,
+}
+
 /// Opens `path` for reading without ever blocking or following a link, and
 /// only if what was opened is a regular file.
 ///
@@ -77,12 +115,45 @@ pub fn open_regular_file_nonblocking(path: &Path) -> std::io::Result<fs::File> {
 /// `dolphin_local`'s `DolphinDirectoryIdentity`) - device/inode are the
 /// *only* platform-specific part (`0` on non-Unix, where they carry no
 /// comparable meaning), size and modification time are always real.
+///
+/// `changed` is the Unix status-change time (ctime, seconds + nanoseconds).
+/// Unlike mtime, an ordinary program cannot set it to a chosen value: the
+/// kernel moves it to "now" on every write, truncate, chmod, owner or
+/// timestamp change, and on adding, removing or renaming a name of the
+/// file. So a same-size rewrite whose mtime was reset, or a replacement
+/// handed the freed inode with an equal mtime, no longer compares equal.
+///
+/// It is a freshness signal, not a cryptographic identity: root, a clock
+/// change or a rewrite inside one kernel timestamp tick can still collide.
+/// It also moves on harmless metadata-only changes (chmod, a hard link made
+/// or removed by a publish, repair or Undo, a rename away and back), so an
+/// identity captured before one of those is refused as changed; the caller
+/// re-checks the file and captures afresh. `None` on non-Unix (and in
+/// persisted snapshots, which never stored it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapturedFileIdentity {
     pub device: u64,
     pub inode: u64,
     pub size: u64,
     pub modified: Option<SystemTime>,
+    pub changed: Option<SystemTime>,
+}
+
+/// The Unix status-change time (ctime) of `metadata`, to the nanosecond.
+/// `None` on non-Unix or for a value `SystemTime` cannot hold.
+pub(crate) fn status_change_time(metadata: &fs::Metadata) -> Option<SystemTime> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let seconds = u64::try_from(metadata.ctime()).ok()?;
+        let nanos = u32::try_from(metadata.ctime_nsec()).ok()?;
+        std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(seconds, nanos))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
 }
 
 impl CapturedFileIdentity {
@@ -99,6 +170,7 @@ impl CapturedFileIdentity {
             inode,
             size: metadata.len(),
             modified: metadata.modified().ok(),
+            changed: status_change_time(metadata),
         }
     }
 }
@@ -135,9 +207,13 @@ pub struct ProcessExitReport {
     /// process exited non-zero - that is a normal, successful `Ok(status)`
     /// with `status.success() == false`).
     pub status: std::io::Result<ExitStatus>,
-    /// Bounded (see [`PROCESS_STDERR_CAPTURE_LIMIT`]) capture of the
-    /// process's stderr, for diagnosing a failed/crashed launch. Never a
-    /// full, unbounded log.
+    /// What was kept of the process's output, for diagnosing a failed or
+    /// crashed launch (see [`OutputCapture`]): by default the first
+    /// [`PROCESS_STDERR_CAPTURE_LIMIT`] bytes of standard error; for a
+    /// diagnostic capture, standard output and standard error together, the
+    /// first [`PROCESS_STDERR_CAPTURE_LIMIT`] and the last
+    /// [`DIAGNOSTIC_TAIL_CAPTURE_LIMIT`] bytes. Never a full, unbounded log.
+    /// Empty after [`WatchedProcess::discard_captured_output`].
     pub stderr: Vec<u8>,
 }
 
@@ -152,7 +228,9 @@ pub struct WatchedProcess {
     receiver: Receiver<ProcessExitReport>,
     exit_report: Option<ProcessExitReport>,
     stop_identity: OwnedChildIdentity,
-    stop_requested: bool,
+    /// SIGTERMs sent so far: 0, 1 ([`Self::request_graceful_stop`]) or 2
+    /// ([`Self::request_second_stop`]). Never more.
+    stop_signals_sent: u8,
 }
 
 /// The caller must explicitly choose the scope of a stop request.
@@ -184,6 +262,9 @@ pub enum GracefulStopRefusal {
     /// The owned child is not proven to be the emulator itself. It may be a
     /// launcher whose exit says nothing about the emulator, so nothing is sent.
     TargetNotEmulator,
+    /// A second stop is only ever the follow-up to a graceful stop already
+    /// sent to this child, never a first signal.
+    NoEarlierStopRequest,
 }
 
 /// Describes the launched child only, never an entire emulator tree. Child
@@ -263,6 +344,15 @@ impl WatchedProcess {
         self.exit_report.as_ref()
     }
 
+    /// Let go of what the process printed, keeping how it ended. For a
+    /// launch that ended well: once that has been seen, nothing it printed
+    /// is held any longer. Does nothing while the process is still running.
+    pub fn discard_captured_output(&mut self) {
+        if let Some(report) = &mut self.exit_report {
+            report.stderr = Vec::new();
+        }
+    }
+
     /// Whether the owned child is executing `expected` right now, even if that
     /// file has since been replaced or deleted at its path. The process
     /// comes from the pidfd, never from `pid`, and a child that has not exited
@@ -308,6 +398,32 @@ impl WatchedProcess {
         scope: GracefulStopScope,
         grace_period: Duration,
     ) -> GracefulStopOutcome {
+        self.signal_owned_child(scope, grace_period, 0)
+    }
+
+    /// The one follow-up to [`Self::request_graceful_stop`]: exactly one more
+    /// SIGTERM to the same owned child, only after the first was sent and the
+    /// child has not exited, and only when the player explicitly asks.
+    /// Some emulators (RetroArch) treat a second termination request while
+    /// already closing as "exit now"; that is the only way out once their own
+    /// shutdown has stalled, at the cost of whatever they would still have
+    /// written. Repeats only observe. Still no SIGKILL, timer, PID lookup,
+    /// process-group signal or descendant walk.
+    pub fn request_second_stop(&mut self, grace_period: Duration) -> GracefulStopOutcome {
+        if self.stop_signals_sent == 0 {
+            return GracefulStopOutcome::Refused(GracefulStopRefusal::NoEarlierStopRequest);
+        }
+        self.signal_owned_child(GracefulStopScope::LaunchedChild, grace_period, 1)
+    }
+
+    /// Sends a SIGTERM only when exactly `already_sent` have been sent, then
+    /// observes for at most `grace_period`.
+    fn signal_owned_child(
+        &mut self,
+        scope: GracefulStopScope,
+        grace_period: Duration,
+        already_sent: u8,
+    ) -> GracefulStopOutcome {
         if scope == GracefulStopScope::ProcessTree {
             return GracefulStopOutcome::Refused(GracefulStopRefusal::ProcessTreeNotSupervised);
         }
@@ -342,7 +458,7 @@ impl WatchedProcess {
                         );
                     }
                 }
-                let request_already_pending = self.stop_requested;
+                let request_already_pending = self.stop_signals_sent > already_sent;
                 if !request_already_pending {
                     // SAFETY: fd is a live OwnedFd acquired from this exact
                     // child before exec. A null siginfo and zero flags target
@@ -365,7 +481,7 @@ impl WatchedProcess {
                             raw_os_error: error.raw_os_error(),
                         });
                     }
-                    self.stop_requested = true;
+                    self.stop_signals_sent = already_sent + 1;
                 }
                 loop {
                     match pidfd_has_exited(fd) {
@@ -447,7 +563,25 @@ fn pidfd_has_exited(fd: i32) -> std::io::Result<bool> {
 /// - No timeout, no automatic kill: see [`WatchedProcess`]'s own doc
 ///   comment.
 pub fn spawn_watched_process(command: &PreparedProcessCommand) -> std::io::Result<WatchedProcess> {
-    spawn_watched_process_inner(command, &[], &[], None, None, false, None)
+    spawn_watched_process_inner(
+        command,
+        &[],
+        &[],
+        None,
+        None,
+        false,
+        None,
+        OutputCapture::StderrStart,
+    )
+}
+
+/// [`spawn_watched_process`] with a chosen [`OutputCapture`]. Everything
+/// else about the launch is identical.
+pub(crate) fn spawn_watched_process_captured(
+    command: &PreparedProcessCommand,
+    capture: OutputCapture,
+) -> std::io::Result<WatchedProcess> {
+    spawn_watched_process_inner(command, &[], &[], None, None, false, None, capture)
 }
 
 /// Like [`spawn_watched_process`] but the child starts with an EMPTY
@@ -461,7 +595,16 @@ pub fn spawn_watched_process(command: &PreparedProcessCommand) -> std::io::Resul
 pub(crate) fn spawn_watched_process_closing_fds(
     command: &PreparedProcessCommand,
 ) -> std::io::Result<WatchedProcess> {
-    spawn_watched_process_inner(command, &[], &[], None, None, true, None)
+    spawn_watched_process_inner(
+        command,
+        &[],
+        &[],
+        None,
+        None,
+        true,
+        None,
+        OutputCapture::StderrStart,
+    )
 }
 
 /// Like [`spawn_watched_process`] but sets `environment` on the child only
@@ -471,7 +614,16 @@ pub(crate) fn spawn_watched_process_with_environment(
     command: &PreparedProcessCommand,
     environment: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> std::io::Result<WatchedProcess> {
-    spawn_watched_process_inner(command, environment, &[], None, None, false, None)
+    spawn_watched_process_inner(
+        command,
+        environment,
+        &[],
+        None,
+        None,
+        false,
+        None,
+        OutputCapture::StderrStart,
+    )
 }
 
 /// Opt-in preservation workspace seam. Legacy callers retain their exact
@@ -495,6 +647,7 @@ pub(crate) fn spawn_watched_process_isolated(
         Some(Box::new(on_exit)),
         false,
         None,
+        OutputCapture::StderrStart,
     )
 }
 
@@ -516,6 +669,7 @@ pub(crate) fn spawn_watched_process_private_pinned(
         Some(Box::new(on_exit)),
         true,
         Some(executable.as_raw_fd()),
+        OutputCapture::StderrStart,
     )
 }
 
@@ -547,6 +701,7 @@ pub(crate) fn spawn_watched_process_with_assets(
         Some(Box::new(on_exit)),
         false,
         None,
+        OutputCapture::StderrStart,
     )
 }
 
@@ -559,6 +714,7 @@ pub(crate) fn spawn_watched_process_observed(
     files: &[&std::fs::File],
     on_start: impl FnOnce(u32) + 'static,
     on_exit: impl FnOnce(&ProcessExitReport) + Send + 'static,
+    capture: OutputCapture,
 ) -> std::io::Result<WatchedProcess> {
     use std::os::fd::AsRawFd;
     let fds: Vec<_> = files.iter().map(|file| file.as_raw_fd()).collect();
@@ -573,9 +729,11 @@ pub(crate) fn spawn_watched_process_observed(
         Some(Box::new(on_exit)),
         false,
         None,
+        capture,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_watched_process_inner(
     command: &PreparedProcessCommand,
     environment: &[(std::ffi::OsString, std::ffi::OsString)],
@@ -584,6 +742,7 @@ fn spawn_watched_process_inner(
     on_exit: Option<ExitCallback>,
     close_inherited_fds: bool,
     pinned_executable: Option<i32>,
+    capture: OutputCapture,
 ) -> std::io::Result<WatchedProcess> {
     // The executable must already be an absolute path. A bare name or a
     // relative path would make `execvp` repeat a `PATH`/working-directory
@@ -600,6 +759,13 @@ fn spawn_watched_process_inner(
             ),
         ));
     }
+    // The read end of the shared output pipe of a diagnostic capture. Set
+    // (and reset) by each spawn attempt below, so a retried spawn can never
+    // read an earlier attempt's pipe.
+    let mut shared_output: Option<std::io::PipeReader> = None;
+    // Whoever set a gate gets to finish its work before the process exists
+    // (Blue reads the game's saves here, while nothing can have changed them).
+    let gate_token = super::process_log::before_start(&command.executable, &command.arguments);
     // Each test-only ETXTBSY retry needs a fresh command and ownership
     // channel, so a failed exec's descriptor can never name a later child.
     let (mut child, stop_identity) = spawn_child(|| {
@@ -623,8 +789,26 @@ fn spawn_watched_process_inner(
         }
         process.envs(environment.iter().map(|(key, value)| (key, value)));
         process.stdin(Stdio::null());
-        process.stdout(Stdio::null());
-        process.stderr(Stdio::piped());
+        shared_output = None;
+        match (capture == OutputCapture::Diagnostic)
+            .then(shared_output_pipe)
+            .flatten()
+        {
+            Some((reader, for_stdout, for_stderr)) => {
+                // The command owns both write ends and drops them when it
+                // goes out of scope at the end of this attempt, so the
+                // reader sees end-of-file once the child (and anything it
+                // handed its output to) has finished.
+                process.stdout(for_stdout);
+                process.stderr(for_stderr);
+                survive_a_lost_reader(&mut process);
+                shared_output = Some(reader);
+            }
+            None => {
+                process.stdout(Stdio::null());
+                process.stderr(Stdio::piped());
+            }
+        }
         if let Some(working_directory) = &command.working_directory {
             process.current_dir(working_directory);
         }
@@ -671,6 +855,10 @@ fn spawn_watched_process_inner(
         spawn_with_owned_identity(&mut process)
     })?;
     let pid = child.id();
+    // Noted for every route, so a caller that only knows "a launch is in
+    // progress" can learn the real process and how it ended.
+    let log_sequence =
+        super::process_log::record_start(pid, &command.executable, &command.arguments, gate_token);
     if let Some(on_start) = on_start {
         on_start(pid);
     }
@@ -678,8 +866,16 @@ fn spawn_watched_process_inner(
 
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
-        let stderr_bytes = stderr.map(read_bounded_stderr).unwrap_or_default();
+        let stderr_bytes = match shared_output {
+            Some(output) => read_start_and_end(
+                output,
+                PROCESS_STDERR_CAPTURE_LIMIT,
+                DIAGNOSTIC_TAIL_CAPTURE_LIMIT,
+            ),
+            None => stderr.map(read_bounded_stderr).unwrap_or_default(),
+        };
         let status = child.wait();
+        super::process_log::record_exit(log_sequence, &status);
         let report = ProcessExitReport {
             status,
             stderr: stderr_bytes,
@@ -695,7 +891,7 @@ fn spawn_watched_process_inner(
         receiver,
         exit_report: None,
         stop_identity,
-        stop_requested: false,
+        stop_signals_sent: 0,
     })
 }
 
@@ -924,6 +1120,128 @@ fn spawn_child(
     }
 }
 
+/// Makes the child ignore SIGPIPE, so that losing the reader of its
+/// output cannot kill it.
+///
+/// A diagnostic capture gives the emulator one pipe for everything it
+/// prints, and the only reader is this process. If EmuWiz exits, crashes
+/// or is killed while the game is still running, the emulator's next write
+/// to that pipe would raise SIGPIPE, whose default action is to kill it.
+/// RetroArch with `--verbose` prints a line as it quits, before it writes
+/// the game's battery save: it was killed there and the save was never
+/// written (measured with RetroArch 1.21.0; without `--verbose` it prints
+/// nothing at that point, which is why this was not seen before). With the
+/// signal ignored the write just fails and the emulator carries on, exits
+/// normally and saves.
+///
+/// This changes one thing in the launched process and nothing else: its
+/// own answer to that one signal, for that run. No emulator setting is
+/// touched. Anything the emulator itself starts inherits it. `std` puts
+/// SIGPIPE back to its default in a child before these hooks run, and an
+/// ignored signal stays ignored across `exec`, so the hook is what the
+/// emulator starts with. It cannot fail the launch: if the call were
+/// refused the launch goes ahead as it would have without it.
+#[cfg(unix)]
+fn survive_a_lost_reader(process: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `signal` is async-signal-safe and is the only call made
+    // between fork and exec here. It changes the child's own disposition
+    // for one signal and touches nothing shared with the parent.
+    unsafe {
+        process.pre_exec(|| {
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn survive_a_lost_reader(_process: &mut Command) {}
+
+/// One pipe whose write end is duplicated for a child's standard output
+/// and standard error. `None` when the operating system refuses; the caller
+/// then falls back to the plain capture rather than fail a launch over a
+/// diagnostic.
+fn shared_output_pipe() -> Option<(
+    std::io::PipeReader,
+    std::io::PipeWriter,
+    std::io::PipeWriter,
+)> {
+    let (reader, writer) = std::io::pipe().ok()?;
+    let second = writer.try_clone().ok()?;
+    Some((reader, writer, second))
+}
+
+/// Read `output` to its end, keeping at most `start_limit` bytes from the
+/// start and `end_limit` bytes from the end. Memory use is bounded by those
+/// two limits plus one small read buffer, however much is written.
+///
+/// When everything fits, the result is the output unchanged. When bytes had
+/// to be left out, the kept start is cut back to its last complete line, the
+/// kept end starts at its first complete line, and one marker line between
+/// them states how many bytes are missing, so a reader of the result never
+/// sees half a line presented as a line.
+pub fn read_start_and_end(mut output: impl Read, start_limit: usize, end_limit: usize) -> Vec<u8> {
+    let mut start: Vec<u8> = Vec::new();
+    let mut end: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
+    let mut omitted: u64 = 0;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = match output.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let mut bytes = &chunk[..read];
+        if start.len() < start_limit {
+            let take = (start_limit - start.len()).min(bytes.len());
+            start.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+        }
+        if bytes.is_empty() {
+            continue;
+        }
+        if end_limit == 0 {
+            omitted += bytes.len() as u64;
+            continue;
+        }
+        if bytes.len() >= end_limit {
+            omitted += (end.len() + bytes.len() - end_limit) as u64;
+            end.clear();
+            end.extend(&bytes[bytes.len() - end_limit..]);
+        } else {
+            let overflow = (end.len() + bytes.len()).saturating_sub(end_limit);
+            omitted += overflow as u64;
+            end.drain(..overflow);
+            end.extend(bytes);
+        }
+    }
+    if omitted == 0 {
+        // Nothing was left out: start and end are contiguous.
+        start.extend(end);
+        return start;
+    }
+    let start_keep = start
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |index| index + 1);
+    omitted += (start.len() - start_keep) as u64;
+    start.truncate(start_keep);
+    let end: Vec<u8> = end.into();
+    let end_skip = end
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .map_or(end.len(), |index| index + 1);
+    omitted += end_skip as u64;
+    start.extend_from_slice(
+        format!("{OUTPUT_OMITTED_MARKER_PREFIX}{omitted}{OUTPUT_OMITTED_MARKER_SUFFIX}\n")
+            .as_bytes(),
+    );
+    start.extend_from_slice(&end[end_skip..]);
+    start
+}
+
 pub fn read_bounded_stderr(mut stderr: impl Read) -> Vec<u8> {
     let mut buffer = vec![0u8; PROCESS_STDERR_CAPTURE_LIMIT];
     let mut filled = 0usize;
@@ -946,7 +1264,6 @@ pub fn read_bounded_stderr(mut stderr: impl Read) -> Vec<u8> {
 #[cfg(test)]
 mod open_regular_tests {
     use super::*;
-    use std::io::Read as _;
     use std::os::unix::fs::symlink;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -1026,3 +1343,62 @@ mod open_regular_tests {
         assert_eq!(text, "payload");
     }
 }
+
+#[cfg(all(test, unix))]
+mod captured_identity_ctime_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn capture(path: &Path) -> CapturedFileIdentity {
+        CapturedFileIdentity::capture(&fs::symlink_metadata(path).unwrap())
+    }
+
+    /// An ordinary unchanged game or emulator keeps its identity: opening,
+    /// reading and re-stating it never moves ctime, so Play is not refused.
+    #[test]
+    fn an_unchanged_file_keeps_its_identity_when_read_and_reopened() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("game.bin");
+        fs::write(&path, b"cartridge bytes").unwrap();
+        let checked = capture(&path);
+        assert!(checked.changed.is_some());
+        let mut bytes = Vec::new();
+        fs::File::open(&path)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        drop(fs::File::open(&path).unwrap());
+        assert_eq!(capture(&path), checked);
+    }
+
+    /// A same-size replacement with the original mtime, renamed over the
+    /// checked file, is a different identity (by inode here: the
+    /// replacement was created while the original still held its inode;
+    /// the ctime-only case is pinned by the forged-metadata tests in
+    /// `azahar_homebrew` and `game_identity`).
+    #[test]
+    fn a_same_size_replacement_with_the_old_mtime_is_a_different_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("emulator");
+        fs::write(&path, b"original!").unwrap();
+        let checked = capture(&path);
+        let staged = dir.path().join("emulator.new");
+        let mut file = fs::File::create(&staged).unwrap();
+        file.write_all(b"replaced!").unwrap();
+        file.set_modified(checked.modified.unwrap()).unwrap();
+        drop(file);
+        fs::rename(&staged, &path).unwrap();
+        let now = capture(&path);
+        assert_eq!((now.size, now.modified), (checked.size, checked.modified));
+        assert_ne!(now.inode, checked.inode);
+        assert_ne!(now, checked);
+    }
+}
+
+#[cfg(test)]
+#[path = "process_spawn/capture_tests.rs"]
+mod capture_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "process_spawn/second_stop_tests.rs"]
+mod second_stop_tests;

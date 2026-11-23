@@ -24,7 +24,7 @@ use archivefs_core::patch_manager::{
     PreviewAdapter, ResolvedEmulatorProfile, SharedApplyContext, SharedApplyEntry,
     SharedApplyOutcome, SharedApplyResult, SharedApplyStatus, SharedPlanEntry, SharedPreviewReport,
     SharedTransactionPath, SharedTransactionStage, build_dolphin_texture_pack_manifest,
-    build_dolphin_texture_pack_preview,
+    build_dolphin_texture_pack_preview, validate_dolphin_texture_pack_manifest,
 };
 use tempfile::TempDir;
 
@@ -250,6 +250,7 @@ fn builder_preview_shows_verified_target_and_accepted_files_without_installing()
                 PathBuf::from("/library/game.iso"),
                 identity.clone(),
                 dir.path().join("dest"),
+                None,
             )
         });
     });
@@ -857,4 +858,365 @@ mod rollback_warnings {
     fn warning_text_says_when_no_rollback_ran() {
         assert_rollback_did_not_run(&detail(None));
     }
+}
+
+// ---- Night Watch II NW2-A-01 (test written by the Night Watch II session) ----
+
+/// NW2-A-01: a texture-pack ZIP preview extracts into $TMPDIR. Once the
+/// preview stage is dropped (a new selection, cancel, or a completed install)
+/// the extracted copy must not stay behind.
+#[test]
+fn nw2_a01_dropped_zip_preview_leaves_no_extracted_copy_in_tmp() {
+    use std::io::Write as _;
+    let dir = TempDir::new().unwrap();
+    let archive = dir.path().join("nw2-a01-pack.zip");
+    {
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        for name in [
+            "Pack/Load/Textures/GALE01/nw2a01_a.png",
+            "Pack/Load/Textures/GALE01/nw2a01_b.png",
+        ] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(&[0x89, b'P', b'N', b'G', 1, 2, 3, 4])
+                .unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    let identity = DolphinTextureModIdentity {
+        game_id: "GALE01".into(),
+        platform: IdentityPlatform::GameCube,
+    };
+    let mut leaked = Vec::new();
+    for _ in 0..3 {
+        let stage = super::build_pack_archive_preview_stage(
+            &archive,
+            &dir.path().join("game.iso"),
+            &identity,
+            &dir.path().join("dest"),
+        );
+        let super::DolphinTextureModStage::PackArchivePreview {
+            source_root,
+            staging,
+            ..
+        } = &stage
+        else {
+            panic!("preview was built");
+        };
+        assert!(staging.is_some(), "an archive preview owns its staging");
+        assert!(
+            source_root.starts_with(std::env::temp_dir()),
+            "{source_root:?}"
+        );
+        assert!(source_root.join("nw2a01_a.png").exists());
+        let source_root = source_root.clone();
+        drop(stage);
+        if source_root.exists() {
+            leaked.push(source_root);
+        }
+    }
+    let leaked_count = leaked.len();
+    for path in &leaked {
+        if let Some(root) = path.ancestors().find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("archivefs-dolphin-texture-archive-"))
+        }) {
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+    assert_eq!(
+        leaked_count, 0,
+        "each dropped preview left its extracted copy in $TMPDIR: {leaked:?}"
+    );
+}
+
+#[test]
+fn retained_pack_directory_names_are_unique_and_readable() {
+    let first = super::retained_pack_directory_name("My Pack! v2");
+    let second = super::retained_pack_directory_name("My Pack! v2");
+    assert!(first.starts_with("my-pack--v2-"), "{first}");
+    assert_ne!(first, second);
+    assert!(super::retained_pack_directory_name("***").starts_with("texture-pack-"));
+}
+
+fn lifecycle_identity() -> DolphinTextureModIdentity {
+    DolphinTextureModIdentity {
+        game_id: "GALE01".into(),
+        platform: IdentityPlatform::GameCube,
+    }
+}
+
+fn lifecycle_zip(path: &std::path::Path) {
+    use std::io::Write as _;
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    for (name, bytes) in [
+        (
+            "Pack/Load/Textures/GALE01/tex_a.png",
+            &b"\x89PNG\r\n\x1a\nA"[..],
+        ),
+        (
+            "Pack/Load/Textures/GALE01/tex_b.png",
+            &b"\x89PNG\r\n\x1a\nBB"[..],
+        ),
+    ] {
+        zip.start_file(name, options).unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    zip.finish().unwrap();
+}
+
+/// Owner acceptance requirement (2026-11-06): the complete ZIP manifest
+/// lifecycle - preview, save to persistent storage, every path rewritten,
+/// reload from disk, containment and integrity checks pass, still usable
+/// after the temporary extraction is gone.
+#[test]
+fn zip_manifest_lifecycle_save_then_reload_survives_temp_cleanup() {
+    let dir = TempDir::new().unwrap();
+    let archive = dir.path().join("pack.zip");
+    lifecycle_zip(&archive);
+    let archive_bytes = std::fs::read(&archive).unwrap();
+    let identity = lifecycle_identity();
+    let retained_parent = dir.path().join("data").join("dolphin-texture-packs");
+
+    // 1. Preview and extract.
+    let stage = super::build_pack_archive_preview_stage(
+        &archive,
+        &dir.path().join("game.iso"),
+        &identity,
+        &dir.path().join("dest"),
+    );
+    let super::DolphinTextureModStage::PackArchivePreview {
+        preview, staging, ..
+    } = stage
+    else {
+        panic!("preview was built");
+    };
+    let staging = staging.expect("archive preview owns its staging");
+    let staging_root = staging.root().to_path_buf();
+    assert!(
+        preview
+            .manifest
+            .source_root
+            .starts_with(std::env::temp_dir())
+    );
+    assert_eq!(preview.manifest.files.len(), 2);
+
+    // 2. Save to persistent storage.
+    let manifest_path = dir.path().join("saved").join("pack.json");
+    let saved = super::save_manifest_stage_in(
+        &manifest_path,
+        preview.manifest.clone(),
+        &identity,
+        Some(staging),
+        &retained_parent,
+    );
+    let (path, retained_root) = match saved {
+        super::DolphinTextureModStage::PackManifestSaved {
+            path,
+            retained_root,
+        } => (path, retained_root),
+        super::DolphinTextureModStage::Failed { detail } => panic!("save failed: {detail}"),
+        _ => panic!("save produced an unexpected stage"),
+    };
+    assert_eq!(path, manifest_path);
+    let retained_root = retained_root.expect("a ZIP manifest reports where its files were kept");
+    assert!(
+        retained_root.starts_with(&retained_parent),
+        "{retained_root:?}"
+    );
+
+    // 3. Root and every file path were rewritten (fresh parse from disk).
+    let text = std::fs::read_to_string(&manifest_path).unwrap();
+    let reloaded: DolphinTexturePackManifest = serde_json::from_str(&text).unwrap();
+    assert_eq!(reloaded.source_root, retained_root);
+    let mentions_staging = |path: &std::path::Path| {
+        path.starts_with(&staging_root)
+            || path.components().any(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("archivefs-dolphin-texture-archive-"))
+            })
+    };
+    assert!(
+        !mentions_staging(&reloaded.source_root),
+        "{:?}",
+        reloaded.source_root
+    );
+    assert_eq!(reloaded.files.len(), 2);
+    for (saved_file, previewed) in reloaded.files.iter().zip(&preview.manifest.files) {
+        assert!(
+            saved_file.source_path.starts_with(&reloaded.source_root),
+            "{saved_file:?}"
+        );
+        assert!(!mentions_staging(&saved_file.source_path), "{saved_file:?}");
+        assert!(saved_file.source_path.is_file(), "{saved_file:?}");
+        assert_eq!(
+            saved_file.source_relative_path,
+            previewed.source_relative_path
+        );
+        assert_eq!(saved_file.sha256, previewed.sha256);
+        assert_eq!(
+            saved_file.destination_filename,
+            previewed.destination_filename
+        );
+    }
+
+    // 4./5. Reload in a "fresh session": containment and integrity checks pass.
+    validate_dolphin_texture_pack_manifest(&reloaded, &identity, &reloaded.source_root)
+        .expect("reloaded manifest validates");
+    let destination = dir.path().join("dest");
+    std::fs::create_dir_all(&destination).unwrap();
+    let reload_stage = super::build_pack_preview_stage(
+        &manifest_path,
+        &dir.path().join("game.iso"),
+        &identity,
+        &destination,
+    );
+    match reload_stage {
+        super::DolphinTextureModStage::PackPreviewReady { plan, .. } => {
+            assert_eq!(plan.manifest.source_root, reloaded.source_root);
+        }
+        super::DolphinTextureModStage::Failed { detail } => panic!("reload failed: {detail}"),
+        _ => panic!("reload produced an unexpected stage"),
+    }
+
+    // 6. The temporary extraction is gone and the manifest is still usable.
+    assert!(
+        !staging_root.exists(),
+        "temporary staging must be removed on save"
+    );
+    // (Other tests in this binary create and drop their own stagings
+    // concurrently, so only this test's own staging root is asserted on.)
+    validate_dolphin_texture_pack_manifest(&reloaded, &identity, &reloaded.source_root).unwrap();
+    assert_eq!(
+        std::fs::read(&archive).unwrap(),
+        archive_bytes,
+        "the ZIP is never modified"
+    );
+
+    // 7. A failed save (manifest path already exists) preserves everything
+    //    and leaves no broken manifest and no orphaned retained copy.
+    let stage = super::build_pack_archive_preview_stage(
+        &archive,
+        &dir.path().join("game.iso"),
+        &identity,
+        &destination,
+    );
+    let super::DolphinTextureModStage::PackArchivePreview {
+        preview: second,
+        staging: second_staging,
+        ..
+    } = stage
+    else {
+        panic!("second preview was built");
+    };
+    let second_staging_root = second_staging.as_ref().unwrap().root().to_path_buf();
+    let retained_entries_before: Vec<_> = std::fs::read_dir(&retained_parent)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    let failed = super::save_manifest_stage_in(
+        &manifest_path,
+        second.manifest,
+        &identity,
+        second_staging,
+        &retained_parent,
+    );
+    let super::DolphinTextureModStage::Failed { detail } = failed else {
+        panic!("saving over an existing manifest must fail");
+    };
+    assert!(detail.contains("existing manifest"), "{detail}");
+    assert_eq!(
+        std::fs::read_to_string(&manifest_path).unwrap(),
+        text,
+        "existing manifest untouched"
+    );
+    let retained_entries_after: Vec<_> = std::fs::read_dir(&retained_parent)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(
+        retained_entries_after, retained_entries_before,
+        "no orphaned retained copy"
+    );
+    assert!(
+        !second_staging_root.exists(),
+        "failed save removes its temporary copy"
+    );
+    validate_dolphin_texture_pack_manifest(&reloaded, &identity, &reloaded.source_root)
+        .expect("the first manifest is still intact");
+    assert_eq!(std::fs::read(&archive).unwrap(), archive_bytes);
+}
+
+/// Owner decision 2026-11-06: a manifest saved before this change points at
+/// a temporary folder that no longer exists. Choosing it must explain that
+/// (with the recovery route) and never look like an installation.
+#[test]
+fn legacy_manifest_with_missing_temp_source_is_explained_not_installed() {
+    let dir = TempDir::new().unwrap();
+    let legacy_root = std::env::temp_dir()
+        .join("archivefs-dolphin-texture-archive-424242-7")
+        .join("Pack/Load/Textures/GALE01");
+    assert!(!legacy_root.exists());
+    let manifest = serde_json::json!({
+        "format": archivefs_core::patch_manager::DOLPHIN_TEXTURE_PACK_MANIFEST_FORMAT,
+        "name": "Old Pack",
+        "version": null,
+        "target_game_id": "GALE01",
+        "source_root": legacy_root,
+        "files": [{
+            "source_path": legacy_root.join("a.png"),
+            "source_relative_path": "a.png",
+            "destination_filename": "a.png",
+            "size_bytes": 1,
+            "sha256": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+        }]
+    });
+    let manifest_path = dir.path().join("old.json");
+    std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+    let identity = lifecycle_identity();
+    let destination = dir.path().join("dest");
+    let stage = super::build_pack_preview_stage(
+        &manifest_path,
+        &dir.path().join("game.iso"),
+        &identity,
+        &destination,
+    );
+    let super::DolphinTextureModStage::Failed { detail } = stage else {
+        panic!("a manifest with a missing source must fail, not preview");
+    };
+    assert!(
+        detail.contains("before EmuWiz kept the extracted files"),
+        "{detail}"
+    );
+    assert!(detail.contains("Nothing was installed"), "{detail}");
+    assert!(detail.contains("Choose texture-pack ZIP"), "{detail}");
+    assert!(!destination.exists());
+    // Any other missing folder is explained too, without the legacy wording.
+    let other_root = dir.path().join("gone");
+    let manifest = serde_json::json!({
+        "format": archivefs_core::patch_manager::DOLPHIN_TEXTURE_PACK_MANIFEST_FORMAT,
+        "name": "Moved Pack",
+        "version": null,
+        "target_game_id": "GALE01",
+        "source_root": other_root,
+        "files": []
+    });
+    let manifest_path = dir.path().join("moved.json");
+    std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+    let stage = super::build_pack_preview_stage(
+        &manifest_path,
+        &dir.path().join("game.iso"),
+        &identity,
+        &destination,
+    );
+    let super::DolphinTextureModStage::Failed { detail } = stage else {
+        panic!("missing source must fail");
+    };
+    assert!(detail.contains("source folder"), "{detail}");
+    assert!(!detail.contains("temporary folder"), "{detail}");
+    assert!(!destination.exists());
 }

@@ -914,8 +914,17 @@ fn scan_completion_and_activity_use_every_truthful_non_overlapping_count() {
             archives_unchanged: 1_230,
             archives_updated: 3,
             archives_missing: 4,
-            skipped_unsupported_extension: 5,
+            // The coarse columns hold 8 + 2; the stored breakdown splits them,
+            // and identical copies are never reported as unsupported.
+            skipped_unsupported_extension: 8,
             skipped_ambiguous_platform: 2,
+            skip_reasons: Some(archivefs_core::SkipReasonCounts {
+                unsupported_extension: 4,
+                unsupported_variant: 1,
+                invalid_content: 0,
+                ambiguous_platform: 2,
+                identical_copy: 3,
+            }),
             errors_count: 1,
             source_folders_scanned: 2,
         },
@@ -927,24 +936,35 @@ fn scan_completion_and_activity_use_every_truthful_non_overlapping_count() {
         ingestion_skip_reasons: Default::default(),
         ingestion_platform_counts: Default::default(),
         arcade_ingestion: Default::default(),
+        nested_mounts: Vec::new(),
         ingestion_skipped: Vec::new(),
         ingestion_recognised_sample: Vec::new(),
     };
 
     assert_eq!(
         format_scan_completion(&summary),
-        "Scan completed\nSeen: 1236\nAdded: 3\nUpdated: 3 (including 1 restored)\nNewly missing: 4\nUnchanged: 1230\nSkipped unsupported: 5\nSkipped ambiguous: 2\nErrors: 1"
+        "Scan completed\nSeen: 1236\nAdded: 3\nUpdated: 3 (including 1 restored)\nNewly missing: 4\nUnchanged: 1230\nSkipped unsupported format: 4\nSkipped unsupported variant: 1\nSkipped invalid content: 0\nSkipped ambiguous: 2\nRecognised duplicates (identical copies of catalogued ZIPs, not added twice): 3\nErrors: 1"
     );
     let activity = format_scan_activity(&summary);
     assert_eq!(
         activity,
-        "Scan completed: seen 1236, added 3, updated 3 (including 1 restored), newly missing 4, unchanged 1230, skipped 7, errors 1."
+        "Scan completed: seen 1236, added 3, updated 3 (including 1 restored), newly missing 4, unchanged 1230, skipped 10 (4 unsupported format, 1 unsupported variant, 2 ambiguous, 3 recognised duplicates), errors 1."
     );
     assert_eq!(
         activity.lines().count(),
         1,
         "activity must stay one concise entry"
     );
+    // A run without a stored breakdown never presents its coarse figure as
+    // "unsupported formats" or invents per-reason zeros.
+    let mut legacy = summary;
+    legacy.counts.skip_reasons = None;
+    let text = format_scan_completion(&legacy);
+    assert!(
+        text.contains("Skipped unsupported, invalid or alternate copies (breakdown not recorded): 8\nSkipped ambiguous: 2"),
+        "{text}"
+    );
+    assert!(!text.contains("Recognised duplicates"), "{text}");
 }
 
 /// A never-before-seen `egui::Window` needs one settling frame before
@@ -1067,6 +1087,7 @@ fn skipped_files_window_redirects_to_collection_discovery_instead_of_duplicating
         ingestion_skip_reasons: Default::default(),
         ingestion_platform_counts: Default::default(),
         arcade_ingestion: Default::default(),
+        nested_mounts: Vec::new(),
         ingestion_skipped: vec![ingestion_item],
         ingestion_recognised_sample: Vec::new(),
     };

@@ -116,33 +116,35 @@ test('conflicts, unknown, draft, behind and blocked are never READY', () => {
   assert.equal(decide({...fixture(), mergeable: 'UNKNOWN'}).status, 'BLOCKED');
 });
 
-function harness({duplicate = false, stale = false, staleBase = false, foreign = false, pending = false} = {}) {
+function harness({duplicate = false, stale = false, staleBase = false, foreign = false, pending = false, draft = false, mergeStateStatus = 'CLEAN', failJob = false} = {}) {
   const x = fixture();
   if (pending) x.runs[1].status = 'in_progress';
+  if (failJob) x.jobs[0].conclusion = 'failure';
   const pr = {number: 7, head: {sha: foreign ? 'b'.repeat(40) : sha},
     base: {sha: 'c'.repeat(40)}, state: 'open', html_url: 'https://github.com/o/r/pull/7'};
   x.runs[0].event = 'pull_request'; x.runs[1].event = 'dynamic';
-  const posted = []; const requested = [];
+  const posted = []; const requested = []; const updated = []; let existing = [];
   const rest = {
     pulls: {list: 'prs', listFiles: 'files', get: async () => ({data:
       {...pr, head: {sha: stale ? 'b'.repeat(40) : sha},
         base: {sha: staleBase ? 'd'.repeat(40) : pr.base.sha}}})},
-    issues: {listComments: 'comments', createComment: async c => posted.push(c)},
+    issues: {listComments: 'comments', createComment: async c => posted.push(c),
+      updateComment: async c => updated.push(c)},
     actions: {listRepoWorkflows: 'workflows', listWorkflowRuns: 'runs', listJobsForWorkflowRun: 'jobs'},
     checks: {listForRef: 'checks'}, repos: {listCommitStatusesForRef: 'statuses'},
   };
   const github = {rest, paginate: async (method, args) => {
     requested.push({method, args});
     return ({prs: [pr], files: [{filename: 'README.md'}],
-      comments: duplicate ? [{user: {login: 'github-actions[bot]'}, body: marker(7, sha)}] : [],
+      comments: duplicate ? [{id: 1, user: {login: 'github-actions[bot]'}, body: marker(7, sha)}] : existing,
       workflows: [{id: 1, path: '.github/workflows/ci.yml'},
         {id: 2, path: 'dynamic/github-code-scanning/codeql'}],
       runs: x.runs.filter(r => r.id === args.workflow_id),
       jobs: x.jobs.filter(j => j.run_id === args.run_id), checks: x.checks, statuses: []})[method];
   }, graphql: async () => ({repository: {pullRequest: {headRefOid: sha, baseRefOid: pr.base.sha,
-    state: 'OPEN', isDraft: false, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN'}}})};
+    state: 'OPEN', isDraft: draft, mergeable: 'MERGEABLE', mergeStateStatus}}})};
   return {github, context: {repo: {owner: 'o', repo: 'r'}, payload: {workflow_run: {head_sha: sha}}},
-    core: {info() {}}, posted, requested};
+    core: {info() {}}, posted, requested, updated, setComments: c => { existing = c; }};
 }
 test('posts exact PR/head, final status, workflow links and owner mention', async () => {
   const h = harness(); await notify(h);
@@ -233,3 +235,65 @@ test('workflow and job contract still matches existing CI', () => {
   assert.doesNotMatch(workflow, /pull_request_target:|schedule:|secrets\.(?!GITHUB_TOKEN)/);
 });
 function pathFor(relative) { return require('node:path').join(__dirname, relative); }
+
+const bot = (id, body) => ({id, user: {login: 'github-actions[bot]'}, body});
+test('draft PR with every gate green is silent (no comment, no mention)', async () => {
+  for (const mergeStateStatus of ['CLEAN', 'BLOCKED']) {
+    const h = harness({draft: true, mergeStateStatus}); await notify(h);
+    assert.equal(h.posted.length, 0);
+    assert.equal(h.updated.length, 0);
+  }
+});
+test('pending is silent and a UNKNOWN mergeability is silent', async () => {
+  const h = harness({pending: true}); await notify(h); assert.equal(h.posted.length, 0);
+  const g = harness({mergeStateStatus: 'UNKNOWN'}); await notify(g); assert.equal(g.posted.length, 0);
+});
+test('non-draft BLOCKED (e.g. conflicts) still notifies once', async () => {
+  const h = harness({mergeStateStatus: 'DIRTY'}); await notify(h);
+  assert.equal(h.posted.length, 1);
+  assert.match(h.posted[0].body, /\*\*BLOCKED\*\*/);
+  assert.ok(h.posted[0].body.includes(marker(7, sha, 'BLOCKED')));
+});
+test('genuine failure on a draft still notifies the owner', async () => {
+  const h = harness({failJob: true, draft: true}); await notify(h);
+  assert.equal(h.posted.length, 1);
+  assert.match(h.posted[0].body, /^<!-- emuwiz-ci-final:7:a{40}:FAILED -->\n@kiehntre \*\*FAILED\*\*/);
+});
+test('same-head FAILED is deduplicated, then READY after a rerun posts and supersedes it', async () => {
+  const failed = harness({failJob: true});
+  await notify(failed);
+  const failedComment = bot(5, failed.posted[0].body);
+  const again = harness({failJob: true}); again.setComments([failedComment]);
+  await notify(again);
+  assert.equal(again.posted.length, 0, 'same result for same head is not re-sent');
+  const rerun = harness(); rerun.setComments([failedComment]);
+  await notify(rerun);
+  assert.equal(rerun.posted.length, 1);
+  assert.match(rerun.posted[0].body, /\*\*READY\*\*/);
+  assert.equal(rerun.updated.length, 1);
+  assert.equal(rerun.updated[0].comment_id, 5);
+  assert.doesNotMatch(rerun.updated[0].body, /@kiehntre|emuwiz-ci-final/);
+  assert.match(rerun.updated[0].body, /Superseded/);
+});
+test('rerun in progress marks a stale FAILED snapshot superseded without new mail', async () => {
+  const failed = harness({failJob: true}); await notify(failed);
+  const h = harness({pending: true}); h.setComments([bot(5, failed.posted[0].body)]);
+  await notify(h);
+  assert.equal(h.posted.length, 0);
+  assert.equal(h.updated.length, 1);
+  assert.doesNotMatch(h.updated[0].body, /@kiehntre/);
+});
+test('a READY snapshot is superseded if the PR returns to draft; a user comment is never edited', async () => {
+  const ready = harness(); await notify(ready);
+  const h = harness({draft: true});
+  h.setComments([bot(5, ready.posted[0].body),
+    {id: 6, user: {login: 'someone'}, body: marker(7, sha, 'FAILED')}]);
+  await notify(h);
+  assert.deepEqual(h.updated.map(u => u.comment_id), [5]);
+  assert.equal(h.posted.length, 0);
+});
+test('a new READY still mentions only the fixed owner even with hostile PR text', async () => {
+  const h = harness(); h.context.payload.workflow_run.head_sha = sha;
+  await notify(h);
+  assert.equal((h.posted[0].body.match(/@/g) || []).length, 1);
+});

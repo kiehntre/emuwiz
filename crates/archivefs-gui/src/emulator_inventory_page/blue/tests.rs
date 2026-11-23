@@ -18,6 +18,7 @@ struct Fixture {
     bytes: &'static [u8],
     sha: Option<&'static str>,
     resolver_error: Option<&'static str>,
+    record_roots: Option<Vec<std::path::PathBuf>>,
 }
 
 impl Fixture {
@@ -27,6 +28,7 @@ impl Fixture {
             bytes: NEW_BYTES,
             sha: Some(NEW_SHA),
             resolver_error: None,
+            record_roots: None,
         }
     }
 }
@@ -71,6 +73,9 @@ impl UpdateBackend for Fixture {
     }
     fn journal_quiescence(&self, tracked: bool, _: &UpdateJournal) -> QuiescenceEvidence {
         QuiescenceEvidence::from_tracked_flag(tracked).combine(self.quiescence)
+    }
+    fn record_roots(&self) -> Option<Vec<std::path::PathBuf>> {
+        self.record_roots.clone()
     }
 }
 
@@ -560,4 +565,45 @@ fn a_check_worker_that_dies_says_nothing_changed() {
             .unwrap()
             .contains("Nothing was changed")
     );
+}
+
+/// NW2-B-01: saved update records are shown from the first open, without
+/// "Check for emulator updates". An update interrupted after the executable
+/// moved aside shows "Recovery required" on a fresh page, as after a restart.
+#[test]
+fn nw2_b01_interrupted_update_shows_recovery_on_first_open_without_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut page, installation) = fixture_page(dir.path(), Fixture::ok());
+    review(&mut page, &installation);
+    page.confirmation = "UPDATE DOLPHIN".into();
+    page.start_apply(&egui::Context::default());
+    settle(&mut page);
+    let mut journal = page.review_journal.clone().unwrap();
+    let stage = journal
+        .target_path
+        .with_file_name(format!(".emuwiz-update-staging-{}", journal.transaction_id));
+    std::fs::rename(&journal.target_path, &stage).unwrap();
+    journal.staged_path = Some(stage);
+    journal.state = UpdateTransactionState::Applying;
+    std::fs::write(
+        journal.record_path().unwrap(),
+        serde_json::to_vec(&journal).unwrap(),
+    )
+    .unwrap();
+
+    // A fresh page, as after a restart: nothing refreshed, Check not clicked.
+    let mut fresh = EmulatorInventoryPageState::default();
+    fresh.blue.backend = Some(Arc::new(Fixture {
+        record_roots: Some(vec![dir.path().into()]),
+        ..Fixture::ok()
+    }));
+    let shown = render(&mut fresh);
+    assert!(shown.contains("Recovery required"), "{shown}");
+    assert!(fresh.records.iter().any(|e| e.needs_attention()));
+    assert!(
+        fresh.inventory.is_none(),
+        "no version probe ran; Check still discovers with probes"
+    );
+    assert!(!fresh.blue_busy());
+    assert!(fresh.error.is_none(), "{:?}", fresh.error);
 }

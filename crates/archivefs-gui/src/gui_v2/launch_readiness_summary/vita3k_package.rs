@@ -99,6 +99,7 @@ mod tests {
         VpkEvidence {
             path: PathBuf::from("/g/Game.vpk"),
             file_identity: CapturedFileIdentity {
+                changed: None,
                 device: 1,
                 inode: 2,
                 size: 3,
@@ -191,6 +192,7 @@ mod tests {
     fn a_ready_card_says_play_starts_the_installed_title_and_flags_a_version_difference() {
         use archivefs_core::launch::Vita3kInstalledEntry;
         let identity = CapturedFileIdentity {
+            changed: None,
             device: 1,
             inode: 2,
             size: 3,

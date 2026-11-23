@@ -1084,8 +1084,10 @@ mod extras {
         assert!(note.contains("no identity check for Sharp X68000"));
         assert!(extras_for(&x68, &verified(), None).blocker_note.is_none());
 
+        // An Amiga HDF now starts from a private working copy through
+        // RetroArch (PUAE), so an unresolved review no longer blocks it.
         let hdf = game(2, "a.hdf", "Amiga");
-        assert!(extras_for(&hdf, &unresolved(), None).blocker_note.is_some());
+        assert!(extras_for(&hdf, &unresolved(), None).blocker_note.is_none());
         assert!(
             extras_for(&hdf, &verified(), None).blocker_note.is_none(),
             "a DAT-verified Amiga HDF must not be told it cannot start"

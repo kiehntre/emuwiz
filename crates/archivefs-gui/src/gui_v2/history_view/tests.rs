@@ -619,12 +619,12 @@ fn organisation_record(
 }
 
 #[test]
-fn a_modern_organisation_rename_opens_organisation_with_its_own_transaction_selected() {
+fn a_modern_organisation_rename_opens_quick_rename_with_its_own_transaction_selected() {
     let record = organisation_record("org-1", TransactionState::Applied, EntryState::Applied);
     let entry = entry_of(&record, source_of(&record));
     assert_eq!(entry.source, Source::CanonicalOrganisation);
-    assert_eq!(entry.handoff.label, "Open Organisation");
-    assert_eq!(entry.handoff.route, Route::Section(Section::Build));
+    assert_eq!(entry.handoff.label, "Open Undo in Quick Rename");
+    assert_eq!(entry.handoff.route, Route::QuickRename);
     assert!(entry.handoff.selects_organisation);
     assert_eq!(entry.transaction_id, "org-1");
     assert!(organisation_note(&entry).is_none());

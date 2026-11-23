@@ -23,6 +23,11 @@ sys.dont_write_bytecode = True
 import test_emuwiz_cargo_retention as T  # noqa: E402
 
 RETIRE = os.path.join(HERE, "emuwiz-cargo-retire")
+
+
+def S_keys():
+    import test_emuwiz_cargo_signing as S
+    return S.keys()
 DAY = 86400
 
 
@@ -37,13 +42,16 @@ def load_retire():
 class Base(T.Env):
     def setUp(self):
         super().setUp()
-        self.receipts = os.path.join(self.tmp, "receipts")
+        # signed executions must write into the instance's canonical receipts directory
+        self.receipts = os.path.join(self.env["EMUWIZ_RETENTION_DIR"], "maintenance", "receipts")
         for k in ("HOME", "EMUWIZ_TARGET_ROOT", "EMUWIZ_RETENTION_DIR", "EMUWIZ_OWNER"):
             old = os.environ.get(k)
             self.addCleanup(self.restore, k, old)
             os.environ[k] = self.env[k]
         os.environ.pop("EMUWIZ_RETENTION_NOW", None)
         self.mod = load_retire()
+        import test_emuwiz_cargo_signing as S
+        S.install_test_anchor(self.mod)
         self.full_visibility()
         self.victim = os.path.join(self.tmp, "victim")
         os.makedirs(self.victim)
@@ -122,11 +130,15 @@ class Base(T.Env):
             "deletion_paths_json": json.dumps(paths),
         }
 
-    def run_retire(self, path, digest, *extra, execute=False, window=False, extra_args=()):
+    def run_retire(self, path, digest, *extra, execute=False, window=False, extra_args=(), scoped="auto"):
         args = ["--manifest", path, "--approved-sha256", digest, "--receipt-dir", self.receipts, "--json"]
         args.extend(extra_args)
         if execute:
             args.append("--execute")
+            if scoped == "auto":
+                scoped = self.signed_record_for(path, digest)
+            if scoped:
+                args.extend(["--scoped-run", scoped])
         if window:
             args.append("--maintenance-window-attested")
         args.extend(extra)
@@ -136,6 +148,34 @@ class Base(T.Env):
         with contextlib.redirect_stdout(buffer):
             rc = self.mod.main(args)
         return rc, json.loads(buffer.getvalue())
+
+    def signed_record_for(self, path, digest, module=None):
+        """An owner-signed (test key) scoped-run record for exactly this manifest."""
+        import test_emuwiz_cargo_signing as S
+        X = module or self.mod
+        try:
+            with open(path) as handle:
+                groups = json.load(handle).get("cargo_artifact_groups", [])
+        except (OSError, ValueError):
+            groups = []
+        groups = [g for g in groups if isinstance(g, dict) and {"directory", "device", "inode"} <= set(g)]
+        if not groups:
+            return None
+        return S.write_record(X, path, digest, groups)
+
+    def inner_layer_only(self):
+        """Test the per-group defences BEHIND the scoped-run/owner-signature gate on their own.
+        The outer gate already refuses these inputs (non-canonical, foreign-root or
+        changed-identity targets) before any group is evaluated, which hides the inner holds;
+        this in-process stub stands in for a valid owner-signed record.  Production code has
+        no such switch."""
+        X = self.mod
+        facts = {"owner_signature": "VERIFIED", "signer_fingerprint": "SHA256:test-stub",
+                 "signature_sha256": "0" * 64, "signers_path": "stub", "signers_sha256": "0" * 64,
+                 "limitation": X.LIMITATION}
+        X.check_scoped_run = lambda *a, **k: ({"nonce": "0" * 32, "recorded_by": "stub"}, "0" * 64, facts)
+        X.consume_scoped_run = lambda *a, **k: None
+        X.record_signed_retirements = lambda receipt: []
 
     def outcomes(self, receipt):
         return {os.path.relpath(p["path"], g["directory"]): (p["outcome"], p["reason"])
@@ -298,6 +338,10 @@ class Authorisation(Base):
         self.age_record(t, 10)
         self.assertEqual(self.ret("finish", t, "--extra-target", t).returncode, 0)
         rc, rec = self.run_retire(path, digest, execute=True)
+        self.assertEqual(rec["refused"]["code"], "SCOPED_RUN_WRONG_ROOT")      # outer gate
+        self.assertTrue(self.exists(t, "debug/deps"))
+        self.inner_layer_only()
+        rc, rec = self.run_retire(path, digest, execute=True)
         self.assertIn("NONPARTICIPATING_WRITERS_NOT_EXCLUDED", {h["code"] for h in rec["groups"][0]["holds"]})
         self.assertTrue(self.exists(t, "debug/deps"))
         rc, rec = self.run_retire(path, digest, execute=True, window=True)
@@ -322,6 +366,8 @@ class Authorisation(Base):
         wt, t = self.managed_cache("wt-vis")
         path, digest = self.manifest([self.group(wt, t)])
         census = importlib.machinery.SourceFileLoader("fresh", RETIRE).load_module()
+        import test_emuwiz_cargo_signing as S
+        S.install_test_anchor(census)
         rc, r = self.mod_run_real(census, path, digest)
         gap = r["process_census"]["unreadable_foreign"]
         codes = {h["code"] for h in r["groups"][0]["holds"]}
@@ -337,7 +383,8 @@ class Authorisation(Base):
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
             rc = module.main(["--manifest", path, "--approved-sha256", digest, "--json", "--execute",
-                              "--receipt-dir", self.receipts])
+                              "--receipt-dir", self.receipts,
+                              "--scoped-run", self.signed_record_for(path, digest, module)])
         return rc, json.loads(buffer.getvalue())
 
 
@@ -423,12 +470,30 @@ class Concurrency(Base):
         rc, r = self.run_retire(path, digest, execute=True)
         self.assertEqual(r["groups"][0]["outcome"], "RETIRED", r["groups"][0]["holds"])
 
+    @staticmethod
+    def stop_fixture_sleep(pid):
+        """Stop the fixture's fake-cargo `sleep`, only if that PID is still that process."""
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as handle:
+                argv = handle.read().split(b"\0")
+        except OSError:
+            return
+        if argv and os.path.basename(argv[0]) == b"sleep" and argv[1:2] == [b"120"]:
+            os.kill(pid, 15)
+
     def test_orphaned_cargo_child_of_a_killed_wrapper_still_blocks(self):
         wt, t = self.managed_cache("wt-orphan")
         path, digest = self.manifest([self.group(wt, t)])
-        p = subprocess.Popen([T.ISO, "check"], cwd=wt, env=dict(self.env, FAKE_SLEEP="4"),
+        log = os.path.join(self.tmp, "orphan.log")
+        # long enough to outlive a slow retire run under load; the orphan is stopped in cleanup
+        p = subprocess.Popen([T.ISO, "check"], cwd=wt, env=dict(self.env, FAKE_SLEEP="120", FAKE_LOG=log),
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(1.0)
+        deadline = time.time() + 30
+        while not (os.path.exists(log) and os.path.getsize(log)) and time.time() < deadline:
+            time.sleep(0.1)
+        with open(log) as handle:
+            child = int(handle.read().split()[0])
+        self.addCleanup(self.stop_fixture_sleep, child)
         p.kill()
         p.wait()
         rc, r = self.run_retire(path, digest, execute=True)
@@ -649,6 +714,8 @@ class Corrections(Base):
                 "    def __init__(self, t, **kw):\n"
                 "        super().__init__(t, **kw); self.unreadable_foreign = 0\n"
                 "mod.F.Census = Full\n"
+                f"mod.OWNER_SIGNERS = {S_keys()['signers']!r}\n"
+                "mod.TRUST_ANCHOR_UID = os.geteuid()\n"
                 + body +
                 "sys.exit(mod.main(ARGS))\n"
             )
@@ -658,7 +725,8 @@ class Corrections(Base):
         script = self.driver(body)
         return subprocess.run(
             [sys.executable, "-I", script, RETIRE, "--manifest", path, "--approved-sha256", digest,
-             "--receipt-dir", self.receipts, "--json", "--execute"],
+             "--receipt-dir", self.receipts, "--json", "--execute",
+             "--scoped-run", self.signed_record_for(path, digest)],
             env=self.env, capture_output=True, text=True)
 
     def test_f2_sigkill_mid_entry_leaves_classifiable_evidence(self):
@@ -794,7 +862,8 @@ class Corrections(Base):
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = self.mod.main(["--manifest", path, "--approved-sha256", digest,
-                                "--receipt-dir", self.receipts, "--json", "--execute"])
+                                "--receipt-dir", self.receipts, "--json", "--execute",
+                                "--scoped-run", self.signed_record_for(path, digest)])
         self.assertEqual(rc, 5)
         self.assertIn("receipt could not be published", err.getvalue())
         (journal,) = self.journals()
@@ -810,7 +879,8 @@ class Corrections(Base):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             rc = self.mod.main(["--manifest", path, "--approved-sha256", digest,
-                                "--receipt-dir", os.path.join(t, "debug", "receipts"), "--json", "--execute"])
+                                "--receipt-dir", os.path.join(t, "debug", "receipts"), "--json", "--execute",
+                                "--scoped-run", self.signed_record_for(path, digest)])
         self.assertEqual(rc, 4)
         self.assertEqual(json.loads(out.getvalue())["refused"]["code"], "RECEIPT_DIR_INSIDE_CACHE")
         for rel in self.RELS:
@@ -842,6 +912,13 @@ class FilesystemRaces(Base):
         os.symlink(self.victim, os.path.join(t, "debug", "incremental"))
         base = self.group(wt, t, ["debug/incremental", "debug/deps"])
         path, digest = self.manifest([base])
+        # outer gate: a record for a target reached through a symlinked parent is refused outright
+        link0 = os.path.join(self.tmp, "link0")
+        os.symlink(os.path.dirname(t), link0)
+        p0, d0 = self.manifest([dict(base, directory=os.path.join(link0, os.path.basename(t)))], "m0.json")
+        rc, r = self.run_retire(p0, d0, execute=True)
+        self.assertEqual(r["refused"]["code"], "SCOPED_RUN_WRONG_ROOT")
+        self.inner_layer_only()
         rc, r = self.run_retire(path, digest, execute=True)
         out = self.outcomes(r)
         self.assertEqual(out["debug/incremental"][0], "HELD")
@@ -1116,6 +1193,10 @@ class OrphanRoute(Base):
         self.assertIn("OWNER_UNVERIFIED", self.holds(g)[0])
         self.assertTrue(self.exists(t, "debug/deps"))
         wt, t, g = self.orphan("wt-id2")           # directory identity differs from the manifest's
+        p0, d0 = self.manifest([dict(g, inode=g["inode"] + 1)], "id2-outer.json")
+        rc, r0 = self.run_retire(p0, d0, execute=True, window=True)
+        self.assertEqual(r0["refused"]["code"], "SCOPED_RUN_IDENTITY_CHANGED")   # outer gate
+        self.inner_layer_only()
         self.assertIn("DIRECTORY_IDENTITY_CHANGED", self.holds(dict(g, inode=g["inode"] + 1), "id2.json")[0])
         self.assertTrue(self.exists(t, "debug/deps"))
         wt, t, g = self.orphan("wt-id3")           # non-normalised recorded worktree path

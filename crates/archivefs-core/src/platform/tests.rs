@@ -404,7 +404,6 @@ fn an_alias_never_matches_a_substring_of_a_longer_folder_name() {
         "segacd32",
         "amiga-cd",
         "atari-jaguar-cd",
-        "amstrad-gx4000",
         "amstrad-pcw",
         "neo-geo-x",
         "intellivision-amico",
@@ -3296,4 +3295,156 @@ mod inspection_completeness {
         );
         assert_ne!(report.confidence, DetectionConfidence::Confirmed);
     }
+}
+
+/// The scan consequence of the Sega Pico entry (owner approval 2026-11-10 is
+/// for development only; the live library is not rescanned by this change):
+/// a `sega-pico` folder now names Sega Pico, while a Mega Drive folder and a
+/// Mega Drive header keep reading as Mega Drive. The Pico header is
+/// deliberately not a registry magic rule.
+#[test]
+fn a_sega_pico_folder_is_sega_pico_and_mega_drive_folders_are_unchanged() {
+    for folder in [
+        "sega-pico",
+        "Sega Pico",
+        "pico",
+        "kids-pico",
+        "segatoys-pico",
+    ] {
+        assert_eq!(platform_for_folder(folder), Some("Sega Pico"), "{folder}");
+        let zip = detect(&format!("{ROOT}/{folder}/Anpanman (Japan).zip"));
+        assert_eq!(zip.platform, Some("Sega Pico"), "{folder}");
+    }
+    for folder in ["megadrive", "genesis", "md"] {
+        assert_eq!(platform_for_folder(folder), Some("MegaDrive"), "{folder}");
+    }
+    // Extension-only files outside any system folder:
+    // `.md` was already ambiguous (Sega 32X lists it too); the Pico is one
+    // more named candidate, never a new decision.
+    let md = detect(&format!("{ROOT}/misc/Game.md"));
+    assert_eq!(md.platform, None, "{md:?}");
+    let named: Vec<_> = md.candidates.iter().map(|c| c.platform).collect();
+    assert_eq!(named, ["MegaDrive", "Sega 32X", "Sega Pico"]);
+    assert_eq!(
+        detect(&format!("{ROOT}/misc/Game.smd")).platform,
+        Some("MegaDrive")
+    );
+    let tree = TempTree::new("pico-header-registry");
+    let mut rom = vec![0u8; 0x400];
+    rom[0x100..0x109].copy_from_slice(b"SEGA PICO");
+    let path = tree.file("megadrive/Pico Game.md", &rom);
+    let report =
+        detect_platform_report(&DetectionRequest::new(&path, tree.path()).inspecting_content());
+    assert_eq!(report.platform, Some("MegaDrive"), "{report:?}");
+    let pico = platform_by_id("Sega Pico").expect("registered");
+    assert!(pico.magic.is_empty());
+    assert!(pico.conflicts_with.contains(&"MegaDrive"));
+    assert!(pico.accepts_extension("zip") && !pico.accepts_extension("pco"));
+}
+
+#[test]
+fn a_prg_alone_never_names_a_commodore_machine() {
+    let report = detect(&format!("{ROOT}/unsorted/game.prg"));
+    assert_eq!(report.platform, None);
+    assert!(report.requires_confirmation);
+    let names: Vec<_> = report.candidates.iter().map(|c| c.platform).collect();
+    for expected in [
+        "Commodore 64",
+        "Commodore 128",
+        "VIC-20",
+        "Commodore 16",
+        "Commodore Plus-4",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "{expected} missing from {names:?}"
+        );
+    }
+}
+
+#[test]
+fn a_prg_follows_folder_evidence_and_c16_plus4_folders_are_never_c64() {
+    assert_eq!(
+        detect(&format!("{ROOT}/c64/game.prg")).platform,
+        Some("Commodore 64")
+    );
+    assert_eq!(
+        detect(&format!("{ROOT}/vic20/game.prg")).platform,
+        Some("VIC-20")
+    );
+    assert_eq!(
+        detect(&format!("{ROOT}/c128/game.prg")).platform,
+        Some("Commodore 128")
+    );
+    for (folder, platform) in [
+        ("c16", "Commodore 16"),
+        ("commodore16", "Commodore 16"),
+        ("c116", "Commodore 16"),
+        ("plus4", "Commodore Plus-4"),
+        ("plus-4", "Commodore Plus-4"),
+        ("commodore-plus-4", "Commodore Plus-4"),
+    ] {
+        let report = detect(&format!("{ROOT}/{folder}/game.prg"));
+        assert_eq!(report.platform, Some(platform), "{folder}");
+        assert_ne!(report.platform, Some("Commodore 64"), "{folder}");
+    }
+}
+
+#[test]
+fn c16_and_plus4_are_distinct_but_equivalent_ted_machines() {
+    assert_eq!(
+        platform_for_alias("c16").map(|p| p.id),
+        Some("Commodore 16")
+    );
+    assert_eq!(
+        platform_for_alias("plus4").map(|p| p.id),
+        Some("Commodore Plus-4")
+    );
+    assert_eq!(
+        equivalent_platform_ids("Commodore 16"),
+        vec!["Commodore Plus-4"]
+    );
+    assert_eq!(
+        equivalent_platform_ids("Commodore Plus-4"),
+        vec!["Commodore 16"]
+    );
+    for id in ["Commodore 16", "Commodore Plus-4"] {
+        assert!(
+            equivalent_platform_ids("Commodore 64")
+                .iter()
+                .all(|e| *e != id)
+        );
+        assert!(equivalent_platform_ids("VIC-20").iter().all(|e| *e != id));
+    }
+}
+
+#[test]
+fn a_c16_tape_header_names_the_c16_and_contradicts_a_c64_folder() {
+    let tree = TempTree::new("commodore-tap-c16");
+    let mut tap = Vec::from(&b"C64-TAPE-RAW"[..]);
+    tap.extend([2, 2, 0, 0]);
+    tap.extend(1_u32.to_le_bytes());
+    tap.push(0xaa);
+    let loose = tree.file("unsorted/c16.tap", &tap);
+    let report =
+        detect_platform_report(&DetectionRequest::new(&loose, tree.path()).inspecting_content());
+    assert_eq!(report.platform, Some("Commodore 16"));
+    assert_eq!(report.confidence, DetectionConfidence::Confirmed);
+
+    // Filed under c64/ by mistake: the folder still answers, but only as
+    // Probable with the C16 on show, so the wrong assignment is visible and
+    // waits for a person instead of being confirmed as a C64 tape.
+    let misfiled = tree.file("c64/c16.tap", &tap);
+    let report =
+        detect_platform_report(&DetectionRequest::new(&misfiled, tree.path()).inspecting_content());
+    assert_ne!(report.confidence, DetectionConfidence::Confirmed);
+    assert!(report.requires_confirmation);
+    assert!(
+        report
+            .candidates
+            .iter()
+            .any(|c| c.platform == "Commodore 16"),
+        "{:?}",
+        report.candidates
+    );
 }

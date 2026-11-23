@@ -21,17 +21,21 @@
 //! `main.rs`, so Part 2 does not need to move it.
 
 pub(crate) mod amiga_adf;
+pub(crate) mod answers;
 pub(crate) mod azahar_homebrew;
 pub(crate) mod cemu;
 mod controller;
+pub(crate) mod firmware_answers;
 pub(crate) mod flycast_gdi;
 pub(crate) mod hatari;
 pub(crate) mod mesen;
+pub(crate) mod prepared_media;
 pub(crate) mod profile_resolution;
 pub(crate) mod readiness_input;
 #[cfg(target_os = "linux")]
 pub(crate) mod shadps4;
 mod state;
+pub(crate) mod unverified_media;
 pub(crate) mod vita3k_library;
 pub(crate) mod xroar_cassette;
 pub(crate) mod zx_snapshot;

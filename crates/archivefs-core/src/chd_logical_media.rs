@@ -79,6 +79,15 @@ pub use crate::raw_cd_sector::{
 };
 use crate::raw_cd_sector::{RawCdSectorMode, extract_user_data};
 
+mod gdrom;
+#[cfg(test)]
+pub(crate) use gdrom::synthetic_gdrom_chd;
+pub use gdrom::{
+    CHD_TRACK_PADDING_FRAMES, ChdGdromHighDensityMedia, GDROM_HIGH_DENSITY_START_LBA,
+    GdromTrackPlacement, high_density_data_tracks, open_chd_gdrom_high_density_file,
+    place_gdrom_tracks,
+};
+
 #[derive(Debug, Clone, Copy)]
 enum TrackKind {
     Mode1Raw,
@@ -168,6 +177,11 @@ pub struct ChdTrackLogicalMediaReader<R: Read + Seek> {
     chd: RefCell<Chd<R>>,
     hunk_bytes: u64,
     unit_bytes: u64,
+    /// Physical frame index (in CHD units) where the selected track's first
+    /// frame is stored. Zero for the track-1 reader; a GD-ROM high-density
+    /// track sits after every earlier track's frames, each padded by
+    /// chdman to a multiple of [`CHD_TRACK_PADDING_FRAMES`].
+    start_frame: u64,
     frame_count: u64,
     track_kind: TrackKind,
     /// A single decoded-hunk cache: `(hunk_index, decoded bytes)`. Bounded
@@ -284,6 +298,7 @@ fn build_chd_track_logical_media<R: Read + Seek>(
         chd: RefCell::new(chd),
         hunk_bytes,
         unit_bytes,
+        start_frame: 0,
         frame_count: u64::from(candidate.frames),
         track_kind,
         cache: RefCell::new(None),
@@ -329,7 +344,7 @@ impl<R: Read + Seek> ChdTrackLogicalMediaReader<R> {
                 self.frame_count
             ));
         }
-        let absolute_byte_offset = sector_index * self.unit_bytes;
+        let absolute_byte_offset = (self.start_frame + sector_index) * self.unit_bytes;
         let hunk_index = u32::try_from(absolute_byte_offset / self.hunk_bytes)
             .map_err(|_| "hunk index exceeds u32 range".to_string())?;
         let offset_within_hunk = (absolute_byte_offset % self.hunk_bytes) as usize;
@@ -355,7 +370,7 @@ impl<R: Read + Seek> ChdTrackLogicalMediaReader<R> {
                 self.frame_count
             ));
         }
-        let absolute_byte_offset = sector_index * self.unit_bytes;
+        let absolute_byte_offset = (self.start_frame + sector_index) * self.unit_bytes;
         let hunk_index = u32::try_from(absolute_byte_offset / self.hunk_bytes)
             .map_err(|_| "hunk index exceeds u32 range".to_string())?;
         let offset_within_hunk = (absolute_byte_offset % self.hunk_bytes) as usize;

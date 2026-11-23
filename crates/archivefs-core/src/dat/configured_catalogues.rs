@@ -52,6 +52,18 @@ impl ConfiguredCatalogue {
 pub fn configured_catalogues(
     inputs: CatalogueInventoryInputs<'_>,
 ) -> HashMap<String, ConfiguredCatalogue> {
+    configured_catalogues_among(inputs, None)
+}
+
+/// [`configured_catalogues`] restricted to `wanted` audit IDs: exactly the
+/// same rows for those IDs, without reading any other catalogue's bytes.
+/// Sources sharing an ID are all wanted or all skipped, so the ambiguity
+/// rule is unchanged.
+pub fn configured_catalogues_among(
+    inputs: CatalogueInventoryInputs<'_>,
+    wanted: Option<&HashSet<String>>,
+) -> HashMap<String, ConfiguredCatalogue> {
+    let is_wanted = |id: &str| wanted.is_none_or(|wanted| wanted.contains(id));
     let mut rows = HashMap::new();
     let mut seen = HashSet::new();
     let mut insert = |row: ConfiguredCatalogue| {
@@ -71,6 +83,9 @@ pub fn configured_catalogues(
         .map(|descriptor| managed_dat_audit_source_id(descriptor.source_id()))
         .collect();
     for entry in inputs.local_registry.entries() {
+        if !is_wanted(&entry.id) {
+            continue;
+        }
         if !entry.enabled
             || super::sources::validation::validate_dat_path(&entry.path, entry.kind).is_err()
             || managed_ids.contains(&entry.id)
@@ -115,6 +130,9 @@ pub fn configured_catalogues(
         else {
             continue;
         };
+        if !is_wanted(&managed_dat_audit_source_id(&state.source_id)) {
+            continue;
+        }
         if descriptor.update_policy() == super::updates::ManagedDatUpdatePolicy::Disabled {
             continue;
         }
@@ -139,18 +157,29 @@ pub fn configured_catalogues(
 }
 
 pub fn load_configured_catalogues(local_config: &Path) -> HashMap<String, ConfiguredCatalogue> {
+    load_configured_catalogues_among(local_config, None)
+}
+
+/// [`load_configured_catalogues`] reading only the `wanted` catalogues.
+pub fn load_configured_catalogues_among(
+    local_config: &Path,
+    wanted: Option<&HashSet<String>>,
+) -> HashMap<String, ConfiguredCatalogue> {
     let config = load_dat_sources_config_from(local_config).unwrap_or_default();
     let (local, _) = DatSourceRegistry::from_config(&config);
     let managed = load_managed_dat_sources_default().unwrap_or_default();
     let Ok(root) = managed_dat_root() else {
         return HashMap::new();
     };
-    configured_catalogues(CatalogueInventoryInputs {
-        local_registry: &local,
-        managed_sources: &managed,
-        managed_root: &root,
-        limits: super::limits::DatLimits::default(),
-    })
+    configured_catalogues_among(
+        CatalogueInventoryInputs {
+            local_registry: &local,
+            managed_sources: &managed,
+            managed_root: &root,
+            limits: super::limits::DatLimits::default(),
+        },
+        wanted,
+    )
 }
 
 /// Resolves the exact current source by its durable audit ID. Managed resolution

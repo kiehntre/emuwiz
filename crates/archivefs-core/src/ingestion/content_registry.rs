@@ -223,6 +223,10 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("tap", ContentKind::TapeImage),
     cf("tzx", ContentKind::TapeImage),
     cf("t64", ContentKind::TapeImage),
+    // A Commodore program file is a stored program, not a disk or tape image.
+    // The machine is never inferred from the extension (see
+    // `crate::platform::SHARED_EXTENSIONS`).
+    cf("prg", ContentKind::Executable),
     // --- Sinclair-family machine snapshots ---
     // The category is knowable from the extension; the machine family is not,
     // and is confirmed by `crate::zx_spectrum_snapshot` parsing the bytes in
@@ -356,6 +360,14 @@ mod tests {
         assert_eq!(
             content_kind_for_extension("d88"),
             Some(ContentKind::ComputerDisk)
+        );
+    }
+
+    #[test]
+    fn commodore_prg_is_a_program_not_a_disk_or_tape() {
+        assert_eq!(
+            content_kind_for_extension("prg"),
+            Some(ContentKind::Executable)
         );
     }
 

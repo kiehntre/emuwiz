@@ -48,6 +48,9 @@ pub mod arcade_compatibility;
 pub mod arcade_fbneo_compatibility;
 /// Read-only per-set compatibility against pinned installed MAME evidence.
 pub mod arcade_mame_compatibility;
+/// Per-set routing of extracted Arcade set directories to the installed MAME
+/// from MAME's own `-listxml` / `-verifyroms` data (no category gates).
+pub mod arcade_mame_routing;
 /// Deterministic emulator recommendation from existing arcade evidence.
 pub mod arcade_recommendation;
 /// Bounded Atari 8-bit standard cassette WAV evidence.
@@ -63,6 +66,8 @@ pub mod bios_projection;
 pub mod catalogue_health;
 pub mod catalogue_reconciliation;
 pub mod catalogue_supersession;
+/// Daedalus: evidence-driven diagnosis of emulator launch problems.
+pub mod daedalus;
 mod database;
 /// Read-only Doctor diagnostics: one shared finding model plus adapters
 /// over the existing per-subsystem reports. See the module documentation
@@ -138,6 +143,7 @@ pub mod retroachievements;
 pub mod retrobios_provider;
 pub mod retrobios_viewer;
 pub mod rom_representation_diagnostics;
+pub mod save_continuity;
 pub mod save_migration_planner;
 pub mod save_migration_readiness;
 /// Local immutable emulator-save snapshots and conservative restore previews.
@@ -155,6 +161,8 @@ pub mod tape_audio;
 pub mod test_environment;
 /// Bounded, read-only Thomson SAP floppy evidence.
 pub mod thomson_sap;
+#[cfg(target_os = "linux")]
+pub mod transform;
 pub mod uef_tape;
 /// A disposable profile holding one production-verified synthetic game.
 #[cfg(any(test, feature = "test-support"))]
@@ -166,29 +174,35 @@ pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
     BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE, CatalogueStats, CompletedScanSummary,
     CueDiscCatalogue, CueDiscRevalidation, CurrentLibraryDatEvidence, DAT_ROMM_AGREEMENT_SOURCE,
-    DatDiscOrderOutcome, Database, DatabaseCheckOutcome, DatabaseCheckStatus, DatabaseDiagnostic,
-    DatabaseDiagnosticCode, DatabaseDiagnosticSeverity, DatabaseFileFinding, DatabaseHealth,
-    DatabaseHealthReport, DatabaseOpenOutcome, DatabaseRestorePlan, DatabaseRestoreReceipt,
-    DatabaseRestoreResult, DatabaseRestoreState, DatabaseSidecarFinding, DatabaseSidecarKind,
-    DatabaseUpgradeReport, DiscoveryDetailFilter, DiscoveryDetailRecord, DiscoveryDetailsPage,
-    DiscoveryRunId, DiscoveryRunStatus, GameScanDisposition, LibraryDatState,
-    MANUAL_PLATFORM_SOURCE, MAX_RETAINED_DISCOVERY_RUNS, MissingArchiveRemovalResult,
-    PersistedArchive, PersistedSetAuditDependency, PersistedSetAuditResult, PlatformAlias,
-    PlatformAssignmentChange, PlatformIdentityApplyOutcome, PlatformIdentityConflictDetail,
-    PlatformIdentityEnrichmentSummary, PlatformProvenanceDetails, ROMM_PLATFORM_SOURCE,
-    RecentScanAdditions, RegisteredSourceFolder, SOURCE_PLATFORM_ASSIGNMENT_SOURCE,
-    ScanPersistSummary, ScanRunCounts, ScummVmScanReport, SourceFolderRecord, SourceRole,
-    SourceScanStatus, TopologyPersistOutcome, UpgradeBackupInspection, UpgradeBackupState,
-    VERIFIED_DAT_PLATFORM_SOURCE, check_database_health, default_database_path, diagnose_database,
+    DatDiscOrderOutcome, DatRecheckAttempt, Database, DatabaseCheckOutcome, DatabaseCheckStatus,
+    DatabaseDiagnostic, DatabaseDiagnosticCode, DatabaseDiagnosticSeverity, DatabaseFileFinding,
+    DatabaseHealth, DatabaseHealthReport, DatabaseOpenOutcome, DatabaseRestorePlan,
+    DatabaseRestoreReceipt, DatabaseRestoreResult, DatabaseRestoreState, DatabaseSidecarFinding,
+    DatabaseSidecarKind, DatabaseUpgradeReport, DiscoveryDetailFilter, DiscoveryDetailRecord,
+    DiscoveryDetailsPage, DiscoveryRunId, DiscoveryRunStatus, GameScanDisposition,
+    JournalRecoveryReceipt, JournalRecoveryState, LibraryDatState, MANUAL_PLATFORM_SOURCE,
+    MAX_RETAINED_DISCOVERY_RUNS, MissingArchiveRemovalResult, PersistedArchive,
+    PersistedSetAuditDependency, PersistedSetAuditResult, PlatformAlias, PlatformAssignmentChange,
+    PlatformIdentityApplyOutcome, PlatformIdentityConflictDetail,
+    PlatformIdentityEnrichmentSummary, PlatformProvenanceDetails, PlatformReviewItem,
+    PreservedFile, ROMM_PLATFORM_SOURCE, RecentScanAdditions, RegisteredSourceFolder,
+    RommPlatformSuggestion, SOURCE_PLATFORM_ASSIGNMENT_SOURCE, SavedDatEvidenceRow,
+    SavedDatEvidenceStatus, ScanPersistSummary, ScanRunCounts, ScummVmScanReport,
+    SourceFolderRecord, SourceRole, SourceScanStatus, TopologyPersistOutcome,
+    UpgradeBackupInspection, UpgradeBackupState, VERIFIED_DAT_PLATFORM_SOURCE, VerifiedDatName,
+    apply_journal_recovery, check_database_health, default_database_path, diagnose_database,
     format_unix_timestamp_utc, inspect_upgrade_backup_evidence, inspect_upgrade_backups,
     latest_schema_version, pending_schema_migration_versions,
-    persisted_archive_has_unknown_platform, prepare_database_restore, restore_database,
+    persisted_archive_has_unknown_platform, platform_source_words, prepare_database_restore,
+    prepare_journal_recovery, read_journal_recovery_receipt, restore_database,
     rollback_database_restore, scan_and_persist, upgrade_library_database,
 };
 pub use database::{
-    DiscoveryImportExclusion, DiscoveryImportItem, DiscoveryImportOperation,
-    DiscoveryImportUndoPreview, DiscoveryImportUndoResult, MissingCleanupTarget,
-    PreservationFreshness,
+    CollectionItemKey, CollectionReanchor, DiscoveryImportExclusion, DiscoveryImportItem,
+    DiscoveryImportOperation, DiscoveryImportUndoPreview, DiscoveryImportUndoResult,
+    GameCollection, GameCollectionItem, GameCollectionKind, JournalledMoves,
+    MAX_COLLECTION_NAME_CHARS, MissingCleanupTarget, NestedMountOutcome, NestedMountState,
+    PreservationFreshness, validate_collection_name,
 };
 pub use database::{
     FileIdentity, InterruptedRestoreAssessment, InterruptedRestoreOutcome,
@@ -196,6 +210,7 @@ pub use database::{
     interrupted_restore_receipts, preview_interrupted_restore, read_database_restore_receipt,
     review_database_rollback,
 };
+pub use database::{MAX_SCAN_HISTORY_RUNS, RecordedScanCounts, ScanRunCoverage, ScanRunRecord};
 
 mod inspector;
 pub use inspector::{
@@ -208,6 +223,7 @@ pub mod archive_member_resolver;
 pub mod archive_workflow;
 pub mod folder_platform_check;
 pub mod memory_card_inventory;
+pub mod memory_card_manager;
 pub mod persistent_state_inventory;
 pub mod save_state_compatibility;
 pub mod save_state_orchestration;
@@ -225,6 +241,7 @@ pub use archive_member_resolver::{
 pub mod game_identity;
 pub mod scummvm_detection;
 pub mod zip_cartridge_stage;
+pub mod zip_floppy_set;
 
 mod library_view_history;
 pub use library_view_history::{
@@ -266,6 +283,7 @@ pub use library_views::{
 /// Read-only external identity providers - RomM in Stage 1, with room for local
 /// DAT catalogues and Hasheous later.
 pub mod identity_source;
+pub mod loose_cartridge;
 /// Explicit, user-approved descriptive metadata enrichment. This is kept
 /// separate from identity/platform evidence by construction.
 pub mod screenscraper_enrichment;
@@ -311,6 +329,10 @@ pub mod storage_health;
 /// Read-only projection of persisted source-folder/database state into the
 /// generic source-root migration planner.
 pub mod source_folder_migration;
+
+/// Game recovery engine: evidence-backed diagnosis of games that cannot start
+/// and verified, create-new preparation of playable copies.
+pub mod recovery;
 
 /// Read-only projection of active rename/recovery transaction paths into the
 /// generic source-root migration planner.
@@ -699,6 +721,10 @@ pub mod mod_history;
 pub mod classic_poke_family;
 /// Per-game, read-only view of classic POKE trainers (never applies anything).
 pub mod classic_trainer_evidence;
+/// Game package boundaries (single file, CUE/GDI/M3U set, game folder).
+pub mod game_package;
+/// Manual system choices kept outside the database (survive rebuilds).
+pub mod manual_platform_choices;
 /// Provider-neutral, metadata-only catalogue records for future mod sources.
 pub mod mod_catalogue;
 /// Provider-neutral, metadata-only discovery and user-acquisition handoff.
@@ -709,6 +735,8 @@ pub mod mod_provider;
 pub mod moddb;
 /// Legal/open cheat-provider metadata and conservative local projections.
 pub mod open_retro_cheat_providers;
+/// Re-points RetroArch JSON playlists at games EmuWiz moved.
+pub mod retroarch_playlist_relink;
 /// Bounded import of user-supplied local ROM-hack metadata.
 pub mod rom_hack_catalogue;
 
@@ -4772,9 +4800,31 @@ impl Archive {
         path: impl AsRef<Path>,
         source_root: impl Into<PathBuf>,
     ) -> Option<Self> {
+        Self::from_path_in_root_with_loose(path, source_root, None, false)
+    }
+
+    /// As [`Self::from_path_in_root`], with a loose-cartridge verdict the
+    /// scanner already computed. `keep_catalogued_copy`: the file is already
+    /// a library row, so a ZIP added beside it later never hides that row
+    /// (its identity and history stay attached).
+    pub(crate) fn from_path_in_root_with_loose(
+        path: impl AsRef<Path>,
+        source_root: impl Into<PathBuf>,
+        loose: Option<&loose_cartridge::LooseCartridge>,
+        keep_catalogued_copy: bool,
+    ) -> Option<Self> {
         let path = path.as_ref();
         let source_root = source_root.into();
-        let kind = archive_kind_in_root(path, &source_root)?;
+        let kind = match loose {
+            Some(verdict) => (verdict.is_catalogued()
+                || (keep_catalogued_copy
+                    && matches!(
+                        verdict,
+                        loose_cartridge::LooseCartridge::IdenticalCopy { .. }
+                    )))
+            .then_some(ArchiveKind::DirectGameImage)?,
+            None => archive_kind_in_root(path, &source_root)?,
+        };
         let metadata = fs::symlink_metadata(path)
             .ok()
             .filter(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
@@ -4932,10 +4982,25 @@ pub(crate) fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<Ar
             }),
         };
     }
+    // A Commodore `.prg` is stored on its extension, but arcade and console
+    // dumps use the same name for program-ROM chips (`arcade/<set>/1game.prg`,
+    // `famibox/0.prg`). A folder naming a system that has no `.prg` media is a
+    // positive refusal, exactly like the `.gen` rule below.
+    if extension == "prg" && folder_refuses_commodore_program(path, source_root) {
+        return None;
+    }
     if let Some(kind) = archive_kind(path) {
         return Some(kind);
     }
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    // A `.bin` directly in a folder naming a cartridge system with raw `.bin`
+    // dumps: catalogued when its size/header fits, unless it is a proven
+    // identical copy of a sibling ZIP (see `loose_cartridge`).
+    if extension == "bin" && loose_cartridge::candidate_platform(path).is_some() {
+        return loose_cartridge::classify(path)
+            .is_catalogued()
+            .then_some(ArchiveKind::DirectGameImage);
+    }
     if !media_registry::is_corroboration_candidate(&extension) {
         return None;
     }
@@ -4959,6 +5024,21 @@ pub(crate) fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<Ar
     }
     let header_match = !nested_match && !source_root_match && has_mega_drive_cartridge_header(path);
     (nested_match || source_root_match || header_match).then_some(ArchiveKind::MegaDriveRom)
+}
+
+/// Whether the nearest folder (or the source root) names a platform whose
+/// media never includes `.prg`.
+fn folder_refuses_commodore_program(path: &Path, source_root: &Path) -> bool {
+    let refuses = |platform: &str| {
+        !platform::platform_by_id(platform).is_some_and(|entry| entry.accepts_extension("prg"))
+    };
+    detect_platform_from_folder_alias_with_match(path, source_root)
+        .is_some_and(|(platform, _)| refuses(platform))
+        || source_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(folder_platform_alias)
+            .is_some_and(refuses)
 }
 
 pub fn is_supported_archive(path: impl AsRef<Path>) -> bool {
@@ -6094,6 +6174,9 @@ pub struct ArchiveStatus {
 
 pub struct ArchiveScanner<'a> {
     config: &'a Config,
+    /// Nested mounts whose cached observations may be reused (see
+    /// [`ArchiveScanner::with_trusted_nested_areas`]).
+    trusted_nested_areas: Vec<PathBuf>,
 }
 
 // v2 records that stable direct-media classifications are reusable under the
@@ -6187,9 +6270,40 @@ pub enum SkipReason {
     /// that merely shares one of these three extensions (for example a
     /// ScummVM `RESOURCE.GEN`) is reported this way, not as unsupported.
     AmbiguousPlatform,
+    /// A loose cartridge byte-identical to the only file of a sibling ZIP the
+    /// library already catalogues: an alternate copy, reported rather than
+    /// catalogued twice. Neither file is changed.
+    IdenticalCopy,
 }
 
 impl SkipReason {
+    /// Every reason, in the order reports list them.
+    pub const ALL: [SkipReason; 5] = [
+        Self::UnsupportedExtension,
+        Self::UnsupportedVariant,
+        Self::InvalidContent,
+        Self::AmbiguousPlatform,
+        Self::IdenticalCopy,
+    ];
+
+    /// The stable key stored in `scan_run_skip_counts.reason` (schema 30).
+    /// Never rename one: stored rows outlive the binary that wrote them.
+    pub fn storage_key(self) -> &'static str {
+        match self {
+            Self::UnsupportedExtension => "unsupported_extension",
+            Self::InvalidContent => "invalid_content",
+            Self::UnsupportedVariant => "unsupported_variant",
+            Self::AmbiguousPlatform => "ambiguous_platform",
+            Self::IdenticalCopy => "identical_copy",
+        }
+    }
+
+    pub fn from_storage_key(key: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|reason| reason.storage_key() == key)
+    }
+
     /// A short, human-readable label - what a GUI shows for this reason.
     pub fn label(self) -> &'static str {
         match self {
@@ -6197,7 +6311,68 @@ impl SkipReason {
             Self::InvalidContent => "Unsupported or invalid media structure",
             Self::UnsupportedVariant => "Recognised, unsupported variant",
             Self::AmbiguousPlatform => "Ambiguous platform",
+            Self::IdenticalCopy => "Identical copy of a catalogued ZIP",
         }
+    }
+}
+
+/// Exact skipped-file totals per [`SkipReason`]. Counted for every skipped
+/// file, so unlike the bounded samples they are never truncated; schema 30
+/// stores them per scan run and source (`scan_run_skip_counts`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SkipReasonCounts {
+    pub unsupported_extension: u64,
+    pub unsupported_variant: u64,
+    pub invalid_content: u64,
+    pub ambiguous_platform: u64,
+    pub identical_copy: u64,
+}
+
+impl SkipReasonCounts {
+    pub fn get(&self, reason: SkipReason) -> u64 {
+        match reason {
+            SkipReason::UnsupportedExtension => self.unsupported_extension,
+            SkipReason::UnsupportedVariant => self.unsupported_variant,
+            SkipReason::InvalidContent => self.invalid_content,
+            SkipReason::AmbiguousPlatform => self.ambiguous_platform,
+            SkipReason::IdenticalCopy => self.identical_copy,
+        }
+    }
+
+    fn slot(&mut self, reason: SkipReason) -> &mut u64 {
+        match reason {
+            SkipReason::UnsupportedExtension => &mut self.unsupported_extension,
+            SkipReason::UnsupportedVariant => &mut self.unsupported_variant,
+            SkipReason::InvalidContent => &mut self.invalid_content,
+            SkipReason::AmbiguousPlatform => &mut self.ambiguous_platform,
+            SkipReason::IdenticalCopy => &mut self.identical_copy,
+        }
+    }
+
+    pub fn record(&mut self, reason: SkipReason) {
+        *self.slot(reason) += 1;
+    }
+
+    pub fn set(&mut self, reason: SkipReason, count: u64) {
+        *self.slot(reason) = count;
+    }
+
+    pub fn merge(&mut self, other: &Self) {
+        for reason in SkipReason::ALL {
+            *self.slot(reason) += other.get(reason);
+        }
+    }
+
+    pub fn total(&self) -> u64 {
+        SkipReason::ALL
+            .into_iter()
+            .map(|reason| self.get(reason))
+            .sum()
+    }
+
+    /// `(reason, count)` for every reason, in [`SkipReason::ALL`] order.
+    pub fn entries(&self) -> [(SkipReason, u64); 5] {
+        SkipReason::ALL.map(|reason| (reason, self.get(reason)))
     }
 }
 
@@ -6217,6 +6392,10 @@ pub struct ArchiveScanDiscovery {
     pub archives: Vec<Archive>,
     pub skipped_unsupported_extension: usize,
     pub skipped_ambiguous_platform: usize,
+    /// Exact totals per [`SkipReason`] for the whole walk, independent of
+    /// every bounded sample (`skipped_files`, `non_archive_fingerprints`).
+    /// The two historical counters above are coarser projections of these.
+    pub skip_reason_counts: SkipReasonCounts,
     /// A bounded (see [`MAX_RETAINED_SKIPPED_FILES`]) sample of individual
     /// skipped files, for GUI drill-down. The exact totals always live in
     /// `skipped_unsupported_extension`/`skipped_ambiguous_platform` - this
@@ -6235,6 +6414,32 @@ pub struct ArchiveScanDiscovery {
     /// parent directory's, so same-device bind mounts count). Remembered so a later scan that finds one gone or
     /// replaced cannot treat the files formerly beneath it as deleted.
     pub nested_boundaries: Vec<catalogue_health::NestedBoundaryObservation>,
+    /// Every nested mount met, in walk order. Errors inside a walked area
+    /// are counted there, not against the source, so one unreadable mount
+    /// cannot make the rest of the source partial.
+    pub nested_areas: Vec<DiscoveredNestedArea>,
+}
+
+/// One nested filesystem found inside a source during discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredNestedArea {
+    pub path: PathBuf,
+    /// The area this one is nested in, if any.
+    pub parent_area: Option<usize>,
+    pub mount_id: u64,
+    pub device: u64,
+    pub inode: u64,
+    /// A FUSE archive mount that was walked. Anything else was not entered.
+    pub supported: bool,
+    pub archives: usize,
+    pub scan_errors: Vec<ScanError>,
+    pub scan_errors_total: usize,
+}
+
+impl DiscoveredNestedArea {
+    pub fn is_complete(&self) -> bool {
+        self.supported && self.scan_errors_total == 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6261,6 +6466,23 @@ impl ArchiveScanDiscovery {
         self.scan_errors_total == 0
     }
 
+    /// Records an error against the nested area it happened in, or against
+    /// the source itself outside every area.
+    fn record_error_in(&mut self, area: Option<usize>, path: PathBuf, message: impl Into<String>) {
+        let Some(index) = area else {
+            self.record_scan_error(path, message);
+            return;
+        };
+        let area = &mut self.nested_areas[index];
+        area.scan_errors_total = area.scan_errors_total.saturating_add(1);
+        if area.scan_errors.len() < MAX_RETAINED_SCAN_ERRORS {
+            area.scan_errors.push(ScanError {
+                path,
+                message: message.into(),
+            });
+        }
+    }
+
     pub fn scan_errors_truncated(&self) -> bool {
         self.scan_errors_total > self.scan_errors.len()
     }
@@ -6283,7 +6505,18 @@ impl ArchiveScanDiscovery {
 
 impl<'a> ArchiveScanner<'a> {
     pub fn new(config: &'a Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            trusted_nested_areas: Vec::new(),
+        }
+    }
+
+    /// Nested mounts the caller has proven to be the same trusted mount as
+    /// at the last scan. Cached file observations are reused only inside
+    /// these; every other nested mount is inspected afresh.
+    pub fn with_trusted_nested_areas(mut self, areas: Vec<PathBuf>) -> Self {
+        self.trusted_nested_areas = areas;
+        self
     }
 
     pub fn scan_archives(&self) -> Result<Vec<Archive>> {
@@ -6429,14 +6662,16 @@ impl<'a> ArchiveScanner<'a> {
         let root_mount = catalogue_health::directory_mount(source)
             .map(|mount| mount.mount_id)
             .map_err(|error| ArchiveFsError::io(source.to_path_buf(), error))?;
-        let mut directories = vec![(source.to_path_buf(), 0_usize, root_mount)];
-        while let Some((directory, depth, parent_mount)) = directories.pop() {
+        let mut directories = vec![(source.to_path_buf(), 0_usize, root_mount, None::<usize>)];
+        let untrusted_fingerprints = HashMap::new();
+        while let Some((directory, depth, parent_mount, mut area)) = directories.pop() {
             discovery.timings.directories_visited += 1;
             let traversal_started = Instant::now();
             let before = match fs::symlink_metadata(&directory) {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    discovery.record_scan_error(
+                    discovery.record_error_in(
+                        area,
                         directory.clone(),
                         ArchiveFsError::io(directory.clone(), error).to_string(),
                     );
@@ -6444,7 +6679,8 @@ impl<'a> ArchiveScanner<'a> {
                 }
             };
             if before.file_type().is_symlink() || !before.is_dir() {
-                discovery.record_scan_error(
+                discovery.record_error_in(
+                    area,
                     directory.clone(),
                     format!(
                         "source directory changed or became unsafe during scan: {}",
@@ -6457,7 +6693,8 @@ impl<'a> ArchiveScanner<'a> {
                 Ok(mount) => mount,
                 Err(error) => {
                     // Without a mount identity a boundary cannot be excluded.
-                    discovery.record_scan_error(
+                    discovery.record_error_in(
+                        area,
                         directory.clone(),
                         format!(
                             "mount identity unavailable for {}: {error}",
@@ -6476,12 +6713,47 @@ impl<'a> ArchiveScanner<'a> {
                         inode: directory_mount.inode,
                         mount_id: directory_mount.mount_id,
                     });
+                // A nested filesystem is its own ownership boundary. FUSE
+                // archive mounts are walked as a separate area (persistence
+                // opens each one as its own root); any other filesystem is
+                // left unwalked and reported, never resolved across.
+                let supported = catalogue_health::directory_filesystem_type(&directory)
+                    .is_ok_and(catalogue_health::is_supported_area_filesystem);
+                discovery.nested_areas.push(DiscoveredNestedArea {
+                    path: directory.clone(),
+                    parent_area: area,
+                    mount_id: directory_mount.mount_id,
+                    device: directory_mount.device,
+                    inode: directory_mount.inode,
+                    supported,
+                    archives: 0,
+                    scan_errors: Vec::new(),
+                    scan_errors_total: 0,
+                });
+                if !supported {
+                    continue;
+                }
+                area = Some(discovery.nested_areas.len() - 1);
             }
+            // Cached observations are reused inside a nested mount only when
+            // the caller proved it is the same trusted mount; otherwise every
+            // file there is inspected afresh.
+            let fingerprints = match area {
+                Some(index)
+                    if !self
+                        .trusted_nested_areas
+                        .contains(&discovery.nested_areas[index].path) =>
+                {
+                    &untrusted_fingerprints
+                }
+                _ => fingerprints,
+            };
             let directory_device = directory_mount.mount_id;
             let read_dir = match fs::read_dir(&directory) {
                 Ok(read_dir) => read_dir,
                 Err(error) => {
-                    discovery.record_scan_error(
+                    discovery.record_error_in(
+                        area,
                         directory.clone(),
                         ArchiveFsError::io(directory.clone(), error).to_string(),
                     );
@@ -6495,7 +6767,8 @@ impl<'a> ArchiveScanner<'a> {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(error) => {
-                        discovery.record_scan_error(
+                        discovery.record_error_in(
+                            area,
                             directory.clone(),
                             ArchiveFsError::io(directory.clone(), error).to_string(),
                         );
@@ -6507,7 +6780,8 @@ impl<'a> ArchiveScanner<'a> {
                 let file_type = match entry.file_type() {
                     Ok(file_type) => file_type,
                     Err(error) => {
-                        discovery.record_scan_error(
+                        discovery.record_error_in(
+                            area,
                             path.clone(),
                             ArchiveFsError::io(path.clone(), error).to_string(),
                         );
@@ -6518,6 +6792,7 @@ impl<'a> ArchiveScanner<'a> {
                     continue;
                 }
                 let mut metadata_error = None;
+                let mut loose_verdict = None;
                 let candidate = if file_type.is_file() {
                     self.archive_from_fingerprint_or_path(
                         &path,
@@ -6526,12 +6801,13 @@ impl<'a> ArchiveScanner<'a> {
                         fingerprints,
                         &mut discovery.timings,
                         &mut metadata_error,
+                        &mut loose_verdict,
                     )
                 } else {
                     None
                 };
                 if let Some(error) = metadata_error {
-                    discovery.record_scan_error(path.clone(), error);
+                    discovery.record_error_in(area, path.clone(), error);
                     continue;
                 }
                 if file_type.is_dir() {
@@ -6554,13 +6830,14 @@ impl<'a> ArchiveScanner<'a> {
                         continue;
                     }
                     if depth >= MAX_SCAN_DEPTH {
-                        discovery.record_scan_error(path.clone(), format!("source scan exceeded the {MAX_SCAN_DEPTH} directory depth limit at {}", path.display()));
+                        discovery.record_error_in(area, path.clone(), format!("source scan exceeded the {MAX_SCAN_DEPTH} directory depth limit at {}", path.display()));
                         continue;
                     }
-                    child_directories.push((path, depth + 1, directory_device));
+                    child_directories.push((path, depth + 1, directory_device, area));
                 } else if let Some(archive) = candidate {
                     if archive.identity.size_bytes.is_none() {
-                        discovery.record_scan_error(
+                        discovery.record_error_in(
+                            area,
                             path.clone(),
                             format!(
                                 "archive changed or became unreadable during scan: {}",
@@ -6570,6 +6847,9 @@ impl<'a> ArchiveScanner<'a> {
                         continue;
                     }
                     debug!("discovered archive {}", archive.path.display());
+                    if let Some(index) = area {
+                        discovery.nested_areas[index].archives += 1;
+                    }
                     discovery.archives.push(archive);
                     discovery.timings.candidate_discovery_ns +=
                         candidate_started.elapsed().as_nanos();
@@ -6632,6 +6912,15 @@ impl<'a> ArchiveScanner<'a> {
                     {
                         discovery.skipped_unsupported_extension += 1;
                         SkipReason::InvalidContent
+                    } else if matches!(
+                        loose_verdict,
+                        Some(loose_cartridge::LooseCartridge::IdenticalCopy { .. })
+                    ) {
+                        // Kept in the historical unsupported counter for schema
+                        // compatibility, like `UnsupportedVariant`; the
+                        // per-item reason stays distinct.
+                        discovery.skipped_unsupported_extension += 1;
+                        SkipReason::IdenticalCopy
                     } else if extension
                         .as_deref()
                         .is_some_and(|value| matches!(value, "md" | "bin" | "gen"))
@@ -6642,6 +6931,7 @@ impl<'a> ArchiveScanner<'a> {
                         discovery.skipped_unsupported_extension += 1;
                         SkipReason::UnsupportedExtension
                     };
+                    discovery.skip_reason_counts.record(reason);
                     // Bounded: the counters above always stay exact for the
                     // whole scan, but the retained detail list never grows
                     // past `MAX_RETAINED_SKIPPED_FILES` - see
@@ -6655,7 +6945,8 @@ impl<'a> ArchiveScanner<'a> {
                     let non_archive_metadata = match fs::metadata(&path) {
                         Ok(metadata) => metadata,
                         Err(error) => {
-                            discovery.record_scan_error(
+                            discovery.record_error_in(
+                                area,
                                 path.clone(),
                                 ArchiveFsError::io(path.clone(), error).to_string(),
                             );
@@ -6698,6 +6989,7 @@ impl<'a> ArchiveScanner<'a> {
                                         SkipReason::InvalidContent => "invalid_content",
                                         SkipReason::UnsupportedVariant => "unsupported_variant",
                                         SkipReason::AmbiguousPlatform => "ambiguous",
+                                        SkipReason::IdenticalCopy => "identical_copy",
                                     }
                                     .to_string(),
                                 ),
@@ -6709,7 +7001,8 @@ impl<'a> ArchiveScanner<'a> {
             let after = match fs::symlink_metadata(&directory) {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    discovery.record_scan_error(
+                    discovery.record_error_in(
+                        area,
                         directory.clone(),
                         ArchiveFsError::io(directory.clone(), error).to_string(),
                     );
@@ -6720,7 +7013,8 @@ impl<'a> ArchiveScanner<'a> {
                 || !after.is_dir()
                 || filesystem_identity(&before) != filesystem_identity(&after)
             {
-                discovery.record_scan_error(
+                discovery.record_error_in(
+                    area,
                     directory.clone(),
                     format!(
                         "source directory changed during scan: {}",
@@ -6740,6 +7034,7 @@ impl<'a> ArchiveScanner<'a> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn archive_from_fingerprint_or_path(
         &self,
         path: &Path,
@@ -6748,6 +7043,7 @@ impl<'a> ArchiveScanner<'a> {
         fingerprints: &HashMap<(i64, PathBuf), &ScanFingerprint>,
         timings: &mut ScanPhaseTimings,
         metadata_error: &mut Option<String>,
+        loose_verdict: &mut Option<loose_cartridge::LooseCartridge>,
     ) -> Option<Archive> {
         timings.candidates += 1;
         let metadata_started = Instant::now();
@@ -6842,7 +7138,39 @@ impl<'a> ArchiveScanner<'a> {
             timings.re_inspected_plain_files += 1;
         }
         let classification_started = Instant::now();
-        let archive = Archive::from_path_in_root(path, source_root);
+        // A loose `.bin` cartridge is classified once here; the skip reason
+        // below reuses the verdict.
+        let loose =
+            loose_cartridge::candidate_platform(path).map(|_| loose_cartridge::classify(path));
+        let archive = match &loose {
+            Some(verdict) => {
+                match verdict {
+                    loose_cartridge::LooseCartridge::Unreadable { error, .. } => {
+                        *metadata_error = Some(error.clone());
+                    }
+                    // Both files are kept and catalogued separately; the
+                    // pairing is re-derived from disk by `classify`.
+                    loose_cartridge::LooseCartridge::PossibleVariant { counterpart, .. } => {
+                        log::info!(
+                            "possible variant: {} has the same title as {} but different contents",
+                            path.display(),
+                            counterpart.display()
+                        );
+                    }
+                    _ => {}
+                }
+                let already_catalogued =
+                    cached.is_some_and(|fingerprint| fingerprint.non_archive_kind.is_none());
+                Archive::from_path_in_root_with_loose(
+                    path,
+                    source_root,
+                    Some(verdict),
+                    already_catalogued,
+                )
+            }
+            None => Archive::from_path_in_root(path, source_root),
+        };
+        *loose_verdict = loose;
         if archive.is_none()
             && let Some(item) = ingestion::discovery::inspect_spectrum_media(path, source_root)
             && matches!(
@@ -6976,7 +7304,13 @@ fn non_archive_verdict_is_still_current(path: &Path, verdict: &str) -> bool {
             !media_registry::is_recognized_extension(&extension)
                 && !media_registry::is_corroboration_candidate(&extension)
         }
-        "ambiguous" => media_registry::is_corroboration_candidate(&extension),
+        // A loose cartridge candidate is always re-classified: its verdict
+        // depends on the size/header rules and on sibling ZIPs, which the
+        // file's own stat cannot show.
+        "ambiguous" => {
+            media_registry::is_corroboration_candidate(&extension)
+                && loose_cartridge::candidate_platform(path).is_none()
+        }
         _ => false,
     }
 }
@@ -6992,7 +7326,21 @@ pub fn scan_archives(config: &Config) -> Result<Vec<Archive>> {
     ArchiveScanner::new(config).scan_archives()
 }
 
+/// Source-root-only revalidation; production resolves through
+/// [`revalidate_archive_within`] so nested mounts use their own root.
+#[cfg(test)]
 pub(crate) fn revalidate_archive_for_catalogue(archive: &Archive) -> Result<()> {
+    revalidate_archive_within(archive, None)
+}
+
+/// Revalidates an archive before it is saved, resolving the archive from the
+/// pinned root of the nested mount that owns it (`area`: its path,
+/// device/inode and unique mount ID) when it lies inside one. The source
+/// root is still checked.
+pub(crate) fn revalidate_archive_within(
+    archive: &Archive,
+    area: Option<(&Path, (u64, u64), u64)>,
+) -> Result<()> {
     let source_identity = validate_source_root(&archive.identity.source_root)?;
     if archive.identity.source_filesystem_device != Some(source_identity.device)
         || archive.identity.source_filesystem_inode != Some(source_identity.inode)
@@ -7010,8 +7358,20 @@ pub(crate) fn revalidate_archive_for_catalogue(archive: &Archive) -> Result<()> 
     }
     // One descriptor-relative resolution (no symlinks, beneath, no xdev): a
     // component swapped after the scan cannot redirect to outside content.
-    let root = catalogue_health::BoundRoot::open(&archive.identity.source_root)
-        .filter(|root| root.identity == (source_identity.device, source_identity.inode))
+    let (owner, owner_identity, owner_mount) = match area {
+        Some((path, identity, mount_id)) if archive.path.starts_with(path) => {
+            (path, identity, Some(mount_id))
+        }
+        _ => (
+            archive.identity.source_root.as_path(),
+            (source_identity.device, source_identity.inode),
+            None,
+        ),
+    };
+    let root = catalogue_health::BoundRoot::open(owner)
+        .filter(|root| root.identity == owner_identity)
+        // Inside a nested mount: the very instance settlement proved.
+        .filter(|root| owner_mount.is_none_or(|expected| root.mount_id().ok() == Some(expected)))
         .ok_or_else(|| {
             ArchiveFsError::Scanner(format!(
                 "source root changed after scan: {}",
@@ -7588,19 +7948,17 @@ fn detect_platform_from_folder_alias_with_match(
     let mut components: Vec<_> = relative.components().collect();
     components.pop(); // the archive's own filename never counts as a folder.
 
-    components
+    // One folder-choice rule for scans and the detection report.
+    let mut folders: Vec<String> = components
         .iter()
         .rev()
-        .find_map(|component| {
-            let matched_folder = component.as_os_str().to_string_lossy();
-            folder_platform_alias(&matched_folder)
-                .map(|platform| (platform, matched_folder.into_owned()))
-        })
-        .or_else(|| {
-            let matched_folder = source_root.file_name()?.to_string_lossy();
-            folder_platform_alias(&matched_folder)
-                .map(|platform| (platform, matched_folder.into_owned()))
-        })
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if let Some(root) = source_root.file_name() {
+        folders.push(root.to_string_lossy().into_owned());
+    }
+    platform::detect::nearest_platform_folder(&folders)
+        .map(|(platform, folder)| (platform.id, folder))
 }
 
 /// Normalizes one path segment for alias matching. Delegates to the registry
@@ -13691,6 +14049,43 @@ mod tests {
                 "{expected:?} must appear exactly once in canonical_platform_names"
             );
         }
+    }
+
+    /// Real library 2026-11-12: `pc-8800-series/Enterprise (MIA)/Enterprise
+    /// [CT].7z` was filed as the Enterprise 64/128 computer.
+    #[test]
+    fn a_title_folder_never_outranks_the_enclosing_platform_folder() {
+        let root = "/library/games";
+        assert_eq!(
+            detect_platform(
+                format!("{root}/pc-8800-series/Enterprise (MIA)/Enterprise [CT].7z"),
+                root
+            ),
+            Some("NEC PC-8801".to_string())
+        );
+        let report = crate::platform::detect::detect_platform_report(
+            &crate::platform::detect::DetectionRequest::new(
+                Path::new(&format!(
+                    "{root}/pc-8800-series/Enterprise (MIA)/Enterprise [CT].7z"
+                )),
+                Path::new(root),
+            ),
+        );
+        assert_eq!(report.platform, Some("NEC PC-8801"));
+        // Unchanged: an exact platform folder still wins when nearest, and a
+        // suffixed platform folder with nothing above it still counts.
+        assert_eq!(
+            detect_platform(format!("{root}/pc-8800-series/enterprise/Game.7z"), root),
+            Some("Enterprise".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/Enterprise (2024)/Game.7z"), root),
+            Some("Enterprise".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/NEC PC-8801 (TOSEC)/Game.d88"), root),
+            Some("NEC PC-8801".to_string())
+        );
     }
 
     #[test]

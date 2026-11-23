@@ -118,6 +118,44 @@ class RatchetTests(unittest.TestCase):
         note["message"]["level"] = "note"
         self.assertEqual(self.run_tool("count", self.clippy(json.dumps(note), "not json")).stdout.strip(), "0")
 
+    def baseline_entry(self, code: str, file: str, message: str) -> None:
+        self.baseline.write_text(json.dumps([code, file, message]) + "\n", encoding="utf-8")
+
+    def test_ci_and_local_rust_source_paths_are_one_warning(self) -> None:
+        # CI remaps the standard library to /rustc/<commit>/; a machine with the
+        # rust-src component reports the real toolchain path for the same file.
+        ci = "/rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/macros/mod.rs"
+        local = ("/home/dev/.rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu"
+                 "/lib/rustlib/src/rust/library/core/src/macros/mod.rs")
+        code, message = "clippy::cloned_ref_to_slice_refs", "unnecessary use of `clone` to create a slice from a reference"
+        for recorded, reported in ((ci, local), (local, ci), (ci, ci.replace("8bab26f4", "0123abcd"))):
+            with self.subTest(recorded=recorded, reported=reported):
+                self.baseline_entry(code, recorded, message)
+                result = self.run_tool("check", self.clippy(warning(code, reported, 7, message)), self.baseline)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_new_warning_in_rust_source_still_fails(self) -> None:
+        ci = "/rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/macros/mod.rs"
+        local = "/opt/rust/lib/rustlib/src/rust/library/alloc/src/vec/mod.rs"
+        self.baseline_entry("clippy::cloned_ref_to_slice_refs", ci, "unnecessary use of `clone`")
+        for code, file, message in (
+            ("clippy::cloned_ref_to_slice_refs", local, "unnecessary use of `clone`"),  # other library file
+            ("clippy::needless_borrow", ci, "unnecessary use of `clone`"),  # other lint, same file
+            ("clippy::cloned_ref_to_slice_refs", ci, "a different message"),  # other message
+        ):
+            with self.subTest(code=code, file=file, message=message):
+                result = self.run_tool("check", self.clippy(warning(code, file, 3, message)), self.baseline)
+                self.assertEqual(result.returncode, 1, result.stdout)
+
+    def test_workspace_paths_are_not_rewritten(self) -> None:
+        # Only standard-library source paths are canonicalised; a workspace file whose
+        # path merely contains "library/" keeps its own identity.
+        self.baseline_entry(*COLLAPSE)
+        for file in ("crates/x/library/src/b.rs", "/rustc/not-a-commit/library/src/b.rs"):
+            with self.subTest(file=file):
+                result = self.run_tool("check", self.clippy(warning(COLLAPSE[0], file, 3, COLLAPSE[2])), self.baseline)
+                self.assertEqual(result.returncode, 1, result.stdout)
+
     def test_the_committed_baseline_is_well_formed(self) -> None:
         result = self.run_tool("check", self.clippy(), ROOT / ".github" / "clippy-warning-baseline")
         self.assertEqual(result.returncode, 0, result.stderr)

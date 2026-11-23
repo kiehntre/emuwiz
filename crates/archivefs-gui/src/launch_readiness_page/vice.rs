@@ -353,6 +353,7 @@ impl Controller {
         self.receiver = Some((path.clone(), rx));
         thread::spawn(move || {
             let _ = tx.send(Context::inspect(path));
+            crate::emulator_setup::answers::arrived(&ctx);
             ctx.request_repaint();
         });
     }
