@@ -1372,17 +1372,81 @@ mod carried_catalogue_checks {
     }
 
     #[test]
-    fn stale_member_disc_and_changed_checks_stay_exactly_where_they_were() {
+    fn a_zip_member_check_moves_with_its_archive_and_keeps_its_member() {
+        // Owner item 2: the archive is read again in full and must be
+        // byte-identical, so the member inside is the one that was verified.
+        for mode in [
+            OrganisationMode::RenameInPlace,
+            OrganisationMode::MoveRealFile,
+        ] {
+            let mut f = Fixture::new(mode);
+            let mut member = check_of(&f.source);
+            let provenance = serde_json::json!({
+                "member_name": "Inside (USA).nes", "member_index": 0,
+                "archive_format": "zip", "algorithm": "SHA-1"
+            });
+            member["archive_member"] = provenance.clone();
+            let row = insert(&f, &member);
+            rebind(&mut f);
+            f.apply().unwrap();
+            let moved: serde_json::Value = serde_json::from_slice(&stored(&f, row)).unwrap();
+            assert_eq!(moved["archive_member"], provenance, "{mode:?}");
+            assert_eq!(recorded(&f, row).path, f.destination, "{mode:?}");
+            assert_eq!(
+                DiscFileState::of(&recorded(&f, row)),
+                DiscFileState::Unchanged
+            );
+            f.reload();
+            f.undo().unwrap();
+            assert_eq!(recorded(&f, row).path, f.source, "{mode:?}");
+            assert_eq!(
+                DiscFileState::of(&recorded(&f, row)),
+                DiscFileState::Unchanged
+            );
+        }
+    }
+
+    #[test]
+    fn a_zip_member_check_of_a_changed_archive_stays_stale() {
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        let mut member = check_of(&f.source);
+        member["archive_member"] = serde_json::json!({
+            "member_name": "Inside (USA).nes", "member_index": 0,
+            "archive_format": "zip", "algorithm": "SHA-1"
+        });
+        let row = insert(&f, &member);
+        rebind(&mut f);
+        let before = stored(&f, row);
+        // The archive's bytes change after the preview, same size and times.
+        let meta = std::fs::metadata(&f.source).unwrap();
+        let mut bytes = std::fs::read(&f.source).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&f.source, &bytes).unwrap();
+        let times = std::fs::FileTimes::new()
+            .set_modified(meta.modified().unwrap())
+            .set_accessed(meta.accessed().unwrap());
+        std::fs::File::options()
+            .write(true)
+            .open(&f.source)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        let _ = f.apply();
+        assert_eq!(
+            stored(&f, row),
+            before,
+            "a changed archive's member check never moves"
+        );
+    }
+
+    #[test]
+    fn stale_disc_and_changed_checks_stay_exactly_where_they_were() {
         let mut f = Fixture::new(OrganisationMode::RenameInPlace);
         // Changed after it was saved: the change time no longer matches.
         let mut stale = check_of(&f.source);
         stale["audit_file"]["object"]["changed_seconds"] = serde_json::json!(1);
         let stale = insert(&f, &stale);
-        // A check of a member inside an archive, or of a disc set, is not a
-        // check of this one file.
-        let mut member = check_of(&f.source);
-        member["archive_member"] = serde_json::json!({"member": "inside.bin"});
-        let member = insert(&f, &member);
+        // A check of a disc set is not a check of this one file.
         let mut disc = check_of(&f.source);
         disc["disc_members"] = serde_json::json!([FileFingerprint::observe(&f.source).unwrap()]);
         let disc = insert(&f, &disc);
@@ -1397,7 +1461,7 @@ mod carried_catalogue_checks {
                 params![serde_json::to_vec(&check_of(&other)).unwrap(), resaved],
             )
             .unwrap();
-        let before: Vec<_> = [stale, member, disc, resaved]
+        let before: Vec<_> = [stale, disc, resaved]
             .iter()
             .map(|row| stored(&f, *row))
             .collect();
@@ -1407,14 +1471,14 @@ mod carried_catalogue_checks {
             Some(f.id),
             "the game itself moved"
         );
-        let after: Vec<_> = [stale, member, disc, resaved]
+        let after: Vec<_> = [stale, disc, resaved]
             .iter()
             .map(|row| stored(&f, *row))
             .collect();
         assert_eq!(after, before);
         f.reload();
         f.undo().unwrap();
-        let undone: Vec<_> = [stale, member, disc, resaved]
+        let undone: Vec<_> = [stale, disc, resaved]
             .iter()
             .map(|row| stored(&f, *row))
             .collect();

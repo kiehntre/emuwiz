@@ -36,6 +36,7 @@ pub mod link_target;
 pub mod model;
 pub mod plan;
 pub mod rename_guard;
+pub mod tombstones;
 pub mod transaction;
 
 #[cfg(test)]

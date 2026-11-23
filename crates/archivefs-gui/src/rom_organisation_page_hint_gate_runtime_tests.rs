@@ -457,9 +457,8 @@ fn child_both_apply_paths_refuse_a_stale_romm_row() {
     assert!(state.error.is_none(), "{:?}", state.error);
     assert!(renamed.is_file() && !verified.exists());
     verified_choice(&renamed);
-    // The page walks its folders once per visit; walk again as reopening
-    // the page does, so the renamed file is listed.
-    state.scan_sources();
+    // Apply lists the folders again by itself (item 7): no manual rescan.
+    assert!(state.sources.contains(&renamed) && !state.sources.contains(&verified));
     state.generate_plan();
     assert!(state.error.is_none(), "{:?}", state.error);
     assert_eq!(
@@ -486,11 +485,12 @@ fn child_both_apply_paths_refuse_a_stale_romm_row() {
     assert!(state.error.is_none(), "{:?}", state.error);
     assert!(verified.is_file() && !renamed.exists());
     verified_choice(&verified);
-    state.scan_sources();
+    // Undo lists the folders again by itself too.
+    assert!(state.sources.contains(&verified) && !state.sources.contains(&renamed));
     state.generate_plan();
     assert!(state.error.is_none(), "{:?}", state.error);
     assert_eq!(state.approved, BTreeSet::from([key(&verified)]));
-    println!("VERIFIED-ROUND-TRIP apply=verified undo=verified");
+    println!("VERIFIED-ROUND-TRIP apply=verified undo=verified list=refreshed");
 
     // Linked library (owner policy 2026-11-22): every eligible game gets a
     // link. A verified catalogue name names it; a RomM-only or unnamed game

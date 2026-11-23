@@ -73,6 +73,27 @@ fn private(f: &File) -> io::Result<()> {
     }
     Ok(())
 }
+/// The refusal when the game folder is not owned by the user running EmuWiz.
+pub(crate) const COLLECTION_NOT_OWNED: &str = "game folder not owned by you";
+/// The refusal when others can change the game folder's contents.
+pub(crate) const COLLECTION_SHARED_WRITE: &str =
+    "game folder can be changed by other users (group or other write permission)";
+/// The game folder (collection root) itself (owner decision 2026-11-23):
+/// owned by this user and writable by nobody else, so no other user can add,
+/// swap or remove an entry in it during an operation. Reading by others is
+/// allowed: it changes nothing. The mode's group bits are the ACL mask, so
+/// a named ACL entry cannot grant write either. Everything EmuWiz creates
+/// inside it for recovery stays owner-only ([`private`]).
+fn collection_root(f: &File) -> io::Result<()> {
+    let m = f.metadata()?;
+    if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } {
+        return Err(fail(COLLECTION_NOT_OWNED));
+    }
+    if m.mode() & 0o022 != 0 {
+        return Err(fail(COLLECTION_SHARED_WRITE));
+    }
+    Ok(())
+}
 fn lock(f: &File) -> io::Result<()> {
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(fail("fixture already owned by another writer"));
@@ -247,7 +268,7 @@ impl Store {
         crate::dat::rename_apply::writer_gate::check().map_err(fail)?;
         let l = layout(base, cap)?;
         let parent = open_dir(root)?;
-        private(&parent)?;
+        collection_root(&parent)?;
         // Legacy containers remain in place. Successors use independently bound
         // children of the same reserved namespace, never a recycled container.
         let enclosing = if generation {
@@ -341,7 +362,7 @@ impl Store {
             return Err(fail("foreign authority"));
         }
         let root = open_dir(&ticket.root)?;
-        private(&root)?;
+        collection_root(&root)?;
         let directory = ticket_directory(&root, ticket)?;
         private(&directory)?;
         lock(&directory)?;
@@ -367,7 +388,7 @@ impl Store {
             return Err(fail("foreign authority"));
         }
         let root = open_dir(&ticket.root)?;
-        private(&root)?;
+        collection_root(&root)?;
         let directory = ticket_directory(&root, ticket)?;
         private(&directory)?;
         if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
@@ -413,7 +434,7 @@ impl Store {
         {
             return Err(fail("storage binding or ownership changed"));
         }
-        private(&self.root)?;
+        collection_root(&self.root)?;
         private(&self.directory)?;
         Ok(())
     }
@@ -503,3 +524,37 @@ use dispatch::publish_descriptor;
 pub(crate) use dispatch::{
     discovery_bounded, discovery_path, is_enrolled, read_bounded, read_with_history,
 };
+
+#[cfg(test)]
+mod collection_root_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn check(mode: u32) -> io::Result<()> {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        collection_root(&File::open(t.path()).unwrap())
+    }
+
+    #[test]
+    fn a_game_folder_others_can_read_but_not_change_is_accepted() {
+        for mode in [0o700, 0o750, 0o755, 0o705] {
+            assert!(check(mode).is_ok(), "{mode:o}");
+        }
+    }
+
+    #[test]
+    fn a_game_folder_others_can_change_is_refused() {
+        for mode in [0o775, 0o770, 0o757, 0o777, 0o720, 0o702] {
+            let err = check(mode).unwrap_err().to_string();
+            assert!(err.contains(COLLECTION_SHARED_WRITE), "{mode:o}: {err}");
+        }
+    }
+
+    #[test]
+    fn recovery_folders_inside_stay_owner_only() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(private(&File::open(t.path()).unwrap()).is_err());
+    }
+}

@@ -655,6 +655,8 @@ pub struct OrganisationRollbackOutcome {
     /// Directories this transaction created that remain (not empty, or not
     /// removable). Never a pre-existing user directory.
     pub directories_remaining: Vec<std::path::PathBuf>,
+    /// Hidden link tombstones retired after a complete Undo, and any kept.
+    pub tombstones: super::tombstones::TombstoneCleanup,
 }
 
 /// Rolls back an organisation transaction: the entry moves via the shared
@@ -680,6 +682,15 @@ pub fn rollback_organisation_transaction(
     );
     refuse_to_separate_a_game_from_its_saves(transaction)?;
     let rollback = rollback_transaction(transaction, journal_dir, cancel)?;
+    // Only after the engine and the journal agree the Undo is complete.
+    let tombstones = if matches!(
+        rollback.result,
+        crate::dat::rename_apply::RollbackResult::FullyRolledBack
+    ) {
+        super::tombstones::retire_link_tombstones(transaction)
+    } else {
+        Default::default()
+    };
 
     let mut directories_removed = Vec::new();
     let mut directories_remaining = Vec::new();
@@ -713,6 +724,7 @@ pub fn rollback_organisation_transaction(
         rollback,
         directories_removed,
         directories_remaining,
+        tombstones,
     })
 }
 

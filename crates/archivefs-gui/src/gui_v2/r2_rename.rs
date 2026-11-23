@@ -99,7 +99,7 @@ impl State {
         match r {
             Err(e) => {
                 self.needs_refresh = self.info.is_some();
-                self.message = e;
+                self.message = copy::explain_refusal(&e, self.root.as_deref());
                 self.preview = None;
                 self.review = None;
                 self.reuse = None;

@@ -117,8 +117,12 @@ struct ProofCarry {
 }
 
 impl ProofCarry {
-    /// The recorded single-file check in `facts`, if it describes this
-    /// object at `path` (an archive member or disc set never moves this way).
+    /// The recorded outer-file check in `facts`, if it describes this object
+    /// at `path`. A check of one member inside a zip/7z moves with the
+    /// archive (owner item 2, 2026-11-23): its freshness is the outer
+    /// archive's `audit_file`, and the whole archive is read again and must
+    /// be byte-identical, so every member is too. A disc set never moves this
+    /// way: it is several files, carried only as a whole set.
     fn recorded(
         &self,
         facts: &serde_json::Value,
@@ -129,7 +133,7 @@ impl ProofCarry {
             Some(serde_json::Value::Array(items)) => items.is_empty(),
             Some(_) => false,
         };
-        if !empty("disc_members") || !empty("archive_member") {
+        if !empty("disc_members") {
             return None;
         }
         let proof: crate::identity_source::hashing::FileFingerprint =

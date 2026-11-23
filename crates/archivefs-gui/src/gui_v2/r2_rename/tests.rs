@@ -243,3 +243,33 @@ fn unsupported_non_utf8_preview_never_panics_the_gui() {
     assert!(s.fingerprint().unwrap_err().contains("not UTF-8"));
     assert!(s.pairs().is_err());
 }
+
+#[test]
+fn a_shared_game_folder_refusal_says_how_to_fix_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+    let text = super::copy::explain_refusal(
+        "R2 refused: game folder can be changed by other users (group or other write permission)",
+        Some(t.path()),
+    );
+    assert!(text.contains("its permissions are 775"), "{text}");
+    assert!(text.contains("chmod g-w,o-w '"), "{text}");
+    assert!(text.contains("Standard Rename"), "{text}");
+    assert!(text.contains("Nothing was changed."), "{text}");
+}
+
+#[test]
+fn a_recovery_folder_refusal_never_claims_nothing_changed() {
+    let text = super::copy::explain_refusal(
+        "R2 refused: storage binding or ownership changed",
+        Some(std::path::Path::new("/games/nes")),
+    );
+    assert!(text.contains("Do not delete it"), "{text}");
+    assert!(!text.contains("Nothing was changed"), "{text}");
+}
+
+#[test]
+fn an_unknown_refusal_is_shown_unchanged() {
+    assert_eq!(super::copy::explain_refusal("odd", None), "odd");
+}

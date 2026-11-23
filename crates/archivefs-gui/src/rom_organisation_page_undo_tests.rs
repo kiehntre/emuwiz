@@ -165,7 +165,7 @@ fn undo_asks_first_and_names_the_rename_operation_it_reverses() {
         "the Undo button alone must not undo"
     );
     assert!(state.pending_undo);
-    assert!(shows(&output, "Undo rename operation 1795351772-1?"));
+    assert!(shows(&output, "Undo operation 1795351772-1?"));
     assert!(shows(&output, "It puts 2 file(s) back"));
     assert!(shows(
         &output,
@@ -190,7 +190,7 @@ fn cancelling_undo_changes_nothing_and_closes_the_card() {
     let (actions, output) = click(&ctx, &mut state, "Cancel");
     assert!(actions.is_empty(), "{:?}", actions.len());
     assert!(!state.pending_undo);
-    assert!(!shows(&output, "Undo rename operation"));
+    assert!(!shows(&output, "Undo operation"));
     assert!(state.applied.is_some(), "Undo stays available");
 }
 
@@ -349,4 +349,58 @@ fn the_apply_confirmation_is_scrolled_into_view() {
     state.pending_apply = Some(1);
     state.reveal = true;
     assert!(scroll_offset_after(&mut state) > 1500.0);
+}
+
+#[test]
+fn undo_of_created_links_says_it_removes_links_not_renames_files() {
+    use archivefs_core::dat::rename_apply::TransactionOperation;
+    let mut transaction = applied_transaction();
+    transaction.entries = (0..3)
+        .map(|i| {
+            let mut e = entry(
+                &format!("g{i}.nes"),
+                &format!("G{i}.nes"),
+                EntryState::Applied,
+            );
+            e.destination_path = PathBuf::from(format!("/linked/NES/G{i}.nes"));
+            e.operation = TransactionOperation::CreateSymlink {
+                expected_target: e.source_path.clone(),
+                destination_root: PathBuf::from("/linked"),
+            };
+            e
+        })
+        .collect();
+    let heading = undo_confirmation_heading(&transaction);
+    assert!(heading.contains("removes the 3 link(s)"), "{heading}");
+    assert!(heading.contains("game files are not touched"), "{heading}");
+    assert!(
+        !heading.contains("back under their earlier names"),
+        "{heading}"
+    );
+    let lines = undo_confirmation_lines(&transaction, 10);
+    assert_eq!(lines[0], "remove G0.nes (in /linked/NES)");
+}
+
+#[test]
+fn undo_of_moved_links_and_renamed_files_words_each_kind() {
+    let mut transaction = applied_transaction();
+    let mut link = entry("old.nes", "New.nes", EntryState::Applied);
+    link.identity.kind = ObjectKind::Symlink;
+    transaction.entries = vec![link, entry("f.nes", "F.nes", EntryState::Applied)];
+    let heading = undo_confirmation_heading(&transaction);
+    assert!(heading.contains("puts 1 link(s) back"), "{heading}");
+    assert!(
+        heading.contains("puts 1 file(s) back under their earlier names"),
+        "{heading}"
+    );
+}
+
+#[test]
+fn the_system_line_never_claims_the_game_is_verified() {
+    let line = platform_line("Nintendo Entertainment System", "Existing inference");
+    assert_eq!(
+        line,
+        "System: Nintendo Entertainment System (decided by: Existing inference)"
+    );
+    assert!(!line.contains("Verified"));
 }

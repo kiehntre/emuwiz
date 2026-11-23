@@ -78,6 +78,17 @@ fn directory(path: &Path) -> io::Result<File> {
     private(&f)?;
     Ok(f)
 }
+/// A game folder (collection root): canonical, and owned and writable only
+/// by this user ([`collection_root`]). State and authority folders use the
+/// stricter owner-only [`directory`].
+fn collection_directory(path: &Path) -> io::Result<File> {
+    if std::fs::canonicalize(path)? != path {
+        return Err(fail("canonical game folder required"));
+    }
+    let f = open_dir(path)?;
+    collection_root(&f)?;
+    Ok(f)
+}
 fn create_directory(path: &Path) -> io::Result<File> {
     let parent = path.parent().ok_or_else(|| fail("missing parent"))?;
     let pinned = directory(parent)?;
@@ -168,7 +179,7 @@ pub fn issuer_init(path: &Path) -> io::Result<Vec<u8>> {
 }
 /// Read-only filesystem/profile check. Actual syscall probes still run at provisioning/enrollment.
 pub fn preview_root(root: &Path) -> io::Result<serde_json::Value> {
-    let dir = directory(root)?;
+    let dir = collection_directory(root)?;
     capacity(&dir)?;
     let (_, _, filesystem) = contract::capability::root_profile(root)?;
     Ok(
@@ -192,11 +203,11 @@ pub fn provision(
     if public_key.len() != 32 || operator.trim().is_empty() || operator.len() > 128 {
         return Err(fail("valid Ed25519 public key and named operator required"));
     }
-    let root_dir = directory(root)?;
+    let root_dir = collection_directory(root)?;
     capacity(&root_dir)?;
     if state.starts_with(root) || root.starts_with(state) {
         return Err(fail(
-            "authority and collection must be separate private directories",
+            "authority and game folder must be separate directories",
         ));
     }
     for reserved in [NAMESPACE, ".emuwiz-r2-holding"] {
@@ -257,7 +268,7 @@ fn load_config_budget(state: &Path, budget: &mut u64) -> io::Result<Configuratio
     if (c.format != FORMAT && c.format != root_reuse::FORMAT_NEXT)
         || c.state != state
         || c.state_id != identity(&dir)?
-        || c.root_id != identity(&directory(&c.root)?)?
+        || c.root_id != identity(&collection_directory(&c.root)?)?
     {
         return Err(fail("deployment configuration/root identity mismatch"));
     }
@@ -388,7 +399,7 @@ pub fn enroll(state: &Path, plan: &[u8], confirmation: &str, enable: bool) -> io
     let c = load(state)?;
     let dir = directory(state)?;
     capacity(&dir)?;
-    capacity(&directory(&c.root)?)?;
+    capacity(&collection_directory(&c.root)?)?;
     let guard = c.authority.acquire()?;
     root_reuse::validate_lineage(&c, &guard.successors()?)?;
     root_reuse::verify_predecessors(&c, &guard)?;

@@ -907,6 +907,11 @@ impl RomOrganisationPageState {
                 let (message, complete) = apply_result_report(self.mode, &outcome.summary);
                 self.result_message = Some(message);
                 self.result_complete = complete;
+                // Files or links changed on disk: list them again, so the
+                // next preview starts from where they are now.
+                if outcome.summary.applied > 0 {
+                    self.scan_sources();
+                }
                 if complete {
                     self.plan = None;
                     self.approved.clear();
@@ -1065,10 +1070,25 @@ impl RomOrganisationPageState {
                     archivefs_core::dat::rename_apply::RollbackResult::FullyRolledBack
                 ) && transaction.is_fully_rolled_back();
                 self.result_complete = fully;
-                self.result_message = Some(if fully {
+                // Undo moved things back (fully or in part): list them again.
+                self.scan_sources();
+                let kept = &outcome.tombstones.kept;
+                self.result_message = Some(if fully && kept.is_empty() {
                     format!(
                         "Rolled back organisation; {} empty platform director(ies) removed.",
                         dirs
+                    )
+                } else if fully {
+                    format!(
+                        "Rolled back organisation; {} empty platform director(ies) removed. \
+                         {} hidden undone link(s) were left in place because they could not be \
+                         proved safe to remove: {}",
+                        dirs,
+                        kept.len(),
+                        kept.iter()
+                            .map(|(path, why)| format!("{} ({why})", path.display()))
+                            .collect::<Vec<_>>()
+                            .join("; ")
                     )
                 } else {
                     format!(
@@ -2841,6 +2861,72 @@ fn undo_affected_entries(
         .collect()
 }
 
+/// The system a row was placed under and how that was decided. This is the
+/// platform assignment only: whether the game's name is verified is shown
+/// separately (the "Name from" line), so it never says "Verified".
+pub(crate) fn platform_line(display_name: &str, source: &str) -> String {
+    if source.trim().is_empty() {
+        format!("System: {display_name}")
+    } else {
+        format!("System: {display_name} (decided by: {source})")
+    }
+}
+
+/// True when Undo removes what Apply created (a link or copy) rather than
+/// putting a moved or renamed object back.
+fn undo_removes(entry: &archivefs_core::dat::rename_apply::TransactionEntry) -> bool {
+    use archivefs_core::dat::rename_apply::TransactionOperation as Op;
+    matches!(
+        entry.operation,
+        Op::CreateSymlink { .. } | Op::CreateHardlink { .. } | Op::CreateCopy { .. }
+    )
+}
+
+fn destination_folder(entry: &archivefs_core::dat::rename_apply::TransactionEntry) -> String {
+    entry
+        .destination_path
+        .parent()
+        .map(|folder| folder.display().to_string())
+        .unwrap_or_default()
+}
+
+/// What confirming Undo will do, worded for what the transaction did:
+/// created links are removed (game files untouched); moved links and
+/// renamed or moved files are put back under their earlier names.
+pub(crate) fn undo_confirmation_heading(
+    transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
+) -> String {
+    use archivefs_core::dat::rename_apply::ObjectKind;
+    let affected = undo_affected_entries(transaction);
+    let removed = affected.iter().filter(|e| undo_removes(e)).count();
+    let links_back = affected
+        .iter()
+        .filter(|e| !undo_removes(e) && e.identity.kind == ObjectKind::Symlink)
+        .count();
+    let files_back = affected.len() - removed - links_back;
+    let mut parts = Vec::new();
+    if removed > 0 {
+        parts.push(format!(
+            "It removes the {removed} link(s) this operation created; your game files are not touched."
+        ));
+    }
+    if links_back > 0 {
+        parts.push(format!(
+            "It puts {links_back} link(s) back in their earlier folders under their earlier names; your game files are not touched."
+        ));
+    }
+    if files_back > 0 || parts.is_empty() {
+        parts.push(format!(
+            "It puts {files_back} file(s) back under their earlier names."
+        ));
+    }
+    format!(
+        "Undo operation {}? {} Nothing changes until you confirm.",
+        transaction.transaction_id,
+        parts.join(" ")
+    )
+}
+
 /// Lines naming what an Undo would put back, at most `limit` of them.
 pub(crate) fn undo_confirmation_lines(
     transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
@@ -2861,7 +2947,14 @@ pub(crate) fn undo_confirmation_lines(
                 .parent()
                 .map(|folder| folder.display().to_string())
                 .unwrap_or_default();
-            format!("{now} -> {} (in {folder})", entry.original_basename)
+            if undo_removes(entry) {
+                format!(
+                    "remove {now} (in {folder})",
+                    folder = destination_folder(entry)
+                )
+            } else {
+                format!("{now} -> {} (in {folder})", entry.original_basename)
+            }
         })
         .collect();
     if affected.len() > limit {
@@ -2881,15 +2974,7 @@ fn show_undo_confirmation(
     let top = ui.cursor().min.y;
     let mut answer = None;
     widgets::card(ui, |ui| {
-        let count = undo_affected_entries(transaction).len();
-        ui.label(
-            egui::RichText::new(format!(
-                "Undo rename operation {}? It puts {count} file(s) back under their \
-                 earlier names. Nothing changes until you confirm.",
-                transaction.transaction_id
-            ))
-            .strong(),
-        );
+        ui.label(egui::RichText::new(undo_confirmation_heading(transaction)).strong());
         for line in undo_confirmation_lines(transaction, 10) {
             ui.label(line);
         }
@@ -3327,9 +3412,9 @@ fn show_plan(
                             show_name_choice(ui, name_choices.get(&entry.source_path));
                         }
                         if !entry.platform_display_name.is_empty() {
-                            ui.label(format!(
-                                "Reason: Verified for {}",
-                                entry.platform_display_name
+                            ui.label(platform_line(
+                                &entry.platform_display_name,
+                                &entry.platform_source,
                             ));
                         }
                         ui.label(match plan.mode {
