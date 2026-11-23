@@ -87,6 +87,7 @@ mod bsfree;
 mod cheat_reconcile;
 mod cheat_source;
 mod cheatbase;
+mod collection;
 mod continuity;
 mod dat;
 mod diagnose_launch;
@@ -180,6 +181,8 @@ fn startup_registration(cli: &CliArgs) -> StartupRegistration {
 /// game file and creates or removes only its own prepared copies.
 /// `continuity` is the same: it reads saves and writes only new files in its
 /// own snapshot folder or a new folder the person names.
+/// `collection` reads the library database read-only and lists folders; it
+/// writes nothing.
 fn is_read_only_invocation(cli: &CliArgs) -> bool {
     matches!(
         cli.command.as_str(),
@@ -195,6 +198,7 @@ fn is_read_only_invocation(cli: &CliArgs) -> bool {
             | "memory-cards"
             | "recovery"
             | "continuity"
+            | "collection"
             | "emulators"
             | "activity"
             | "history"
@@ -350,6 +354,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "memory-cards" => memory_cards::run(args.collect())?,
         "recovery" => recovery::run(args.collect())?,
         "continuity" => continuity::run(args.collect())?,
+        "collection" => collection::run(args.collect())?,
         "media-set" => media_set::run(args)?,
         "scan" => {
             let config = load_config()?;
@@ -6320,6 +6325,7 @@ fn print_help() {
     println!("  status         Show archive paths, mount paths, and mount states");
     println!("  stats          Show archive library counts and sizes");
     println!("  duplicates     Show filename-based duplicate candidates");
+    println!("  collection     Explain library records whose file moved or is gone (read-only)");
     println!("  info           Show details for one archive by path or name");
     println!("  mount          Mount scanned archives with ratarmount");
     println!("  mount-one      Mount one archive by path or name");
@@ -7574,6 +7580,7 @@ mod tests {
             &["memory-cards", "import", "/card", "/save", "/new"],
             &["recovery", "prepare", "/game.zip", "--system", "AmigaCD32"],
             &["continuity", "snapshot", "0123abcd"],
+            &["collection", "reconcile", "--json"],
             &["history", "--json"],
             &["emulators"],
             &["activity", "--json"],

@@ -118,9 +118,11 @@ pub use disc_order::DatDiscOrderOutcome;
 #[cfg(test)]
 #[path = "database/catalogue_health_tests.rs"]
 mod catalogue_health_tests;
+mod collection_records;
 #[cfg(test)]
 #[path = "database/disc_order_tests.rs"]
 mod disc_order_tests;
+pub use collection_records::{CollectionRecordRow, CollectionSourceFolder};
 pub(crate) mod forget_missing;
 mod missing_cleanup;
 pub use missing_cleanup::MissingCleanupTarget;

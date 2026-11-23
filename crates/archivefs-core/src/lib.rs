@@ -66,6 +66,7 @@ pub mod bios_projection;
 pub mod catalogue_health;
 pub mod catalogue_reconciliation;
 pub mod catalogue_supersession;
+pub mod collection_intelligence;
 /// Daedalus: evidence-driven diagnosis of emulator launch problems.
 pub mod daedalus;
 mod database;

@@ -567,6 +567,11 @@ pub(super) struct ReconcileState {
     /// Tests only: compare with these DAT files instead of installed ones.
     pub catalogue_override: Option<Vec<(String, String, PathBuf)>>,
     pub open_item: Option<(Tab, usize)>,
+    /// The second part of the page: where entries without a file went, and
+    /// the links in the library folders. Its own explicit check, never started
+    /// by opening the page.
+    pub evidence_open: bool,
+    pub evidence: super::collection_reconcile::State,
 }
 
 impl ReconcileState {
@@ -1112,12 +1117,29 @@ impl App {
     pub(super) fn library_files_page(&mut self, ui: &mut egui::Ui) {
         // Opening this page is passive: it never walks the library, reads a file
         // or refreshes a result on its own. Every run starts from a button.
+        ui.heading("Library files check");
+        ui.label("Compares the files in your game folders with EmuWiz's catalogue. Nothing is added, relinked, renamed, moved or deleted here.");
+        if let Some(open) = crate::ui::components::tab_row(
+            ui,
+            &[
+                (false, "Files and entries"),
+                (true, "Where missing entries went"),
+            ],
+            self.reconcile.evidence_open,
+        ) {
+            self.reconcile.evidence_open = open;
+        }
+        if self.reconcile.evidence_open {
+            if ui.button("Back to Problems").clicked() {
+                self.go(Route::Section(Section::Problems));
+            }
+            super::collection_reconcile::show(ui, &mut self.reconcile.evidence);
+            return;
+        }
         let view = self.reconcile.view.clone();
         let busy = self.reconcile.job.is_some();
         let hashing = self.reconcile.hash_job.is_some();
         egui::ScrollArea::vertical().id_salt("v2_library_files").show(ui, |ui| {
-            ui.heading("Library files check");
-            ui.label("Compares the files in your game folders with EmuWiz's catalogue. Nothing is added, relinked, renamed, moved or deleted here.");
             ui.horizontal_wrapped(|ui| {
                 if busy {
                     ui.spinner();
