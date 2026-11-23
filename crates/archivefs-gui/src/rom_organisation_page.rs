@@ -767,9 +767,36 @@ impl RomOrganisationPageState {
         true
     }
 
+    /// Toggles one row. A disc-set file moves only with its whole set, so
+    /// its row selects or clears every Suggested file of that set.
     pub(crate) fn toggle_approved(&mut self, source: &str) {
-        if !self.approved.remove(source) {
-            self.approved.insert(source.to_string());
+        let select = !self.approved.contains(source);
+        let set: Vec<String> = self
+            .plan
+            .as_ref()
+            .and_then(|plan| {
+                archivefs_core::dat::rom_organisation::disc_set_of(plan, Path::new(source)).map(
+                    |(_, members)| {
+                        members
+                            .into_iter()
+                            .filter(|member| {
+                                plan.entries.iter().any(|entry| {
+                                    entry.source_path == *member
+                                        && entry.status == OrganisationStatus::Suggested
+                                })
+                            })
+                            .map(|member| member.to_string_lossy().into_owned())
+                            .collect()
+                    },
+                )
+            })
+            .unwrap_or_else(|| vec![source.to_string()]);
+        for member in set {
+            if select {
+                self.approved.insert(member);
+            } else {
+                self.approved.remove(&member);
+            }
         }
         self.persist_approved_set();
     }
@@ -1697,6 +1724,7 @@ pub(crate) fn validate_r2_selection(
     }) {
         return Err("Catalogue-backed organisation requires Standard Apply so filesystem and catalogue Undo remain coordinated.".into());
     }
+    archivefs_core::dat::rom_organisation::refuse_partial_disc_sets(plan, approved)?;
     let names = NameResolver::load();
     let database = default_database_path().map_err(|e| e.to_string())?;
     hint_gate::check_live_names(plan, approved, &database, &names)?;
@@ -2864,6 +2892,24 @@ fn undo_affected_entries(
 /// The system a row was placed under and how that was decided. This is the
 /// platform assignment only: whether the game's name is verified is shown
 /// separately (the "Name from" line), so it never says "Verified".
+/// The line on a disc-set file's row: it moves only with its whole set.
+pub(crate) fn disc_set_line(entry: &OrganisationPlanEntry) -> Option<String> {
+    let sheet = entry.disc_set.as_deref()?;
+    matches!(
+        entry.status,
+        OrganisationStatus::Suggested | OrganisationStatus::AlreadyOrganised
+    )
+    .then(|| {
+        format!(
+            "Disc set: moves together with {} (names unchanged)",
+            sheet
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| sheet.display().to_string())
+        )
+    })
+}
+
 pub(crate) fn platform_line(display_name: &str, source: &str) -> String {
     if source.trim().is_empty() {
         format!("System: {display_name}")
@@ -3416,6 +3462,9 @@ fn show_plan(
                                 &entry.platform_display_name,
                                 &entry.platform_source,
                             ));
+                        }
+                        if let Some(line) = disc_set_line(entry) {
+                            ui.label(line);
                         }
                         ui.label(match plan.mode {
                             _ if unverified.is_some() => {
@@ -4346,6 +4395,7 @@ mod tests {
             entries.push(OrganisationPlanEntry {
                 source_identity: None,
                 catalogue_binding: None,
+                disc_set: None,
                 source_path: source.clone(),
                 destination_path: source.with_file_name(name),
                 platform: None,
@@ -4953,6 +5003,7 @@ mod tests {
         OrganisationPlanEntry {
             source_identity: None,
             catalogue_binding: None,
+            disc_set: None,
             source_path: PathBuf::from("/sources/Combat.bin"),
             destination_path: PathBuf::from("/library/atari2600/Combat.bin"),
             platform: Some("Atari2600".to_string()),
@@ -5007,6 +5058,7 @@ mod tests {
             entries: vec![OrganisationPlanEntry {
                 source_identity: None,
                 catalogue_binding: None,
+                disc_set: None,
                 source_path: PathBuf::from("/sources/Combat.bin"),
                 destination_path: library_root.join("atari2600").join("Combat (USA).bin"),
                 platform: Some("Atari2600".to_string()),

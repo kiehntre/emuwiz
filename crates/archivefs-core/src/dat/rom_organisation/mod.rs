@@ -31,6 +31,7 @@
 //! organise an existing symlink object only, or build a linked library from
 //! untouched regular sources.
 
+pub mod disc_sets;
 pub mod game_rename;
 pub mod link_target;
 pub mod model;
@@ -40,6 +41,8 @@ pub mod tombstones;
 pub mod transaction;
 
 #[cfg(test)]
+mod disc_set_tests;
+#[cfg(test)]
 mod game_rename_tests;
 #[cfg(test)]
 mod linked_library_tests;
@@ -48,6 +51,7 @@ mod rename_guard_tests;
 #[cfg(test)]
 mod tests;
 
+pub use disc_sets::{disc_set_of, hold_disc_sets_together, refuse_partial_disc_sets};
 pub use model::{OrganisationMode, OrganisationPlan, OrganisationPlanEntry, OrganisationStatus};
 pub use plan::{
     OrganisationCandidate, OrganisationPlanRequest, build_organisation_plan,

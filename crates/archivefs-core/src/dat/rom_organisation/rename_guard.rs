@@ -6,7 +6,9 @@
 //!
 //! - an arcade romset is found by its set name (MAME, FBNeo);
 //! - a `.cue`/`.m3u`/`.m3u8`/`.gdi` names the file, so renaming it alone
-//!   stops the disc (or the whole multi-disc set) launching;
+//!   stops the disc (or the whole multi-disc set) launching. In Move mode a
+//!   file of a complete disc set moves with its sheets, names unchanged
+//!   ([`super::disc_sets`]), so only a sheet outside its set refuses it;
 //! - RetroArch finds saves and save states by the game's file name. Bulk
 //!   rename does not move saves yet, so a game with saves is left for the
 //!   one-game Rename, which moves them in the same journal.
@@ -125,6 +127,22 @@ pub(crate) fn guard_with_index(
         Ok(folders) => Ok(folders),
         Err(error) => Err(format!("could not read the library folders: {error}")),
     };
+    // Move mode: a disc-set file moves with its own set's sheets (names
+    // unchanged), so those sheets naming it is expected; any other sheet
+    // naming it still refuses it.
+    let mut own_sheets: HashMap<PathBuf, BTreeSet<PathBuf>> = HashMap::new();
+    if plan.mode == OrganisationMode::MoveRealFile {
+        for entry in &plan.entries {
+            if let Some(sheet) = &entry.disc_set
+                && super::disc_sets::sheet_kind(&entry.source_path).is_some()
+            {
+                own_sheets
+                    .entry(sheet.clone())
+                    .or_default()
+                    .insert(entry.source_path.clone());
+            }
+        }
+    }
     let mut blocked = 0;
     for entry in &mut plan.entries {
         if entry.status != OrganisationStatus::Suggested
@@ -141,6 +159,11 @@ pub(crate) fn guard_with_index(
                 &entry.source_path,
                 &plan.master_root,
                 plan.generation,
+                plan.mode,
+                entry
+                    .disc_set
+                    .as_ref()
+                    .and_then(|sheet| own_sheets.get(sheet)),
                 save_locations,
                 &mut sidecars,
                 &mut saves,
@@ -152,6 +175,8 @@ pub(crate) fn guard_with_index(
             blocked += 1;
         }
     }
+    // Every file of a disc set moves or none does.
+    blocked += super::disc_sets::hold_disc_sets_together(&mut plan.entries);
     stats.blocked = blocked;
     stats.sidecar_folder_reads = sidecars.folders.len() as u64;
     stats.saves = saves.stats;
@@ -198,6 +223,8 @@ fn refusal_for(
     source: &Path,
     plan_root: &Path,
     generation: u64,
+    mode: OrganisationMode,
+    own_sheets: Option<&BTreeSet<PathBuf>>,
     save_locations: &RetroArchSaveLocations,
     sidecars: &mut SidecarCache,
     saves: &mut SaveSearchIndex,
@@ -218,11 +245,17 @@ fn refusal_for(
     if let Err(reason) = refuse_arcade_set_in(folders, &resolution, &source_root) {
         return Some(reason);
     }
-    match sidecars.referencing(source, &source_root) {
+    match sidecars.referencing(source, &source_root, own_sheets) {
         Err(reason) => return Some(reason),
+        Ok(Some(referrer)) if mode == OrganisationMode::MoveRealFile => {
+            return Some(format!(
+                "{} names this file and does not move with it, so moving this file would stop the game launching. Nothing will change for this file.",
+                referrer.display()
+            ));
+        }
         Ok(Some(referrer)) => {
             return Some(format!(
-                "{} names this file, so renaming it alone would stop the game launching. Disc sets and cue files are not renamed in bulk yet. Nothing will change for this file.",
+                "{} names this file, so renaming it would stop the game launching. Disc-set files are not renamed in bulk; use Move to move the whole set together (names unchanged), or rename it on its own. Nothing will change for this file.",
                 referrer.display()
             ));
         }
@@ -249,11 +282,13 @@ struct SidecarCache {
 impl SidecarCache {
     /// The first sidecar in the file's folder, or a folder above it up to and
     /// including `source_root`, whose text names the file (same walk as the
-    /// one-game Rename).
+    /// one-game Rename). Sheets in `exclude` (the file's own disc set, which
+    /// moves with it) are skipped.
     fn referencing(
         &mut self,
         source: &Path,
         source_root: &Path,
+        exclude: Option<&BTreeSet<PathBuf>>,
     ) -> Result<Option<PathBuf>, String> {
         let Some(name) = source.file_name() else {
             return Ok(None);
@@ -268,10 +303,11 @@ impl SidecarCache {
             match listed {
                 Err(reason) => return Err(reason.clone()),
                 Ok(found) => {
-                    if let Some((path, _)) = found
-                        .iter()
-                        .find(|(path, text)| path != source && text.contains(&name))
-                    {
+                    if let Some((path, _)) = found.iter().find(|(path, text)| {
+                        path != source
+                            && !exclude.is_some_and(|own| own.contains(path))
+                            && text.contains(&name)
+                    }) {
                         return Ok(Some(path.clone()));
                     }
                 }

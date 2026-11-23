@@ -266,6 +266,7 @@ fn entry(
     OrganisationPlanEntry {
         source_identity: None,
         catalogue_binding: None,
+        disc_set: None,
         source_path: PathBuf::from("/tmp/whatever"),
         destination_path: PathBuf::new(),
         platform: platform.map(String::from),

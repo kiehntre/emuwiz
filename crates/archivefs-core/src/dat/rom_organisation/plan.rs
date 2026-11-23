@@ -91,24 +91,55 @@ pub fn layout_folder_in(master_root: &Path, platform_id: &str) -> Result<String,
     }
 }
 
-/// Builds a read-only organisation plan. Never mutates the filesystem.
+/// The reason an entry is blocked only because its platform is unknown. A
+/// disc-set file with this reason takes its set's platform.
+pub(crate) const NO_PLATFORM_REASON: &str = "no platform identity could be resolved for this game";
+
+/// Builds a read-only organisation plan, one entry per candidate on its own.
+/// Never mutates the filesystem. Disc sets are not grouped here: this is the
+/// planner for single-game rechecks and for workflows that move a set with
+/// its lead themselves. The bulk Organise preview uses
+/// [`build_organisation_plan_reporting`].
 pub fn build_organisation_plan(request: &OrganisationPlanRequest<'_>) -> OrganisationPlan {
     let mut ignore = |_: crate::job_progress::JobProgress| {};
     let mut reporter = crate::job_progress::ProgressReporter::new(&mut ignore);
-    build_organisation_plan_reporting(request, None, &mut reporter)
+    plan_reporting(request, None, &mut reporter, false)
         .expect("a plan without a cancel flag is never cancelled")
 }
 
-/// [`build_organisation_plan`] with real checkpoints and cooperative
-/// cancellation between candidates. Planning only reads (it stats sources and
-/// computes destinations), so `None` - cancelled - means nothing on disk was
-/// touched and there is no half-built plan to reason about.
+/// The bulk Organise preview: [`build_organisation_plan`] with real
+/// checkpoints and cooperative cancellation between candidates, and, in Move
+/// mode, disc sets moved as a whole ([`super::disc_sets`]). Planning only
+/// reads (it stats sources, reads sheets and computes destinations), so
+/// `None` - cancelled - means nothing on disk was touched and there is no
+/// half-built plan to reason about.
 pub fn build_organisation_plan_reporting(
     request: &OrganisationPlanRequest<'_>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     progress: &mut crate::job_progress::ProgressReporter<'_>,
 ) -> Option<OrganisationPlan> {
+    plan_reporting(request, cancel, progress, true)
+}
+
+fn plan_reporting(
+    request: &OrganisationPlanRequest<'_>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    progress: &mut crate::job_progress::ProgressReporter<'_>,
+    group_disc_sets: bool,
+) -> Option<OrganisationPlan> {
     let stop = || cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+    // A disc set keeps every name (its sheets name the files), so its files
+    // are planned under their own names.
+    let sets = if group_disc_sets && request.mode == OrganisationMode::MoveRealFile {
+        let files: Vec<&Path> = request
+            .candidates
+            .iter()
+            .map(|candidate| candidate.source_path.as_path())
+            .collect();
+        super::disc_sets::detect(&files)
+    } else {
+        Default::default()
+    };
     progress.phase(
         "Analysing files",
         "files",
@@ -120,14 +151,24 @@ pub fn build_organisation_plan_reporting(
             return None;
         }
         progress.tick(position as u64);
-        entries.push(plan_entry(request, candidate));
+        entries.push(if sets.contains(&candidate.source_path) {
+            let own_name = OrganisationCandidate {
+                canonical_name: None,
+                ..candidate.clone()
+            };
+            plan_entry(request, &own_name)
+        } else {
+            plan_entry(request, candidate)
+        });
     }
     progress.tick(request.candidates.len() as u64);
     if stop() {
         return None;
     }
+    super::disc_sets::settle(&sets, request.master_root, &mut entries);
     progress.phase("Checking destination conflicts", "files", None);
     detect_collisions(request.master_root, &mut entries);
+    super::disc_sets::hold_disc_sets_together(&mut entries);
     if stop() {
         return None;
     }
@@ -172,6 +213,7 @@ fn plan_entry(
     let blocked = |reason: &str| OrganisationPlanEntry {
         source_identity: source_identity.clone(),
         catalogue_binding: None,
+        disc_set: None,
         source_path: candidate.source_path.clone(),
         destination_path: PathBuf::new(),
         platform: None,
@@ -190,6 +232,7 @@ fn plan_entry(
         OrganisationPlanEntry {
             source_identity: source_identity.clone(),
             catalogue_binding: None,
+            disc_set: None,
             source_path: candidate.source_path.clone(),
             destination_path: PathBuf::new(),
             platform,
@@ -298,7 +341,7 @@ fn plan_entry(
                     &source_basename,
                     source_identity,
                 ),
-                _ => blocked("no platform identity could be resolved for this game"),
+                _ => blocked(NO_PLATFORM_REASON),
             };
         }
         PlatformIdentityResolution::Conflict { .. } => {
@@ -408,6 +451,7 @@ fn plan_entry(
     OrganisationPlanEntry {
         source_identity: source_identity.clone(),
         catalogue_binding: None,
+        disc_set: None,
         source_path: candidate.source_path.clone(),
         destination_path,
         platform: Some(platform),
@@ -464,6 +508,7 @@ fn unknown_entry(
     OrganisationPlanEntry {
         source_identity,
         catalogue_binding: None,
+        disc_set: None,
         source_path: candidate.source_path.clone(),
         destination_path,
         platform: None,

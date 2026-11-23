@@ -103,6 +103,11 @@ pub struct OrganisationPlanEntry {
     /// Exact catalogue identity and path associations reviewed in this preview.
     #[serde(default)]
     pub catalogue_binding: Option<serde_json::Value>,
+    /// Move mode only: the top sheet (`.cue`/`.m3u`/`.m3u8`/`.gdi`) of the
+    /// disc set this file belongs to. Every file of a set moves together,
+    /// names unchanged, or none of them moves (see `disc_sets`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disc_set: Option<PathBuf>,
     pub source_path: PathBuf,
     pub destination_path: PathBuf,
     /// Canonical platform id, when resolved strongly enough.

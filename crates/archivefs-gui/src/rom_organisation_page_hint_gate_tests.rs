@@ -32,6 +32,7 @@ fn entry(source: &str, name: &str, mode: OrganisationMode) -> OrganisationPlanEn
     OrganisationPlanEntry {
         source_identity: None,
         catalogue_binding: None,
+        disc_set: None,
         destination_path: source.with_file_name(name),
         source_path: source,
         platform: Some("NES".into()),

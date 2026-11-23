@@ -6,6 +6,7 @@ fn selection(count: usize) -> Selection {
         .map(|n| OrganisationPlanEntry {
             source_identity: None,
             catalogue_binding: None,
+            disc_set: None,
             source_path: PathBuf::from(format!("/collection/{n}.bin")),
             destination_path: PathBuf::from(format!("/collection/new{n}.bin")),
             platform: None,

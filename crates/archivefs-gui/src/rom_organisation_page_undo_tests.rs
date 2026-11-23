@@ -333,6 +333,7 @@ fn the_apply_confirmation_is_scrolled_into_view() {
         .push(OrganisationPlanEntry {
             source_identity: None,
             catalogue_binding: None,
+            disc_set: None,
             source_path: PathBuf::from("/roms/nes/ugly_one.nes"),
             destination_path: PathBuf::from("/roms/nes/Alpha Quest (USA).nes"),
             platform: Some("NES".to_string()),

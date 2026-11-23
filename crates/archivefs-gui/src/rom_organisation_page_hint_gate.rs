@@ -231,7 +231,10 @@ pub(crate) fn refuse_changed_names_with(
 ) -> Result<(), String> {
     use archivefs_core::dat::rename_plan::{DeriveOutcome, derive_proposed_basename};
     for entry in plan.suggested() {
-        if !approved.contains(entry.source_path.to_string_lossy().as_ref()) {
+        // A disc-set file keeps its own name by design (its sheets name it).
+        if !approved.contains(entry.source_path.to_string_lossy().as_ref())
+            || entry.disc_set.is_some()
+        {
             continue;
         }
         let (Some(own), Some(reviewed)) = (
