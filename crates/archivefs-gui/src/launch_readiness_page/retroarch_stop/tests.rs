@@ -504,3 +504,94 @@ fn no_stop_is_offered_without_a_running_launch() {
     wait_for_exit(&mut state);
     assert!(!rendered(|ui| state.show_stop_control(ui)).contains("Stop RetroArch"));
 }
+
+/// Issue #528: RetroArch can stall while closing after a save state it could
+/// not write, and a single Stop then never ends it. The player may confirm a
+/// second request, which RetroArch obeys by exiting at once with status 1.
+fn stalling_retroarch(dir: &std::path::Path) -> (RetroArchLaunchState, std::path::PathBuf) {
+    let (ready, count) = (dir.join("ready"), dir.join("count"));
+    let script = format!(
+        "n=0; trap 'n=$((n+1)); printf x >> \"{count}\"; [ $n -ge 2 ] && exit 1' TERM; : > '{ready}'; while [ -d '{dir}' ]; do sleep 0.01; done",
+        count = count.display(),
+        ready = ready.display(),
+        dir = dir.display(),
+    );
+    let state = tracking(spawn_test_process("/bin/sh", &["-c", &script]));
+    wait_for_file(&ready);
+    (state, count)
+}
+
+#[test]
+fn force_close_is_offered_only_after_stop_and_is_never_sent_by_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut state, count) = stalling_retroarch(dir.path());
+    let before = rendered(|ui| state.show_stop_control(ui));
+    assert!(!before.contains("Force RetroArch"), "{before}");
+    assert!(before.contains(FROZEN_HINT), "{before}");
+    assert_eq!(state.force_stop_for_test(), None, "never a first signal");
+
+    assert!(matches!(
+        state.stop_for_test(),
+        Some(GracefulStopOutcome::StillRunning { .. })
+    ));
+    // Showing the control, any number of frames later, sends nothing more.
+    for _ in 0..3 {
+        let text = rendered(|ui| state.show_stop_control(ui));
+        assert!(text.contains("stuck closing"), "{text}");
+        assert!(text.contains("Force RetroArch to close"), "{text}");
+        assert!(!text.contains(FROZEN_HINT), "{text}");
+        assert!(text.contains("will not write the in-game save"), "{text}");
+        std::thread::sleep(Duration::from_millis(100));
+        state.poll();
+    }
+    assert_eq!(std::fs::read(&count).unwrap(), b"x");
+    assert!(state.is_active());
+    assert!(matches!(
+        state.display_for(&request()),
+        RetroArchLaunchDisplay::Running { .. }
+    ));
+}
+
+#[test]
+fn a_forced_close_ends_a_stalled_retroarch_and_says_the_in_game_save_was_not_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut state, count) = stalling_retroarch(dir.path());
+    state.stop_for_test();
+    std::thread::sleep(Duration::from_millis(200));
+    state.poll();
+    assert!(state.is_active(), "the first request alone does not end it");
+
+    assert!(matches!(
+        state.force_stop_for_test(),
+        Some(GracefulStopOutcome::ExitedAfterRequest | GracefulStopOutcome::StillRunning { .. })
+    ));
+    let display = wait_for_exit(&mut state);
+    assert!(
+        matches!(
+            display,
+            RetroArchLaunchDisplay::Exited {
+                success: false,
+                forced_stop: true,
+                ..
+            }
+        ),
+        "expected a forced, unsuccessful exit"
+    );
+    assert_eq!(
+        std::fs::read(&count).unwrap(),
+        b"xx",
+        "exactly two requests"
+    );
+    let feedback = rendered(|ui| show_retroarch_launch_feedback(ui, &display));
+    assert!(feedback.contains("forced to close"), "{feedback}");
+    assert!(
+        feedback.contains("did not write the in-game save"),
+        "{feedback}"
+    );
+    assert!(!feedback.contains("closed normally"), "{feedback}");
+    let control = rendered(|ui| state.show_stop_control(ui));
+    assert!(
+        control.contains("did not write the in-game save"),
+        "{control}"
+    );
+}

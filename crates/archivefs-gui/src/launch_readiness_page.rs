@@ -2424,6 +2424,8 @@ pub(crate) enum RetroArchLaunchDisplay {
         stderr_tail: Option<String>,
         /// What the player's Stop request, if any, returned.
         stop_outcome: Option<archivefs_core::launch::process_spawn::GracefulStopOutcome>,
+        /// Whether the player's confirmed second request reached RetroArch.
+        forced_stop: bool,
         /// What is known about this launch's saves.
         saves: SaveCheck,
     },
@@ -2801,6 +2803,7 @@ impl RetroArchLaunchState {
                         status_detail,
                         stderr_tail,
                         stop_outcome: stop.outcome(),
+                        forced_stop: stop.forced(),
                         saves: saves.clone(),
                     }
                 }
@@ -2855,6 +2858,7 @@ impl RetroArchLaunchState {
                         status_detail,
                         stderr_tail,
                         stop_outcome: stop.outcome(),
+                        forced_stop: stop.forced(),
                         saves: saves.clone(),
                     }
                 }
@@ -6814,6 +6818,7 @@ pub(crate) fn show_retroarch_launch_feedback(ui: &mut egui::Ui, display: &RetroA
             status_detail,
             stderr_tail,
             stop_outcome,
+            forced_stop,
             saves,
         } => {
             // A save problem comes first and is never folded into how the
@@ -6837,7 +6842,22 @@ pub(crate) fn show_retroarch_launch_feedback(ui: &mut egui::Ui, display: &RetroA
                 }
                 SaveCheck::NoFailureDetected { .. } | SaveCheck::Unavailable { .. } => {}
             }
-            if let Some(summary) = retroarch_stop::requested_exit(*stop_outcome, *success) {
+            if *forced_stop {
+                widgets::banner(
+                    ui,
+                    "RetroArch forced to close",
+                    retroarch_stop::FORCED_EXIT,
+                    widgets::StatusTone::Warning,
+                );
+                ui.small(format!("Exit status: {status_detail}"));
+                if let Some(stderr_tail) = stderr_tail {
+                    widgets::technical_details(ui, "retroarch-forced-stderr", |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(stderr_tail).monospace()).wrap(),
+                        );
+                    });
+                }
+            } else if let Some(summary) = retroarch_stop::requested_exit(*stop_outcome, *success) {
                 let summary = if *success && saves.is_problem() {
                     (
                         "RetroArch closed after you asked it to stop, but it reported a save problem (above).",

@@ -1078,6 +1078,28 @@ impl LaunchedRetroArchProcess {
             }
         }
     }
+
+    /// The player's confirmed follow-up when RetroArch did not close after
+    /// [`Self::request_graceful_stop`]: one more SIGTERM to the same child,
+    /// which RetroArch takes as "exit now" while it is already closing. Its
+    /// own shutdown can stall after a save state it could not write
+    /// (RetroArch 1.21.0 and 1.22.2, issue #528); it then writes nothing
+    /// more, including the in-game save. Same target check as the first
+    /// request; see [`WatchedProcess::request_second_stop`].
+    pub fn request_second_stop(
+        &mut self,
+        grace_period: std::time::Duration,
+    ) -> process_spawn::GracefulStopOutcome {
+        use process_spawn::{GracefulStopOutcome, GracefulStopRefusal, OwnedExecutable};
+        match self.stop_target() {
+            OwnedExecutable::Matches | OwnedExecutable::Exited => {
+                self.watched.request_second_stop(grace_period)
+            }
+            OwnedExecutable::Differs | OwnedExecutable::Unavailable => {
+                GracefulStopOutcome::Refused(GracefulStopRefusal::TargetNotEmulator)
+            }
+        }
+    }
 }
 
 /// Spawns exactly the process `command` describes - never a shell, never
