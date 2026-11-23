@@ -143,7 +143,7 @@ deliberate abnormal end returned something else. What has been observed
 |---|---|---|
 | RetroArch, native 1.21.0 and Flatpak 1.22.2 | 18 ordinary endings per route (quit command, quit key, window close, self-exit, polite stop, quit with an unwritable save state): 0 every time. 3 deliberate faults per route: 139 every time. Nothing hung | Meets the standard **from inside a running game**. Believed only for a session in which the game was actually seen running; nothing can observe that today, so in practice every RetroArch exit status is "not known" (see below). One earlier polite stop **at the menu with no game loaded** returned 139 and is unexplained |
 | PPSSPP, Flatpak 1.20.4 | 9 ordinary endings (window close, in-app exit, polite stop): 0 every time. 3 deliberate faults: the process **hung**, and was only ended by the probe 40 s later | Not demonstrated: held as "not known" |
-| PCSX2, Flatpak 2.8.2 | Not yet closed from inside a game. At its first-run window a close returned 1 | Not demonstrated |
+| PCSX2, Flatpak 2.8.2 | Two real sessions with a game running (2026-11-22, 2026-11-23), closed with its own System > Exit: 0 both times. At its first-run window a close returned 1. No abnormal end was tried | Only a relayed **0** from its own identified process is taken as a normal close (owner decision 2026-11-23). Every other status stays "launcher only": not known. A normal close says nothing about whether the game saved |
 | RPCS3, Flatpak | Not yet closed from inside a game. A window close returned 134 and the crash handler confirms it was ended by a fatal signal while closing; after a deliberate fault it kept running | Not demonstrated |
 | DuckStation, Dolphin, others | Not probed | Not demonstrated |
 

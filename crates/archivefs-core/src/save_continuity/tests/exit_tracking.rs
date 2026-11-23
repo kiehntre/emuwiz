@@ -602,6 +602,10 @@ fn no_real_emulators_flatpak_exit_is_believed_until_demonstrated_from_inside_a_g
             "{emulator}: what was observed is kept as preliminary evidence"
         );
         for code in [0, 1, 134, 139, 143] {
+            if code == 0 && relayed_zero_believed(emulator) {
+                // Its own test: `a_relayed_zero_from_the_tracked_pcsx2_process_is_a_normal_close`.
+                continue;
+            }
             let case = launch(emulator, "flatpak", true);
             case.machine
                 .start(100, 1, "bwrap", "/usr/bin/bwrap", Some(scope));
@@ -655,6 +659,155 @@ fn no_real_emulators_flatpak_exit_is_believed_until_demonstrated_from_inside_a_g
     // emulator is on the list, and only in test builds.
     assert_eq!(EXIT_STATUS_DEMONSTRATED.len(), 1);
     assert_eq!(EXIT_STATUS_DEMONSTRATED[0].0, "ProbeEmu");
+}
+
+/// A Flatpak launch of PCSX2 with the process tree really observed:
+/// 100 (bwrap, the process EmuWiz started) -> 101 (bwrap) -> 102 (pcsx2-qt).
+fn flatpak_pcsx2() -> Case {
+    const PCSX2_SCOPE: &str = "app-flatpak-net.pcsx2.PCSX2-100.scope";
+    let case = launch("PCSX2", "flatpak", true);
+    case.machine
+        .start(100, 1, "bwrap", "/usr/bin/bwrap", Some(PCSX2_SCOPE));
+    case.journal
+        .mark_started(&case.session, 100, &case.machine)
+        .unwrap();
+    case.machine
+        .start(101, 100, "bwrap", "/usr/bin/bwrap", Some(PCSX2_SCOPE));
+    case.machine
+        .start(102, 101, "pcsx2-qt", "/app/bin/pcsx2-qt", Some(PCSX2_SCOPE));
+    case
+}
+
+#[test]
+fn a_relayed_zero_from_the_tracked_pcsx2_process_is_a_normal_close() {
+    // Owner decision 2026-11-23. The emulator's own process was identified
+    // inside the sandbox, it is gone, and the sandbox relayed 0.
+    assert!(relayed_zero_believed("PCSX2"));
+    assert!(!exit_status_demonstrated("PCSX2"));
+    let case = flatpak_pcsx2();
+    assert_eq!(case.look().sandbox_main.map(|main| main.pid), Some(102));
+    case.machine.exit(&[102, 101, 100]);
+    let ended = case.end(ExitObservation::Code(0));
+    assert_eq!(ended.state, SessionState::Ended);
+    assert_eq!(ended.end, Some(SessionEnd::Clean));
+    assert_eq!(ended.exit_evidence, Some(ExitEvidence::SandboxRelay));
+    assert_eq!(
+        ended.observed_status,
+        Some(ObservedStatus::ExitCode { code: 0 })
+    );
+    assert!(!ended.needs_attention());
+    // How the process ended says nothing about a save: the save changes are
+    // whatever the marks say, here one changed mark and no claim beyond it.
+    assert!(!ended.status_line().to_lowercase().contains("saved"));
+}
+
+#[test]
+fn any_other_relayed_status_of_pcsx2_stays_the_launchers_alone() {
+    // Nothing but 0 was ever shown to mean anything for PCSX2 (a close at
+    // its first-run window returned 1). Non-zero is neither clean nor
+    // abnormal: exactly what was recorded before the decision.
+    for code in [1, 2, 134, 139, 143, 255] {
+        let case = flatpak_pcsx2();
+        case.look();
+        case.machine.exit(&[102, 101, 100]);
+        let ended = case.end(ExitObservation::Code(code));
+        assert_eq!(
+            ended.exit_evidence,
+            Some(ExitEvidence::LauncherOnly),
+            "{code}"
+        );
+        assert_ne!(ended.end, Some(SessionEnd::Clean), "{code}");
+        assert!(!ended.end.as_ref().unwrap().abnormal(), "{code}");
+        assert!(!ended.needs_attention(), "{code}");
+    }
+    // A signal that ended the process EmuWiz started is not a relayed status.
+    let case = flatpak_pcsx2();
+    case.look();
+    case.machine.exit(&[102, 101, 100]);
+    let ended = case.end(ExitObservation::Signal {
+        signal: 9,
+        core_dumped: false,
+    });
+    assert_eq!(ended.exit_evidence, Some(ExitEvidence::LauncherOnly));
+    assert_ne!(ended.end, Some(SessionEnd::Clean));
+}
+
+#[test]
+fn a_zero_that_is_only_the_launchers_is_not_a_normal_close_of_pcsx2() {
+    const PCSX2_SCOPE: &str = "app-flatpak-net.pcsx2.PCSX2-100.scope";
+    // 1. The emulator's process was never seen: nothing to attribute 0 to.
+    let case = launch("PCSX2", "flatpak", true);
+    case.machine
+        .start(100, 1, "bwrap", "/usr/bin/bwrap", Some(PCSX2_SCOPE));
+    case.journal
+        .mark_started(&case.session, 100, &case.machine)
+        .unwrap();
+    assert!(case.look().sandbox_main.is_none());
+    case.machine.exit(&[100]);
+    let ended = case.end(ExitObservation::Code(0));
+    assert_eq!(ended.end, Some(SessionEnd::LauncherExitedOk));
+    assert_eq!(ended.exit_evidence, Some(ExitEvidence::LauncherOnly));
+
+    // 2. A shell sits between the sandbox and the emulator: the status that
+    //    comes back may be the shell's.
+    let case = launch("PCSX2", "flatpak", true);
+    case.machine
+        .start(100, 1, "bwrap", "/usr/bin/bwrap", Some(PCSX2_SCOPE));
+    case.journal
+        .mark_started(&case.session, 100, &case.machine)
+        .unwrap();
+    case.machine
+        .start(101, 100, "bwrap", "/usr/bin/bwrap", Some(PCSX2_SCOPE));
+    case.machine
+        .start(102, 101, "sh", "/usr/bin/sh", Some(PCSX2_SCOPE));
+    case.machine
+        .start(103, 102, "pcsx2-qt", "/app/bin/pcsx2-qt", Some(PCSX2_SCOPE));
+    assert!(case.look().sandbox_main.is_none());
+    case.machine.exit(&[103, 102, 101, 100]);
+    let ended = case.end(ExitObservation::Code(0));
+    assert_eq!(ended.end, Some(SessionEnd::LauncherExitedOk));
+    assert_eq!(ended.exit_evidence, Some(ExitEvidence::LauncherOnly));
+
+    // 3. The process EmuWiz started is a script, not the sandbox.
+    let case = launch("PCSX2", "flatpak", true);
+    case.machine
+        .start(100, 1, "sh", "/usr/bin/sh", Some(PCSX2_SCOPE));
+    case.journal
+        .mark_started(&case.session, 100, &case.machine)
+        .unwrap();
+    case.machine
+        .start(101, 100, "bwrap", "/usr/bin/bwrap", Some(PCSX2_SCOPE));
+    case.machine
+        .start(102, 101, "pcsx2-qt", "/app/bin/pcsx2-qt", Some(PCSX2_SCOPE));
+    assert!(case.look().sandbox_main.is_none());
+    case.machine.exit(&[102, 101, 100]);
+    let ended = case.end(ExitObservation::Code(0));
+    assert_eq!(ended.end, Some(SessionEnd::LauncherExitedOk));
+    assert_eq!(ended.exit_evidence, Some(ExitEvidence::LauncherOnly));
+
+    // 4. The launcher returned 0 while the identified emulator is still
+    //    running: that 0 is not the emulator's.
+    let case = flatpak_pcsx2();
+    assert_eq!(case.look().sandbox_main.map(|main| main.pid), Some(102));
+    case.machine.exit(&[100]);
+    let ended = case.end(ExitObservation::Code(0));
+    assert_ne!(ended.end, Some(SessionEnd::Clean));
+    assert_ne!(ended.exit_evidence, Some(ExitEvidence::SandboxRelay));
+
+    // 5. A native PCSX2 behind a launcher is not a checked sandbox route.
+    let case = launch("PCSX2", "native", true);
+    case.machine.start(100, 1, "sh", "/usr/bin/sh", None);
+    case.journal
+        .mark_started(&case.session, 100, &case.machine)
+        .unwrap();
+    case.machine.exit(&[100]);
+    let ended = case.end(ExitObservation::Code(0));
+    assert_eq!(ended.exit_evidence, Some(ExitEvidence::LauncherOnly));
+
+    // 6. No other real emulator gains anything from the rule.
+    for other in ["RPCS3", "PPSSPP", "RetroArch", "DuckStation"] {
+        assert!(!relayed_zero_believed(other), "{other}");
+    }
 }
 
 // ---- Regression tests for the independent review of 2026-11-21 ----
@@ -1268,6 +1421,12 @@ fn seeing_a_game_run_does_not_make_any_other_emulator_believed() {
         ("RPCS3", "rpcs3", "/app/bin/rpcs3"),
     ] {
         for code in [0, 1, 134, 139] {
+            if code == 0 && relayed_zero_believed(emulator) {
+                // A relayed 0 of PCSX2 is believed by its own rule, whether
+                // or not a game was seen: see
+                // `a_relayed_zero_from_the_tracked_pcsx2_process_is_a_normal_close`.
+                continue;
+            }
             let dir = tempfile::tempdir().unwrap();
             let journal = SessionJournal::open(dir.path(), "dev").unwrap();
             let launch = SessionLaunch {

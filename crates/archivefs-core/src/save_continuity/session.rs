@@ -583,7 +583,7 @@ pub const PRELIMINARY_EXIT_EVIDENCE: [(&str, &str); 4] = [
     ),
     (
         "PCSX2",
-        "closing its window returned exit code 1 (observed at the first-run setup window, not in a game)",
+        "closing its window returned exit code 1 (observed at the first-run setup window, not in a game); only exit status 0 from its own process is taken as a normal close",
     ),
     (
         "RPCS3",
@@ -635,6 +635,33 @@ pub const SANDBOX_BINARIES: [(&str, &[&str]); 5] = [
 /// included, is recorded as "not known" with the observed number kept. The
 /// rule takes effect only once a trustworthy observation exists.
 pub const EXIT_STATUS_DEMONSTRATED_IN_GAME: [&str; 1] = ["RetroArch"];
+
+/// Emulators for which a relayed exit status of **0, and only 0**, is
+/// believed to be a normal close (owner decision 2026-11-23).
+///
+/// PCSX2, Flatpak 2.8.2: in two real sessions started with Blue's Play,
+/// with a game running, closing it with its own System > Exit returned 0
+/// (2026-11-22 and 2026-11-23). No abnormal end was tried, and a close at
+/// its first-run window returned 1, so nothing but 0 means anything: any
+/// other status stays the launcher's alone, exactly as before.
+///
+/// The 0 is believed only when it is the emulator's own: the session is a
+/// checked Flatpak route, the emulator's process was identified as the
+/// sandbox's direct command (see [`sandbox_main`]) and is gone, and the
+/// sandbox relayed the status by exiting itself. A launcher's 0 with no
+/// such process identified is still only the launcher's.
+///
+/// A normal close says how the process ended. It says nothing about
+/// whether the game saved.
+pub const RELAYED_ZERO_IS_A_NORMAL_CLOSE: [&str; 1] = ["PCSX2"];
+
+/// Whether a relayed exit status of 0 from `emulator` is believed (see
+/// [`RELAYED_ZERO_IS_A_NORMAL_CLOSE`]).
+pub fn relayed_zero_believed(emulator: &str) -> bool {
+    RELAYED_ZERO_IS_A_NORMAL_CLOSE
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(emulator))
+}
 
 fn demonstrated_in_game_only(emulator: &str) -> bool {
     !exit_status_demonstrated(emulator)
@@ -1684,8 +1711,11 @@ impl SessionJournal {
         let relayed = record.launch.through_launcher
             && matches!(exit, ExitObservation::Code(_))
             // Checked again here, not only when the emulator was identified:
-            // a stored record never widens what is believed.
-            && exit_status_believed(&record)
+            // a stored record never widens what is believed. For an emulator
+            // of which only a relayed 0 is believed, only 0 qualifies.
+            && (exit_status_believed(&record)
+                || (matches!(exit, ExitObservation::Code(0))
+                    && relayed_zero_believed(&record.launch.emulator)))
             && record
                 .sandbox_main
                 .as_ref()
