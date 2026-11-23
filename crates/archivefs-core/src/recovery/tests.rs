@@ -4619,6 +4619,52 @@ mod mount_identity_tests {
         assert!(prepare_in(&store, &lab, &zip).is_ok());
     }
 
+    /// The launch check holds a prepared copy in a chosen folder to the
+    /// same proof as writing does. With a second connected disk reporting
+    /// the folder's identity (a block copy has the same identity and the
+    /// same receipts), on a filesystem that is not ext4, or with the disk
+    /// not among the mounted ones, the copy's launch file is refused, though
+    /// the files themselves would pass the quick check.
+    #[test]
+    fn a_launch_from_a_chosen_folder_needs_the_full_proof_of_its_disk() {
+        use crate::recovery::disk_identity::{EXT4_OVERRIDE, SAME_IDENTITY_OVERRIDE};
+        let lab = Lab::new();
+        let zip = lab.standard_zip();
+        let chosen = lab.root.join("chosen");
+        private_folder(&chosen);
+        let real = real_filesystem(&chosen);
+        let store = PreparedMediaStore::configured_recorded(Some(chosen.clone()), real.id)
+            .unwrap()
+            .unwrap();
+        let launch_path = prepare_in(&store, &lab, &zip).unwrap().summary.launch_path;
+        let verified = || {
+            matches!(
+                store.check_launch_path(&launch_path),
+                LaunchPathCheck::Verified(_)
+            )
+        };
+        let refused_with = |reason: &str| {
+            let check = store.check_launch_path(&launch_path);
+            assert!(
+                matches!(&check, LaunchPathCheck::Refused(detail) if detail.contains(reason)),
+                "expected {reason:?}: {check:?}"
+            );
+        };
+        assert!(verified());
+
+        SAME_IDENTITY_OVERRIDE.with(|hook| *hook.borrow_mut() = Some(Box::new(|_| Some(Ok(2)))));
+        refused_with("more than one connected disk");
+        SAME_IDENTITY_OVERRIDE.with(|hook| *hook.borrow_mut() = Some(Box::new(|_| Some(Ok(0)))));
+        refused_with("could not be verified");
+        SAME_IDENTITY_OVERRIDE.with(|hook| *hook.borrow_mut() = Some(Box::new(|_| Some(Ok(1)))));
+        assert!(verified());
+
+        EXT4_OVERRIDE.with(|hook| *hook.borrow_mut() = Some(Box::new(|_| Some(false))));
+        refused_with("could not be verified");
+        EXT4_OVERRIDE.with(|hook| *hook.borrow_mut() = Some(Box::new(|_| Some(true))));
+        assert!(verified());
+    }
+
     /// A folder tied to a disk is never created, whichever way the store
     /// was made: an earlier folder that is gone (its disk is absent) is
     /// refused, and nothing appears where its disk would be mounted.

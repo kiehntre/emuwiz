@@ -1939,15 +1939,36 @@ impl PreparedMediaStore {
         if !content.starts_with(&resolved_root) {
             return LaunchPathCheck::NotPreparedMedia;
         }
-        // A chosen folder that is no longer on the disk it was chosen on
-        // holds nothing this store prepared, whatever is found in it.
-        if let Some(chosen) = self.chosen_filesystem
-            && filesystem_id(&resolved_root) != Some(chosen)
-        {
-            return LaunchPathCheck::Refused(
-                "this file is in the folder for prepared copies, but that folder is not on the disk it was chosen on (is its disk connected?)"
-                    .into(),
-            );
+        // A chosen folder that is not provably on the disk it was chosen on
+        // holds nothing this store prepared, whatever is found in it. The
+        // proof is the same as for writing: the folder's own handle, ext4,
+        // the recorded identity, and no second connected disk reporting it
+        // (a block copy of the disk has the same identity and the same
+        // receipts).
+        if let Some(chosen) = self.chosen_filesystem {
+            use super::disk_identity::NotVerified;
+            let verified = open_directory_no_symlinks(&resolved_root)
+                .map_err(|_| NotVerified::OtherDisk)
+                .and_then(|directory| {
+                    super::disk_identity::verify_id_on(&directory, &resolved_root, chosen)
+                });
+            let why = match verified {
+                Ok(()) => None,
+                Err(NotVerified::Shared) => Some(
+                    "more than one connected disk reports the identity of the disk that folder was chosen on (a copied disk?); disconnect the other disk",
+                ),
+                Err(NotVerified::OtherDisk) => {
+                    Some("that folder is not on the disk it was chosen on (is its disk connected?)")
+                }
+                Err(_) => Some(
+                    "which disk that folder is on could not be verified (is its disk connected?)",
+                ),
+            };
+            if let Some(why) = why {
+                return LaunchPathCheck::Refused(format!(
+                    "this file is in the folder for prepared copies, but {why}"
+                ));
+            }
         }
         let store = Self::at(resolved_root);
         let relative = match content.strip_prefix(store.sets_dir()) {

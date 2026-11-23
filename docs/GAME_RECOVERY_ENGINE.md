@@ -385,8 +385,8 @@ with `members()`, `fingerprint()` and `verify_structure()` rather than a rewrite
     different UUIDs could in principle give the same identity; the chance is about
     1 in 18 billion billion for any pair. A block-level copy of a disk has the same
     UUID: with both copies connected and mounted where EmuWiz can see them it is
-    refused as ambiguous, when a folder is chosen or named and each time a saved
-    choice is used; with only one connected it cannot be told from the original. A
+    refused as ambiguous, when a folder is chosen or named, each time a saved
+    choice is used, and when a prepared copy in it is about to be launched; with only one connected it cannot be told from the original. A
     copy whose mount is hidden under another mount, is mounted only in another
     mount namespace (a container), or is below a folder this user cannot enter is
     not seen. Mounts covered by another mount are left out without being touched.
