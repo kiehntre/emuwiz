@@ -16,6 +16,10 @@ use std::time::Duration;
 const EXPLANATION: &str = "RetroArch is asked to close normally, so save in the game first if it needs it. Only the RetroArch that EmuWiz started is affected.";
 const NOT_THE_EMULATOR: &str = "Stop is not available for this launch: EmuWiz cannot confirm that the program it started is RetroArch itself, so stopping it might not close the game or let it save. Close RetroArch from its own window. EmuWiz will keep watching this launch.";
 const STILL_CLOSING: &str = "If its window has stopped responding, RetroArch may be stuck closing: it can stall for good after a save state it could not write. EmuWiz will not force it to close by itself.";
+/// Guidance only, shown beside Stop for a running RetroArch: Blue has not
+/// detected anything, it only points to where recovery lives (issue #528).
+pub(super) const FROZEN_HINT: &str =
+    "RetroArch frozen or won't quit? Press Stop to see recovery options.";
 const FORCE_WARNING: &str = "Forcing RetroArch to close ends it at once. It will not write the in-game save on the way out, so progress since the game last saved may be lost. Only the RetroArch that EmuWiz started is affected.";
 const FORCED_STILL_RUNNING: &str = "RetroArch has not closed even after being forced. EmuWiz will not send anything else; close it from your system's task manager.";
 pub(super) const FORCED_EXIT: &str = "RetroArch was forced to close because it did not finish closing. It did not write the in-game save on the way out, so progress since the game last saved may be lost.";
@@ -83,6 +87,7 @@ impl StopControl {
             None => {
                 let game = game_name(process);
                 ui.small(EXPLANATION);
+                ui.small(FROZEN_HINT);
                 ui.checkbox(
                     &mut self.confirmed,
                     format!("I confirm: ask RetroArch to close {game}"),

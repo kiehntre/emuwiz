@@ -527,6 +527,7 @@ fn force_close_is_offered_only_after_stop_and_is_never_sent_by_itself() {
     let (mut state, count) = stalling_retroarch(dir.path());
     let before = rendered(|ui| state.show_stop_control(ui));
     assert!(!before.contains("Force RetroArch"), "{before}");
+    assert!(before.contains(FROZEN_HINT), "{before}");
     assert_eq!(state.force_stop_for_test(), None, "never a first signal");
 
     assert!(matches!(
@@ -538,6 +539,7 @@ fn force_close_is_offered_only_after_stop_and_is_never_sent_by_itself() {
         let text = rendered(|ui| state.show_stop_control(ui));
         assert!(text.contains("stuck closing"), "{text}");
         assert!(text.contains("Force RetroArch to close"), "{text}");
+        assert!(!text.contains(FROZEN_HINT), "{text}");
         assert!(text.contains("will not write the in-game save"), "{text}");
         std::thread::sleep(Duration::from_millis(100));
         state.poll();
