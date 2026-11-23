@@ -238,9 +238,7 @@ fn moving_real_files_is_guarded_and_link_modes_refuse_a_disc_without_its_sheet()
                 after["Quest.iso"].1
             );
             assert!(
-                after["Quest.iso"]
-                    .1
-                    .contains("is not linked with it"),
+                after["Quest.iso"].1.contains("is not linked with it"),
                 "{mode:?}"
             );
             assert!(
@@ -1161,6 +1159,7 @@ fn catalogue_and_revalidate_phase_profile() {
                 candidates: std::slice::from_ref(&candidate),
                 generation: 1,
                 unknown_folder: None,
+                link_target_roots: None,
             });
         }
         let replans = t.elapsed();
@@ -1300,6 +1299,7 @@ fn core_pipeline_benchmark() {
             candidates: &candidates,
             generation: 1,
             unknown_folder: None,
+            link_target_roots: None,
         });
         let planning = t.elapsed();
         let t = Instant::now();
