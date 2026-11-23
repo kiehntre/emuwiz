@@ -352,23 +352,91 @@ fn there_is_no_network_and_no_host_processes() {
         return;
     }
     let Some(w) = world() else { return };
+    // A process started here, outside the sandbox, whose command line is
+    // found nowhere else. (Comparing process ids proves nothing: the
+    // sandbox numbers its own processes from 1, and this test's own id is
+    // just as small when the tests themselves run in a process-id space of
+    // their own.)
+    let marker = format!(
+        "600.{}{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    );
+    // Stopped and reaped however this test ends, and holding none of the
+    // test's own output open.
+    struct Outside(std::process::Child);
+    impl Drop for Outside {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut outside = Outside(
+        std::process::Command::new("sleep")
+            .arg(&marker)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    // The same look as the sandboxed program takes, taken from out here,
+    // does find it: the look can tell, and the process is there to be found.
+    let seen_from_outside = || {
+        let listing = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("cat /proc/[0-9]*/cmdline 2>/dev/null")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&listing.stdout).contains(&marker)
+    };
+    assert!(
+        seen_from_outside(),
+        "the outside process is visible outside the sandbox before the look"
+    );
     run_stand_in(
         &w,
-        "#!/bin/sh\ncat /proc/net/dev > net.txt\nls /proc > procs.txt\n",
+        "#!/bin/sh\ncat /proc/net/dev > net.txt\nls /proc > procs.txt\ncat /proc/[0-9]*/cmdline > cmdlines.txt 2>/dev/null\n",
         &DosBoxHostAccess::none(),
     );
+    // It was running the whole time: still there, and still visible from
+    // out here, after the sandboxed program has finished.
+    assert!(
+        outside.0.try_wait().unwrap().is_none(),
+        "the outside process ran throughout the look"
+    );
+    assert!(
+        seen_from_outside(),
+        "the outside process is visible outside the sandbox after the look"
+    );
+    drop(outside);
     let interfaces: Vec<String> = out(&w, "net.txt")
         .lines()
         .filter(|l| l.contains(':'))
         .map(|l| l.split(':').next().unwrap().trim().to_string())
         .collect();
     assert!(interfaces.iter().all(|i| i == "lo"), "{interfaces:?}");
+    // Read as bytes: command lines of other programs need not be text.
+    let inside =
+        String::from_utf8_lossy(&std::fs::read(w.game.join("cmdlines.txt")).unwrap_or_default())
+            .into_owned();
     assert!(
-        !out(&w, "procs.txt")
-            .lines()
-            .any(|l| l == std::process::id().to_string()),
-        "the host process list is visible"
+        inside.contains("fake-dosbox"),
+        "the sandboxed program read its own command line: {inside:?}"
     );
+    assert!(
+        !inside.contains(&marker),
+        "a process outside the sandbox is visible inside it"
+    );
+    // The sandbox's process list is its own short one.
+    let listed = out(&w, "procs.txt")
+        .lines()
+        .filter(|l| l.chars().all(|c| c.is_ascii_digit()))
+        .count();
+    assert!(listed <= 8, "{listed} processes are listed inside");
 }
 
 #[test]

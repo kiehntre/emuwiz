@@ -70,6 +70,12 @@ pub(super) struct NativeWorkflows {
     launch_game_at_start: Option<i64>,
     launch_was_active: bool,
     launch_kind: Option<LaunchKind>,
+    /// Records each launch in the save-continuity session journal (records
+    /// only; never touches a save).
+    session_tracking: super::session_tracking::SessionTracking,
+    /// The process log's next sequence number, as last noted while no
+    /// launch was active.
+    launch_sequence_mark: u64,
     launch_attempts: launch_readiness_summary::AttemptTracker,
     /// The summary the Game Details readiness card last displayed, keyed by
     /// game and path; read-only input for the Game Doctor.
@@ -532,6 +538,8 @@ impl NativeWorkflows {
             launch_game_at_start: None,
             launch_was_active: false,
             launch_kind: None,
+            session_tracking: Default::default(),
+            launch_sequence_mark: archivefs_core::launch::process_log::next_sequence(),
             launch_attempts: Default::default(),
             shown_readiness: None,
             pending_play: None,
@@ -631,10 +639,21 @@ impl NativeWorkflows {
 
     fn observe_launch_activity(&mut self, activity: &mut Activity) {
         let active = self.launch_active();
+        if !active && !self.launch_was_active {
+            // Noted while no launch is active: a launch can start its
+            // process before this first sees it as active, and that process
+            // must still be recognised as the launch's own.
+            self.launch_sequence_mark = archivefs_core::launch::process_log::next_sequence();
+        }
         if active && !self.launch_was_active {
             self.launch_kind = self.active_launch_kind();
             self.launch_game_at_start = self.selected_game;
             self.launch_attempts.started();
+            self.session_tracking.launch_began(
+                self.launch_sequence_mark,
+                self.launch_kind_emulator(),
+                self.launch_session_game(),
+            );
             let job = activity.queue("Launching game", self.selected_route(), false);
             activity.start(job);
             self.launch_job = Some(job);
@@ -643,6 +662,7 @@ impl NativeWorkflows {
             && let Some(job) = self.launch_job.take()
         {
             let error = self.launch_failure();
+            self.session_tracking.launch_finished(error.clone());
             self.launch_attempts
                 .finished(self.launch_game_at_start.take(), error.clone());
             activity.finish(
@@ -4460,6 +4480,33 @@ impl NativeWorkflows {
             || self.app.launch_pcsx2.is_active()
             || self.app.launch_standalone.is_active()
             || self.app.launch_amiga_whdload.is_active()
+    }
+
+    /// The emulator this kind of launch is expected to start. Only a hint:
+    /// the session journal goes by the process that really starts.
+    fn launch_kind_emulator(&self) -> &'static str {
+        match self.launch_kind {
+            Some(LaunchKind::RetroArch) => "RetroArch",
+            Some(LaunchKind::Dolphin) => "Dolphin",
+            Some(LaunchKind::Pcsx2) => "PCSX2",
+            Some(LaunchKind::Standalone | LaunchKind::AmigaWhdLoad) | None => "",
+        }
+    }
+
+    /// The game being launched, as the session journal records it. What
+    /// was asked for, not proof that it ran.
+    fn launch_session_game(&self) -> archivefs_core::save_continuity::session::SessionGame {
+        archivefs_core::save_continuity::session::SessionGame {
+            library_id: self.selected_game,
+            title: self
+                .selected
+                .as_deref()
+                .and_then(|path| path.file_stem())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            product_code: None,
+            content_path: self.selected.clone(),
+        }
     }
 
     fn launch_failure(&self) -> Option<String> {

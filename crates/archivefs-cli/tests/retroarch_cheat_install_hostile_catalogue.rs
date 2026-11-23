@@ -61,8 +61,47 @@ impl Env {
             .env("XDG_STATE_HOME", r.join("state"))
             .env("TMPDIR", r.join("tmp"))
             .current_dir(r);
+        // These tests place the configuration through the XDG folders. A
+        // caller's EMUWIZ_* folders (set when the tests themselves are run
+        // in an isolated profile) take precedence over XDG in the program,
+        // so the child must not inherit them.
+        for inherited in EMUWIZ_FOLDER_VARIABLES {
+            c.env_remove(inherited);
+        }
         c
     }
+}
+
+const EMUWIZ_FOLDER_VARIABLES: [&str; 3] = [
+    "EMUWIZ_CONFIG_HOME",
+    "EMUWIZ_DATA_HOME",
+    "EMUWIZ_CACHE_HOME",
+];
+
+/// The child `emuwiz-cli` is started with the EMUWIZ_* folder variables
+/// explicitly removed, whatever the environment the tests run in, and with
+/// the XDG folders of the test's own temporary profile.
+#[test]
+fn the_child_never_inherits_the_callers_emuwiz_folders() {
+    let env = Env::new();
+    let command = env.cli();
+    let set: Vec<(String, Option<String>)> = command
+        .get_envs()
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().into_owned(),
+                value.map(|value| value.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+    for variable in EMUWIZ_FOLDER_VARIABLES {
+        assert!(
+            set.contains(&(variable.to_string(), None)),
+            "{variable} is not removed for the child: {set:?}"
+        );
+    }
+    let config = env.root.join("config").to_string_lossy().into_owned();
+    assert!(set.contains(&("XDG_CONFIG_HOME".to_string(), Some(config))));
 }
 
 fn crc32(b: &[u8]) -> u32 {

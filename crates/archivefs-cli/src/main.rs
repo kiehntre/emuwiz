@@ -87,6 +87,7 @@ mod bsfree;
 mod cheat_reconcile;
 mod cheat_source;
 mod cheatbase;
+mod continuity;
 mod dat;
 mod diagnose_launch;
 mod discovery;
@@ -177,6 +178,8 @@ fn startup_registration(cli: &CliArgs) -> StartupRegistration {
 /// (backups, exported saves, new cards); it never opens the library database
 /// and never writes a rename journal or seal. `recovery` likewise: it reads a
 /// game file and creates or removes only its own prepared copies.
+/// `continuity` is the same: it reads saves and writes only new files in its
+/// own snapshot folder or a new folder the person names.
 fn is_read_only_invocation(cli: &CliArgs) -> bool {
     matches!(
         cli.command.as_str(),
@@ -191,6 +194,7 @@ fn is_read_only_invocation(cli: &CliArgs) -> bool {
             | "saves"
             | "memory-cards"
             | "recovery"
+            | "continuity"
             | "emulators"
             | "activity"
             | "history"
@@ -345,6 +349,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "saves" => saves::run(args.collect())?,
         "memory-cards" => memory_cards::run(args.collect())?,
         "recovery" => recovery::run(args.collect())?,
+        "continuity" => continuity::run(args.collect())?,
         "media-set" => media_set::run(args)?,
         "scan" => {
             let config = load_config()?;
@@ -7568,6 +7573,7 @@ mod tests {
             &["saves", "list"],
             &["memory-cards", "import", "/card", "/save", "/new"],
             &["recovery", "prepare", "/game.zip", "--system", "AmigaCD32"],
+            &["continuity", "snapshot", "0123abcd"],
             &["history", "--json"],
             &["emulators"],
             &["activity", "--json"],
