@@ -77,10 +77,10 @@ pub fn mode_changes_real_files(mode: OrganisationMode) -> bool {
 }
 
 /// Link modes: the original stays put, but a linked library holds only the
-/// files it links. A disc-set file linked without its sheet (or a sheet
-/// linked under another name) gives an incomplete game, so these modes are
-/// guarded for disc sets too (owner 2026-11-23: never silently create
-/// incomplete sets).
+/// files it links. Build linked library links a complete disc set together
+/// (names unchanged, see `disc_sets`); a disc-set file outside a complete
+/// set, or any disc-set file when reorganising existing links, is refused
+/// with the reason (owner 2026-11-23: never silently create incomplete sets).
 pub fn mode_links_files(mode: OrganisationMode) -> bool {
     matches!(
         mode,
@@ -93,7 +93,7 @@ pub fn mode_is_guarded(mode: OrganisationMode) -> bool {
     mode_changes_real_files(mode) || mode_links_files(mode)
 }
 
-const LINKED_DISC_SET: &str = "Linked libraries do not include disc lists (.cue, .m3u, .gdi) in this release, so linking this file on its own would give an incomplete game. Nothing will be linked for this file. Use Rename or Move for disc sets.";
+const LINKED_DISC_SET: &str = "Linking it on its own would give an incomplete game, so nothing will be linked for this file. A complete disc set (its .cue, .m3u or .gdi and every file it names, in one folder) is linked together with its names unchanged.";
 
 /// What one guard run did: how many rows it blocked and how much it read.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -150,7 +150,10 @@ pub(crate) fn guard_with_index(
     // unchanged), so those sheets naming it is expected; any other sheet
     // naming it still refuses it.
     let mut own_sheets: HashMap<PathBuf, BTreeSet<PathBuf>> = HashMap::new();
-    if plan.mode == OrganisationMode::MoveRealFile {
+    if matches!(
+        plan.mode,
+        OrganisationMode::MoveRealFile | OrganisationMode::BuildLinkedLibrary
+    ) {
         for entry in &plan.entries {
             if let Some(sheet) = &entry.disc_set
                 && super::disc_sets::sheet_kind(&entry.source_path).is_some()
@@ -261,13 +264,18 @@ fn refusal_for(
         })
         .or_else(|| source.parent().map(Path::to_path_buf))?;
     if mode_links_files(mode) {
-        if super::disc_sets::sheet_kind(source).is_some() {
-            return Some(format!("This is a disc list. {LINKED_DISC_SET}"));
+        // A file of a complete disc set is linked with its own sheets
+        // (`own_sheets`); a sheet outside the set, or a set that could not
+        // be grouped, refuses only that file and its set.
+        if super::disc_sets::sheet_kind(source).is_some() && own_sheets.is_none() {
+            return Some(format!(
+                "This is a disc list that is not part of a complete disc set here. {LINKED_DISC_SET}"
+            ));
         }
-        return match sidecars.referencing(source, &source_root, None) {
+        return match sidecars.referencing(source, &source_root, own_sheets) {
             Err(reason) => Some(reason),
             Ok(Some(referrer)) => Some(format!(
-                "{} names this file. {LINKED_DISC_SET}",
+                "{} names this file and is not linked with it. {LINKED_DISC_SET}",
                 referrer.display()
             )),
             Ok(None) => None,

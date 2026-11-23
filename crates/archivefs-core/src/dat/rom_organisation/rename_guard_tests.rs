@@ -193,7 +193,7 @@ fn an_arcade_romset_folder_blocks_even_without_the_arcade_platform() {
 }
 
 #[test]
-fn moving_real_files_is_guarded_and_link_modes_refuse_disc_sets() {
+fn moving_real_files_is_guarded_and_link_modes_refuse_a_disc_without_its_sheet() {
     let mut lib = Lib::new();
     let disc = lib.game("psx", "Quest.iso", "psx");
     let solo = lib.game("psx", "Solo.iso", "psx");
@@ -240,11 +240,11 @@ fn moving_real_files_is_guarded_and_link_modes_refuse_disc_sets() {
             assert!(
                 after["Quest.iso"]
                     .1
-                    .contains("Linked libraries do not include disc lists"),
+                    .contains("is not linked with it"),
                 "{mode:?}"
             );
             assert!(
-                after["Quest.iso"].1.contains("Nothing will be linked"),
+                after["Quest.iso"].1.contains("nothing will be linked"),
                 "{mode:?}"
             );
         }

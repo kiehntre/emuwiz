@@ -659,3 +659,318 @@ mod carried_disc_checks {
         assert_eq!((state.as_str(), count), ("no_match", 1));
     }
 }
+
+/// Build linked library: a complete disc set is linked together into one
+/// folder with every name unchanged, so the sheet's references resolve
+/// beside its links; only an incomplete or unsafe set is refused, and only
+/// that set (owner decision 2026-11-23).
+mod linked {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    fn linked_root(lib: &Lib) -> PathBuf {
+        let root = lib.temp.path().join("linked");
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// The bulk linked preview as the page builds it (verified names for
+    /// rows that have one, the set's own names for disc sets).
+    fn preview(lib: &Lib, sources: &[&Path]) -> OrganisationPlan {
+        let root = linked_root(lib);
+        let candidates: Vec<OrganisationCandidate> = sources
+            .iter()
+            .map(|source| OrganisationCandidate {
+                source_path: source.to_path_buf(),
+                resolution: live_resolution_for(&lib.db, source, 1),
+                canonical_name: Some(format!(
+                    "Verified {}",
+                    source.file_name().unwrap().to_string_lossy()
+                )),
+                content_classification: None,
+                original_metadata: Default::default(),
+            })
+            .collect();
+        let mut ignore = |_: crate::job_progress::JobProgress| {};
+        let mut reporter = crate::job_progress::ProgressReporter::new(&mut ignore);
+        let mut plan = build_organisation_plan_reporting(
+            &OrganisationPlanRequest {
+                master_root: &root,
+                mode: OrganisationMode::BuildLinkedLibrary,
+                content_policy: ContentSelectionPolicy::AllEntries,
+                candidates: &candidates,
+                generation: 1,
+                unknown_folder: None,
+                link_target_roots: None,
+            },
+            None,
+            &mut reporter,
+        )
+        .unwrap();
+        guard_bulk_rename_plan(&lib.db, &mut plan, &RetroArchSaveLocations::default());
+        prepare_organisation_catalogue(&mut plan, &lib.db).unwrap();
+        plan
+    }
+
+    fn apply(
+        lib: &Lib,
+        plan: &OrganisationPlan,
+        approved: &BTreeSet<String>,
+    ) -> Result<RenameTransaction, String> {
+        let mut tx = build_organisation_transaction(plan, approved, 1)?;
+        apply_organisation_transaction(
+            &mut tx,
+            approved,
+            1,
+            TrustedRoots::from_paths([lib.root.clone(), plan.master_root.clone()]),
+            &lib.journal(),
+            &AtomicBool::new(false),
+            plan.mode,
+            &plan.master_root,
+            &lib.db,
+        )
+        .map(|_| tx)
+        .map_err(|error| error.to_string())
+    }
+
+    fn undo(lib: &Lib, plan: &OrganisationPlan, tx: &mut RenameTransaction) -> RollbackResult {
+        let path =
+            crate::dat::rename_apply::journal_path(&lib.journal(), &tx.transaction_id).unwrap();
+        *tx = crate::dat::rename_apply::read_journal(&path).unwrap();
+        rollback_organisation_transaction(
+            tx,
+            &lib.journal(),
+            &AtomicBool::new(false),
+            &plan.master_root,
+        )
+        .unwrap()
+        .rollback
+        .result
+    }
+
+    /// Inode, size and bytes of each original: links never change them.
+    fn originals(paths: &[&PathBuf]) -> Vec<(u64, Vec<u8>)> {
+        paths
+            .iter()
+            .map(|p| {
+                let m = std::fs::symlink_metadata(p).unwrap();
+                assert!(m.is_file(), "{} is still a regular file", p.display());
+                (m.ino(), std::fs::read(p).unwrap())
+            })
+            .collect()
+    }
+
+    /// Every file of the set is linked, under its own name, in one folder,
+    /// and every reference the sheet makes resolves beside the link.
+    fn assert_linked_together(plan: &OrganisationPlan, sheet: &Path, members: &[&PathBuf]) {
+        let folder = plan
+            .entries
+            .iter()
+            .find(|e| e.source_path == sheet)
+            .unwrap()
+            .destination_path
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert!(folder.starts_with(&plan.master_root));
+        for member in members {
+            let link = folder.join(member.file_name().unwrap());
+            let meta = std::fs::symlink_metadata(&link).unwrap();
+            assert!(meta.file_type().is_symlink(), "{}", link.display());
+            assert_eq!(std::fs::read_link(&link).unwrap(), **member);
+        }
+        let kind = super::super::disc_sets::sheet_kind(sheet).unwrap();
+        let text = std::fs::read_to_string(folder.join(sheet.file_name().unwrap())).unwrap();
+        for reference in parse_references(kind, &text) {
+            assert!(
+                folder.join(&reference).exists(),
+                "{reference} resolves beside the linked sheet"
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_disc_cue_bin_game_is_linked_whole_and_undo_leaves_the_originals() {
+        let mut lib = Lib::new();
+        let (cue, one, two) = cue_set(&mut lib);
+        let plain = lib.game("Solo.iso", "solo", "PSX");
+        let before = originals(&[&cue, &one, &two, &plain]);
+        let plan = preview(&lib, &[&cue, &one, &two, &plain]);
+        let rows = rows_of(&plan);
+        for name in ["Game.cue", "Game (Track 1).bin", "Game_2.bin"] {
+            assert_eq!(
+                rows[name].0,
+                OrganisationStatus::Suggested,
+                "{name}: {}",
+                rows[name].1
+            );
+        }
+        for entry in plan.entries.iter().filter(|e| e.source_path != plain) {
+            assert_eq!(entry.disc_set.as_deref(), Some(cue.as_path()));
+            assert_eq!(
+                entry.destination_path.file_name(),
+                entry.source_path.file_name()
+            );
+        }
+        // An ordinary game is still linked under its verified name.
+        let solo = plan
+            .entries
+            .iter()
+            .find(|e| e.source_path == plain)
+            .unwrap();
+        assert_eq!(solo.status, OrganisationStatus::Suggested);
+        assert_eq!(solo.disc_set, None);
+        assert!(solo.destination_path.ends_with("Verified Solo.iso"));
+
+        let mut tx = apply(&lib, &plan, &all_of(&plan)).unwrap();
+        assert_eq!(tx.state, TransactionState::Applied);
+        assert_linked_together(&plan, &cue, &[&cue, &one, &two]);
+        assert!(
+            std::fs::symlink_metadata(&solo.destination_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(originals(&[&cue, &one, &two, &plain]), before);
+
+        assert_eq!(undo(&lib, &plan, &mut tx), RollbackResult::FullyRolledBack);
+        for entry in &plan.entries {
+            assert!(std::fs::symlink_metadata(&entry.destination_path).is_err());
+        }
+        assert_eq!(originals(&[&cue, &one, &two, &plain]), before);
+    }
+
+    #[test]
+    fn a_multi_disc_playlist_and_a_dreamcast_gdi_are_linked_whole() {
+        let mut lib = Lib::new();
+        let m3u = lib.file(
+            "Saga.m3u",
+            "#EXTM3U\nSaga (Disc 1).chd\nSaga (Disc 2).chd\n",
+        );
+        let d1 = lib.game("Saga (Disc 1).chd", "disc one", "PSX");
+        let d2 = lib.game("Saga (Disc 2).chd", "disc two", "PSX");
+        let gdi = lib.game(
+            "Crazy.gdi",
+            "3\n1 0 4 2352 track01.bin 0\n2 600 0 2352 \"track 02.raw\" 0\n3 45000 4 2352 track03.bin 0\n",
+            "Dreamcast",
+        );
+        let t1 = lib.file("track01.bin", "t1");
+        let t2 = lib.file("track 02.raw", "t2");
+        let t3 = lib.file("track03.bin", "t3");
+        let all = [&m3u, &d1, &d2, &gdi, &t1, &t2, &t3];
+        let before = originals(&all);
+        let plan = preview(&lib, &all.map(|p| p.as_path()));
+        for entry in &plan.entries {
+            assert_eq!(entry.status, OrganisationStatus::Suggested, "{entry:?}");
+        }
+        let mut tx = apply(&lib, &plan, &all_of(&plan)).unwrap();
+        assert_linked_together(&plan, &m3u, &[&m3u, &d1, &d2]);
+        assert_linked_together(&plan, &gdi, &[&gdi, &t1, &t2, &t3]);
+        let dreamcast = plan.entries.iter().find(|e| e.source_path == t2).unwrap();
+        assert_eq!(dreamcast.platform.as_deref(), Some("Dreamcast"));
+        assert_eq!(originals(&all), before);
+        assert_eq!(undo(&lib, &plan, &mut tx), RollbackResult::FullyRolledBack);
+        assert_eq!(originals(&all), before);
+    }
+
+    #[test]
+    fn a_missing_track_refuses_only_that_set_with_the_reason() {
+        let mut lib = Lib::new();
+        let cue = lib.game(
+            "Broken.cue",
+            "FILE \"Broken (Track 1).bin\" BINARY\nFILE \"Broken (Track 2).bin\" BINARY\n",
+            "PSX",
+        );
+        let present = lib.file("Broken (Track 1).bin", "track one");
+        let plain = lib.game("Solo.iso", "solo", "PSX");
+        let plan = preview(&lib, &[&cue, &present, &plain]);
+        let rows = rows_of(&plan);
+        for name in ["Broken.cue", "Broken (Track 1).bin"] {
+            assert_eq!(rows[name].0, OrganisationStatus::Blocked, "{name}");
+            assert!(
+                rows[name].1.contains("cannot be linked as a whole"),
+                "{}",
+                rows[name].1
+            );
+            assert!(
+                rows[name]
+                    .1
+                    .contains("Broken (Track 2).bin, named by Broken.cue, is missing"),
+                "{}",
+                rows[name].1
+            );
+            assert!(rows[name].1.contains("Nothing will change for this file"));
+        }
+        assert_eq!(rows["Solo.iso"].0, OrganisationStatus::Suggested);
+        // Selecting a blocked file anyway never puts it in the operation.
+        let mut sneak = all_of(&plan);
+        sneak.insert(present.to_string_lossy().into_owned());
+        if let Ok(tx) = build_organisation_transaction(&plan, &sneak, 1) {
+            let json = serde_json::to_string(&tx).unwrap();
+            assert!(!json.contains("Broken (Track 1).bin"), "{json}");
+            assert!(!json.contains("Broken.cue"), "{json}");
+        }
+        let tx = apply(&lib, &plan, &all_of(&plan)).unwrap();
+        assert_eq!(tx.state, TransactionState::Applied);
+        let folder = plan
+            .entries
+            .iter()
+            .find(|e| e.source_path == plain)
+            .unwrap()
+            .destination_path
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert!(
+            !folder.join("Broken.cue").exists() && !folder.join("Broken (Track 1).bin").exists()
+        );
+    }
+
+    #[test]
+    fn a_collision_or_a_partial_selection_refuses_the_whole_set() {
+        let mut lib = Lib::new();
+        let (cue, one, two) = cue_set(&mut lib);
+        // Something else already has one track's name in the linked folder.
+        let plan = preview(&lib, &[&cue, &one, &two]);
+        let folder = plan.entries[0]
+            .destination_path
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        // A partial selection is refused before any change.
+        let mut part = all_of(&plan);
+        part.remove(two.to_string_lossy().as_ref());
+        let refused = apply(&lib, &plan, &part).unwrap_err();
+        assert!(refused.contains("whole disc set"), "{refused}");
+        assert!(!folder.exists() || std::fs::read_dir(&folder).unwrap().next().is_none());
+
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("Game_2.bin"), "someone else's file").unwrap();
+        let plan = preview(&lib, &[&cue, &one, &two]);
+        let rows = rows_of(&plan);
+        assert_ne!(rows["Game_2.bin"].0, OrganisationStatus::Suggested);
+        for name in ["Game.cue", "Game (Track 1).bin"] {
+            assert_eq!(rows[name].0, OrganisationStatus::Blocked, "{name}");
+            assert!(
+                rows[name].1.contains("only with its whole disc set"),
+                "{}",
+                rows[name].1
+            );
+        }
+        assert!(plan.suggested().next().is_none());
+        assert_eq!(
+            std::fs::read(folder.join("Game_2.bin")).unwrap(),
+            b"someone else's file"
+        );
+        assert!(!folder.join("Game.cue").exists());
+    }
+
+    #[test]
+    fn reorganising_existing_links_still_refuses_disc_set_files() {
+        let mut lib = Lib::new();
+        let (cue, one, _two) = cue_set(&mut lib);
+        let mut plan = lib.preview(OrganisationMode::OrganiseSymlinkOnly, &[&cue, &one]);
+        guard_bulk_rename_plan(&lib.db, &mut plan, &RetroArchSaveLocations::default());
+        assert!(plan.suggested().next().is_none());
+    }
+}

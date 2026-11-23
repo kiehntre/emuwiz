@@ -351,12 +351,20 @@ pub(crate) fn settle(sets: &DiscSets, master_root: &Path, entries: &mut [Organis
             .filter_map(|path| index.get(path).copied())
             .collect();
         let sheet_name = display_name(&set.sheet);
+        let linked = members.first().is_some_and(|&i| {
+            entries[i].mode == super::model::OrganisationMode::BuildLinkedLibrary
+        });
+        let (whole, only) = if linked {
+            ("cannot be linked as a whole", "is linked only as a whole")
+        } else {
+            ("cannot be moved as a whole", "moves only as a whole")
+        };
         if let Some(reason) = &set.invalid {
             block_set(
                 entries,
                 &members,
                 &format!(
-                    "This file belongs to the disc set of {sheet_name}, which cannot be moved as a whole: {reason}. Nothing will change for this file."
+                    "This file belongs to the disc set of {sheet_name}, which {whole}: {reason}. Nothing will change for this file."
                 ),
             );
             continue;
@@ -370,7 +378,7 @@ pub(crate) fn settle(sets: &DiscSets, master_root: &Path, entries: &mut [Organis
                     entries,
                     &members,
                     &format!(
-                        "This file belongs to the disc set of {sheet_name}, which moves only as a whole: {reason}. Nothing will change for this file."
+                        "This file belongs to the disc set of {sheet_name}, which {only}: {reason}. Nothing will change for this file."
                     ),
                 );
             }
@@ -495,10 +503,13 @@ pub fn hold_disc_sets_together(entries: &mut [OrganisationPlanEntry]) -> usize {
         else {
             continue;
         };
+        let linked = entries[members[0]].mode == super::model::OrganisationMode::BuildLinkedLibrary;
         let why = format!(
-            "This file moves only with its whole disc set ({}), and {} cannot move ({}). Nothing will change for this file.",
+            "This file {} only with its whole disc set ({}), and {} cannot {} ({}). Nothing will change for this file.",
+            if linked { "is linked" } else { "moves" },
             display_name(&sheet),
             display_name(&entries[stuck].source_path),
+            if linked { "be linked" } else { "move" },
             entries[stuck]
                 .reason
                 .as_deref()

@@ -129,8 +129,14 @@ fn plan_reporting(
 ) -> Option<OrganisationPlan> {
     let stop = || cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
     // A disc set keeps every name (its sheets name the files), so its files
-    // are planned under their own names.
-    let sets = if group_disc_sets && request.mode == OrganisationMode::MoveRealFile {
+    // are planned under their own names. A linked library links the whole
+    // set into one folder the same way (owner 2026-11-23), so each sheet's
+    // plain-name references resolve beside its links.
+    let sets = if group_disc_sets
+        && matches!(
+            request.mode,
+            OrganisationMode::MoveRealFile | OrganisationMode::BuildLinkedLibrary
+        ) {
         let files: Vec<&Path> = request
             .candidates
             .iter()
