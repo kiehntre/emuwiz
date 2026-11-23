@@ -143,6 +143,7 @@ pub mod retroachievements;
 pub mod retrobios_provider;
 pub mod retrobios_viewer;
 pub mod rom_representation_diagnostics;
+pub mod save_continuity;
 pub mod save_migration_planner;
 pub mod save_migration_readiness;
 /// Local immutable emulator-save snapshots and conservative restore previews.

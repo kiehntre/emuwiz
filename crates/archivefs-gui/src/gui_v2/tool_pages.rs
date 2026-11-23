@@ -27,6 +27,7 @@ pub(super) struct ToolPagesState {
     pub platform_aliases: super::platform_aliases_page::PlatformAliasesState,
     pub database: super::database_status_page::DatabaseStatusState,
     pub scan_history: super::scan_history::ScanHistoryState,
+    pub save_continuity: super::save_continuity_page::State,
     pub alternative_provider_preview: super::alternative_provider_preview::State,
     pub netplay: super::netplay_preview::State,
     pub cheat_extras: super::cheat_extras_page::CheatExtrasState,
@@ -50,6 +51,7 @@ impl ToolPagesState {
             platform_aliases: super::platform_aliases_page::PlatformAliasesState::live(),
             database: super::database_status_page::DatabaseStatusState::live(),
             scan_history: super::scan_history::ScanHistoryState::live(),
+            save_continuity: super::save_continuity_page::State::live(),
             alternative_provider_preview: Default::default(),
             netplay: Default::default(),
             cheat_extras: Default::default(),
@@ -109,6 +111,9 @@ impl App {
             ToolPage::MediaSets => self.media_sets_tool_page(ui),
             ToolPage::CheatExtras => {
                 super::cheat_extras_page::show(ui, &mut self.tools.cheat_extras);
+            }
+            ToolPage::SaveContinuity => {
+                super::save_continuity_page::show(ui, &mut self.tools.save_continuity)
             }
             ToolPage::DatabaseStatus => {
                 use super::database_status_page::{Request, show};

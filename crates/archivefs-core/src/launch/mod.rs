@@ -152,6 +152,7 @@ pub mod planning;
 pub mod platform_map;
 pub mod ppsspp_command;
 pub mod ppsspp_execution;
+pub mod process_log;
 pub mod process_spawn;
 pub mod retroarch_cheat_candidates;
 pub mod retroarch_overrides;

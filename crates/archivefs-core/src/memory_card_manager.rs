@@ -30,7 +30,7 @@ pub mod external_tools;
 mod ps1;
 mod ps2;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Largest file read as a card (a 64 MB PS2 card with ECC is ~66 MiB).
 pub const MAX_CARD_BYTES: u64 = crate::memory_card_inventory::PS2_MAX_CARD_BYTES as u64;
@@ -276,6 +276,55 @@ pub(crate) fn report_bytes(path: &Path, bytes: &[u8]) -> CardReport {
         notes: vec![why.to_string()],
         unsupported: Vec::new(),
     }
+}
+
+/// Reads a card and also returns the SHA-256 of each save's own content
+/// (PS1: the save's blocks; PS2: every file in the save folder, by name), so
+/// a caller can tell which save changed between two readings without
+/// exporting anything. Read-only. A save the library reader cannot return is
+/// simply absent from the map; the report's `health` says whether the two
+/// readers agree.
+pub fn read_card_with_fingerprints(
+    path: &Path,
+) -> Result<(CardReport, std::collections::BTreeMap<String, String>), CardError> {
+    let mut fingerprints = std::collections::BTreeMap::new();
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| io_error("cannot read", path, error))?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return Ok((ps2::folder_report(path)?, fingerprints));
+    }
+    let bytes = read_card_bytes(path)?;
+    let report = report_bytes(path, &bytes);
+    match report.format.platform() {
+        Some(CardPlatform::PlayStation) => {
+            if let Ok(card) = ps1_memcard::MemoryCard::parse(&bytes) {
+                for save in card.saves() {
+                    fingerprints.insert(save.name.clone(), sha256_hex(&save.data));
+                }
+            }
+        }
+        Some(CardPlatform::PlayStation2) => {
+            let saves = ps2_memcard::MemoryCard::parse(&bytes).and_then(|card| card.saves());
+            for save in saves.unwrap_or_default() {
+                let mut files: Vec<(&str, &[u8])> = save
+                    .files
+                    .iter()
+                    .map(|file| (file.name.as_str(), file.data.as_slice()))
+                    .collect();
+                files.sort();
+                let mut text = Vec::new();
+                for (name, data) in files {
+                    text.extend_from_slice(name.as_bytes());
+                    text.push(0);
+                    text.extend_from_slice(&(data.len() as u64).to_le_bytes());
+                    text.extend_from_slice(sha256_hex(data).as_bytes());
+                }
+                fingerprints.insert(save.name, sha256_hex(&text));
+            }
+        }
+        None => {}
+    }
+    Ok((report, fingerprints))
 }
 
 /// `BASLUS-00594DRAX00` -> (`SLUS-00594`, `America`).
