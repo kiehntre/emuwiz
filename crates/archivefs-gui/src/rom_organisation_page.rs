@@ -14,6 +14,8 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use archivefs_core::dat::rom_organisation::game_rename::RetroArchSaveLocations;
+use archivefs_core::dat::rom_organisation::rename_guard as bulk_guard;
 use archivefs_core::dat::rom_organisation::*;
 use archivefs_core::identity_source::cache::{IdentityCacheLocation, load_cache};
 use archivefs_core::identity_source::model::IdentityProvider;
@@ -93,6 +95,11 @@ pub(crate) struct RomOrganisationPageState {
     /// confirmation for large batches.
     pending_apply: Option<usize>,
     confirm_text: String,
+    /// Set when Undo was asked for: Undo runs only from its confirm card.
+    pending_undo: bool,
+    /// One-shot: bring the next confirm card or Apply/Undo outcome into
+    /// view, so it never opens below the visible part of the page.
+    reveal: bool,
     /// Set on the frame "Preview changes" is clicked; the actual (currently
     /// synchronous, potentially slow for a large library) `generate_plan()`
     /// call is deferred to the start of the *next* frame so this frame can
@@ -251,6 +258,8 @@ impl RomOrganisationPageState {
             stopped: false,
             pending_apply: None,
             confirm_text: String::new(),
+            pending_undo: false,
+            reveal: false,
             pending_preview: false,
             approval_persistence_warning: None,
             approvals_file: None,
@@ -399,6 +408,8 @@ impl RomOrganisationPageState {
         self.result_complete = false;
         self.last_rollback = None;
         self.stopped = false;
+        self.pending_undo = false;
+        self.reveal = true;
     }
 
     /// Loads the configured master root and scans the configured source
@@ -511,11 +522,14 @@ impl RomOrganisationPageState {
     }
 
     /// The destination root the current mode plans into: the explicitly
-    /// chosen linked-library root in BuildLinkedLibrary mode, otherwise the
+    /// chosen (session-only) link folder for the two link modes (building a
+    /// linked library, reorganising existing links), otherwise the
     /// configured master ROM root.
     pub(crate) fn effective_root(&self) -> Option<PathBuf> {
         match self.mode {
-            OrganisationMode::BuildLinkedLibrary => self.saved_library_root.clone(),
+            OrganisationMode::BuildLinkedLibrary | OrganisationMode::OrganiseSymlinkOnly => {
+                self.saved_library_root.clone()
+            }
             _ => self.saved_master_root.clone(),
         }
     }
@@ -622,6 +636,9 @@ impl RomOrganisationPageState {
         let Some(master_root) = self.effective_root() else {
             self.error = Some(if self.mode == OrganisationMode::BuildLinkedLibrary {
                 "choose a linked library folder first".to_string()
+            } else if self.mode == OrganisationMode::OrganiseSymlinkOnly {
+                "choose a separate folder for the reorganised links first (not one of your game folders)"
+                    .to_string()
             } else {
                 "configure a master ROM root first".to_string()
             });
@@ -630,8 +647,8 @@ impl RomOrganisationPageState {
         };
         progress.phase("Reading your game list", "steps", None);
         let names = NameResolver::load();
-        let Some((candidates, name_choices)) =
-            build_candidates(&self.sources, self.plan_generation, &names)
+        let Some((mut candidates, name_choices)) =
+            build_candidates_for(self.mode, &self.sources, self.plan_generation, &names)
         else {
             self.error = Some("could not read the platform identity database".to_string());
             self.plan = None;
@@ -639,6 +656,41 @@ impl RomOrganisationPageState {
         };
         if stop() {
             return false;
+        }
+        // Only a verified catalogue name names a link; any other link keeps
+        // the file's own name (Rename/Move rows are blocked further down).
+        for candidate in &mut candidates {
+            candidate.canonical_name = name_choices
+                .get(&candidate.source_path)
+                .and_then(|choice| hint_gate::bulk_name(self.mode, choice));
+        }
+        // Existing links: the library's approved folders, read from the
+        // library. Unreadable means none, and every link is refused.
+        let link_roots = (self.mode == OrganisationMode::OrganiseSymlinkOnly)
+            .then(|| {
+                default_database_path()
+                    .and_then(Database::open_read_only)
+                    .ok()
+                    .and_then(|database| {
+                        archivefs_core::dat::rom_organisation::link_target::approved_library_roots(
+                            &database,
+                        )
+                        .ok()
+                    })
+            })
+            .flatten();
+        // Reorganised links go into their own folder, never one of the game
+        // folders (or one inside or holding them): refused, not redirected.
+        if self.mode == OrganisationMode::OrganiseSymlinkOnly
+            && let Err(reason) =
+                archivefs_core::dat::rom_organisation::link_target::separate_link_destination(
+                    &master_root,
+                    link_roots.as_deref().unwrap_or_default(),
+                )
+        {
+            self.error = Some(reason);
+            self.plan = None;
+            return true;
         }
         // No RomM mapping is consulted: generic destinations derive from the
         // neutral EmuWiz platform layout identity.
@@ -651,12 +703,44 @@ impl RomOrganisationPageState {
                 candidates: &candidates,
                 generation: self.plan_generation,
                 unknown_folder: None,
+                link_target_roots: link_roots.as_deref(),
             },
             cancel,
             progress,
         ) else {
             return false;
         };
+        // A bulk rename or move refuses what the one-game Rename refuses
+        // (arcade sets, files a cue sheet or playlist names, games with
+        // RetroArch saves): those rows become Blocked with the reason.
+        if bulk_guard::mode_is_guarded(plan.mode) && plan.suggested().next().is_some() {
+            progress.phase("Checking disc lists, arcade sets and saves", "steps", None);
+            progress.flush();
+            let guarded = default_database_path()
+                .and_then(Database::open_read_only)
+                .map_err(|e| e.to_string())
+                .map(|database| {
+                    bulk_guard::guard_bulk_rename_plan(
+                        &database,
+                        &mut plan,
+                        &RetroArchSaveLocations::discover(),
+                    )
+                });
+            if let Err(reason) = guarded {
+                self.error = Some(reason);
+                self.plan = None;
+                return true;
+            }
+        }
+        // In every mode: files of a disc set an earlier operation left in two
+        // places stay blocked until that set is whole again (Undo).
+        bulk_guard::block_split_disc_sets(&mut plan, &self.applied_journal);
+        if stop() {
+            return false;
+        }
+        // Bulk rename renames only from verified catalogue names: a RomM
+        // title stays visible as a hint, but its row is Blocked.
+        hint_gate::block_unverified_names(&mut plan, &name_choices);
         if plan.suggested().next().is_some() {
             let catalogue = default_database_path()
                 .and_then(Database::open_read_only)
@@ -686,9 +770,36 @@ impl RomOrganisationPageState {
         true
     }
 
+    /// Toggles one row. A disc-set file moves only with its whole set, so
+    /// its row selects or clears every Suggested file of that set.
     pub(crate) fn toggle_approved(&mut self, source: &str) {
-        if !self.approved.remove(source) {
-            self.approved.insert(source.to_string());
+        let select = !self.approved.contains(source);
+        let set: Vec<String> = self
+            .plan
+            .as_ref()
+            .and_then(|plan| {
+                archivefs_core::dat::rom_organisation::disc_set_of(plan, Path::new(source)).map(
+                    |(_, members)| {
+                        members
+                            .into_iter()
+                            .filter(|member| {
+                                plan.entries.iter().any(|entry| {
+                                    entry.source_path == *member
+                                        && entry.status == OrganisationStatus::Suggested
+                                })
+                            })
+                            .map(|member| member.to_string_lossy().into_owned())
+                            .collect()
+                    },
+                )
+            })
+            .unwrap_or_else(|| vec![source.to_string()]);
+        for member in set {
+            if select {
+                self.approved.insert(member);
+            } else {
+                self.approved.remove(&member);
+            }
         }
         self.persist_approved_set();
     }
@@ -742,7 +853,6 @@ impl RomOrganisationPageState {
         // that went stale or a file that changed since the preview changes the
         // name, and the apply is refused.
         let names = NameResolver::load();
-        let canonical_name_for = |source: &Path| names.choose(source).name;
         let database_path = default_database_path();
         let database = match database_path.and_then(archivefs_core::Database::open_read_only) {
             Ok(database) => database,
@@ -751,11 +861,26 @@ impl RomOrganisationPageState {
                 return;
             }
         };
-        if let Err(reason) = archivefs_core::dat::rom_organisation::revalidate_organisation_plan(
+        if let Err(reason) =
+            hint_gate::check_live_names(plan, &self.approved, database.path(), &names)
+        {
+            self.error = Some(reason);
+            return;
+        }
+        // The same refusals again, read fresh: a cue sheet, playlist or save
+        // that appeared since the preview refuses the whole Apply.
+        if let Err(reason) = bulk_guard::refuse_if_newly_blocked(
+            &database,
             plan,
-            database.path(),
-            &canonical_name_for,
+            &self.approved,
+            &RetroArchSaveLocations::discover(),
         ) {
+            self.error = Some(reason);
+            return;
+        }
+        if let Err(reason) =
+            bulk_guard::refuse_split_disc_sets(plan, &self.approved, &self.applied_journal)
+        {
             self.error = Some(reason);
             return;
         }
@@ -794,7 +919,10 @@ impl RomOrganisationPageState {
 
     /// Records one Apply outcome: complete only for a fully resolved batch,
     /// and an Undo handle whenever the journalled transaction may have changed
-    /// files. The reviewed plan and approvals are never cleared here.
+    /// files. A complete Apply clears the reviewed plan and its approvals:
+    /// that preview described the files before they were renamed, so Apply
+    /// stays off until a fresh preview. An incomplete or failed Apply keeps
+    /// them for review.
     fn record_apply_result(
         &mut self,
         result: Result<
@@ -815,6 +943,18 @@ impl RomOrganisationPageState {
                 let (message, complete) = apply_result_report(self.mode, &outcome.summary);
                 self.result_message = Some(message);
                 self.result_complete = complete;
+                // Files or links changed on disk: list them again, so the
+                // next preview starts from where they are now.
+                if outcome.summary.applied > 0 {
+                    self.scan_sources();
+                }
+                if complete {
+                    self.plan = None;
+                    self.approved.clear();
+                    // Persist the empty set so a restart does not restore
+                    // approvals for files that have already moved.
+                    self.persist_approved_set();
+                }
             }
             Err(error) => {
                 self.stopped = matches!(
@@ -966,10 +1106,25 @@ impl RomOrganisationPageState {
                     archivefs_core::dat::rename_apply::RollbackResult::FullyRolledBack
                 ) && transaction.is_fully_rolled_back();
                 self.result_complete = fully;
-                self.result_message = Some(if fully {
+                // Undo moved things back (fully or in part): list them again.
+                self.scan_sources();
+                let kept = &outcome.tombstones.kept;
+                self.result_message = Some(if fully && kept.is_empty() {
                     format!(
                         "Rolled back organisation; {} empty platform director(ies) removed.",
                         dirs
+                    )
+                } else if fully {
+                    format!(
+                        "Rolled back organisation; {} empty platform director(ies) removed. \
+                         {} hidden undone link(s) were left in place because they could not be \
+                         proved safe to remove: {}",
+                        dirs,
+                        kept.len(),
+                        kept.iter()
+                            .map(|(path, why)| format!("{} ({why})", path.display()))
+                            .collect::<Vec<_>>()
+                            .join("; ")
                     )
                 } else {
                     format!(
@@ -1436,7 +1591,8 @@ pub(crate) fn collect_source_files_reported(
 /// identity from the database, and attaching the proposed name chosen by
 /// [`NameResolver`] (verified catalogue name, then RomM, else unchanged).
 /// Returns `None` when the database is unreadable.
-fn build_candidates(
+fn build_candidates_for(
+    mode: OrganisationMode,
     sources: &[PathBuf],
     generation: u64,
     names: &NameResolver,
@@ -1450,13 +1606,98 @@ fn build_candidates(
     if sources.is_empty() {
         return Some(Default::default());
     }
-    let mut choices = std::collections::BTreeMap::new();
-
     let database_path = default_database_path().ok()?;
     let database = Database::open_read_only(&database_path).ok()?;
-    let mut candidates = Vec::new();
+    if mode == OrganisationMode::OrganiseSymlinkOnly {
+        // An existing link is described by its checked target game file:
+        // its platform and any verified catalogue name are the game's.
+        return Some(candidates_from_lookups(
+            &database,
+            sources,
+            generation,
+            names,
+            |source| {
+                database
+                    .find_archive_id_by_absolute_path(source)
+                    .map_err(|error| error.to_string())
+            },
+            &|source| hint_gate::identity_path(mode, source),
+        ));
+    }
+    Some(build_candidates_in(&database, sources, generation, names))
+}
+
+/// [`build_candidates`] on an open database. Every library path's archive id
+/// is read once ([`Database::archive_path_lookup`], same answers as
+/// `find_archive_id_by_absolute_path`): one lookup per file scanned the whole
+/// archive table each time, so a 4000-game preview grew quadratically.
+pub(crate) fn build_candidates_in(
+    database: &Database,
+    sources: &[PathBuf],
+    generation: u64,
+    names: &NameResolver,
+) -> (
+    Vec<OrganisationCandidate>,
+    std::collections::BTreeMap<PathBuf, NameChoice>,
+) {
+    let ids = database
+        .archive_path_lookup()
+        .map_err(|error| error.to_string());
+    candidates_from_lookups(
+        database,
+        sources,
+        generation,
+        names,
+        |source| match &ids {
+            Ok(ids) => ids.find(source).map_err(|error| error.to_string()),
+            Err(error) => Err(error.clone()),
+        },
+        &|source| source.to_path_buf(),
+    )
+}
+
+/// The pre-optimisation path: one database lookup per file. Kept for the
+/// equivalence tests that prove both give the same preview.
+#[cfg(test)]
+pub(crate) fn build_candidates_per_file(
+    database: &Database,
+    sources: &[PathBuf],
+    generation: u64,
+    names: &NameResolver,
+) -> (
+    Vec<OrganisationCandidate>,
+    std::collections::BTreeMap<PathBuf, NameChoice>,
+) {
+    candidates_from_lookups(
+        database,
+        sources,
+        generation,
+        names,
+        |source| {
+            database
+                .find_archive_id_by_absolute_path(source)
+                .map_err(|error| error.to_string())
+        },
+        &|source| source.to_path_buf(),
+    )
+}
+
+fn candidates_from_lookups(
+    database: &Database,
+    sources: &[PathBuf],
+    generation: u64,
+    names: &NameResolver,
+    mut look_up: impl FnMut(&Path) -> Result<Option<i64>, String>,
+    identity_of: &dyn Fn(&Path) -> PathBuf,
+) -> (
+    Vec<OrganisationCandidate>,
+    std::collections::BTreeMap<PathBuf, NameChoice>,
+) {
+    let mut choices = std::collections::BTreeMap::new();
+    let mut candidates = Vec::with_capacity(sources.len());
     for source in sources {
-        let lookup = database.find_archive_id_by_absolute_path(source);
+        let identity = identity_of(source);
+        let lookup = look_up(&identity);
         let archive_id = lookup.as_ref().ok().copied().flatten();
         let resolution = match archive_id {
             Some(archive_id) => {
@@ -1468,7 +1709,7 @@ fn build_candidates(
             }
             None => PlatformIdentityResolution::Unknown { generation },
         };
-        let choice = names.choose_looked_up(source, lookup);
+        let choice = names.choose_looked_up(&identity, lookup);
         candidates.push(OrganisationCandidate {
             source_path: source.clone(),
             resolution,
@@ -1478,7 +1719,7 @@ fn build_candidates(
         });
         choices.insert(source.clone(), choice);
     }
-    Some((candidates, choices))
+    (candidates, choices)
 }
 
 /// Uses exactly the existing organisation freshness/planning checks, on a worker.
@@ -1486,16 +1727,23 @@ pub(crate) fn validate_r2_selection(
     plan: &OrganisationPlan,
     approved: &BTreeSet<String>,
 ) -> Result<archivefs_core::dat::rename_apply::RenameTransaction, String> {
-    if plan.suggested().any(|e| {
-        e.catalogue_binding.is_some()
-            && approved.contains(&e.source_path.to_string_lossy().into_owned())
-    }) {
-        return Err("Catalogue-backed organisation requires Standard Apply so filesystem and catalogue Undo remain coordinated.".into());
-    }
+    archivefs_core::dat::rom_organisation::refuse_partial_disc_sets(plan, approved)?;
     let names = NameResolver::load();
     let database = default_database_path().map_err(|e| e.to_string())?;
-    revalidate_organisation_plan(plan, &database, &|p| names.choose(p).name)?;
+    hint_gate::check_live_names(plan, approved, &database, &names)?;
+    let library = Database::open_read_only(&database).map_err(|e| e.to_string())?;
+    bulk_guard::refuse_if_newly_blocked(
+        &library,
+        plan,
+        approved,
+        &RetroArchSaveLocations::discover(),
+    )?;
     let tx = build_organisation_transaction(plan, approved, plan.generation)?;
+    // Catalogue-backed files (owner option 1): the library entries must still
+    // be exactly as the preview saw them, the same check Standard Apply makes.
+    archivefs_core::dat::rom_organisation::protected_catalogue::validate_protected_catalogue(
+        &tx, &library,
+    )?;
     let expected = plan
         .suggested()
         .filter(|e| approved.contains(&e.source_path.to_string_lossy().into_owned()))
@@ -1585,10 +1833,14 @@ pub(crate) fn name_counts(
     let mut counts = NameCounts::default();
     for entry in &plan.entries {
         // Blocked, unsupported or colliding entries have no usable destination.
-        if !matches!(
-            entry.status,
-            OrganisationStatus::Suggested | OrganisationStatus::AlreadyOrganised
-        ) {
+        let hint_only = hint_gate::unverified_name_label(entry)
+            == Some("RomM suggests (hint only, not applied)");
+        if !hint_only
+            && !matches!(
+                entry.status,
+                OrganisationStatus::Suggested | OrganisationStatus::AlreadyOrganised
+            )
+        {
             continue;
         }
         let Some(choice) = choices.get(&entry.source_path) else {
@@ -1621,6 +1873,28 @@ impl NameChoice {
             NameSource::Romm => "RomM".to_string(),
             NameSource::Original => "current file name (no verified name)".to_string(),
         }
+    }
+
+    /// How far the proposed name can be trusted: only a verified catalogue
+    /// match is verified; a RomM title is a hint.
+    pub(crate) fn confidence_label(&self) -> &'static str {
+        match self.source {
+            NameSource::VerifiedDat { .. } => "verified (exact catalogue match)",
+            NameSource::Romm => "hint (RomM title, not verified)",
+            NameSource::Original => "no match (name unchanged)",
+        }
+    }
+}
+
+/// Whether a preview row can be undone. Only rows that change a file are
+/// journalled; every other row leaves the file exactly as it is.
+pub(crate) fn undo_availability(status: OrganisationStatus) -> &'static str {
+    match status {
+        OrganisationStatus::Suggested => "Undo: yes, from History after Apply",
+        OrganisationStatus::AlreadyOrganised => "Undo: not needed, the name is already right",
+        OrganisationStatus::Conflict
+        | OrganisationStatus::Blocked
+        | OrganisationStatus::Unsupported => "Undo: not needed, this file will not be changed",
     }
 }
 
@@ -1696,9 +1970,24 @@ pub(crate) fn choose_name(
 
 /// Chooses proposed names from live evidence. Loaded once per preview and
 /// again at apply, so both use the same rule on the then-current state.
+/// A one-pass archive-id lookup ([`Database::archive_path_lookup`]) behind a
+/// closure, as the lookup type is not exported by the core crate.
+type ArchiveIds = Box<dyn Fn(&Path) -> Result<Option<i64>, String> + Send + Sync>;
+
+fn read_archive_ids(database: &Database) -> Option<ArchiveIds> {
+    let ids = database.archive_path_lookup().ok()?;
+    Some(Box::new(move |path: &Path| {
+        ids.find(path).map_err(|error| error.to_string())
+    }))
+}
+
 pub(crate) struct NameResolver {
     romm: RommTitles,
     database: Option<Database>,
+    /// Every library path's archive id, read once with the resolver (each
+    /// preview and each Apply load their own). `None` when that read failed:
+    /// each file is then looked up on its own, as before.
+    archive_ids: Option<ArchiveIds>,
     /// Archives with any saved DAT row; `None` when the index could not be
     /// read (every item is then looked up, as before).
     saved_archives: Option<std::collections::HashSet<i64>>,
@@ -1732,9 +2021,30 @@ impl NameResolver {
         };
         Self {
             romm: RommTitles::new(load_romm_cache().as_ref()),
+            archive_ids: database.as_ref().and_then(read_archive_ids),
             database,
             saved_archives: index.map(|(archives, _)| archives),
             catalogues,
+        }
+    }
+
+    /// Test seam: a resolver over this database and RomM cache, without
+    /// reading the real profile's paths.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        database: Option<Database>,
+        romm: Option<&archivefs_core::identity_source::cache::IdentityCache>,
+    ) -> Self {
+        let saved_archives = database
+            .as_ref()
+            .and_then(|database| database.saved_dat_row_index().ok())
+            .map(|(archives, _)| archives);
+        Self {
+            romm: RommTitles::new(romm),
+            archive_ids: database.as_ref().and_then(read_archive_ids),
+            database,
+            saved_archives,
+            catalogues: Default::default(),
         }
     }
 
@@ -1742,9 +2052,12 @@ impl NameResolver {
         use archivefs_core::VerifiedDatName as V;
         match &self.database {
             None => self.finish(V::NotUsable("the library could not be read".into()), source),
-            Some(database) => {
-                self.choose_looked_up(source, database.find_archive_id_by_absolute_path(source))
-            }
+            Some(database) => match &self.archive_ids {
+                Some(ids) => self.choose_looked_up(source, ids(source)),
+                None => {
+                    self.choose_looked_up(source, database.find_archive_id_by_absolute_path(source))
+                }
+            },
         }
     }
 
@@ -2103,17 +2416,31 @@ fn show_rom_organisation_page_with_options(
         return page_action;
     }
 
-    if state.mode == OrganisationMode::BuildLinkedLibrary {
-        // Linked-library mode plans into an explicitly chosen destination
-        // root that is separate from the master ROM root. It is never
-        // inferred from the source folders.
+    if matches!(
+        state.mode,
+        OrganisationMode::BuildLinkedLibrary | OrganisationMode::OrganiseSymlinkOnly
+    ) {
+        // Both link modes plan into an explicitly chosen destination root
+        // that is separate from the master ROM root. It is never inferred
+        // from the source folders and never saved.
+        let reorganise = state.mode == OrganisationMode::OrganiseSymlinkOnly;
         widgets::card(ui, |ui| {
-            ui.label(egui::RichText::new("Linked library folder").strong());
             ui.label(
-                egui::RichText::new(
+                egui::RichText::new(if reorganise {
+                    "Folder for reorganised links"
+                } else {
+                    "Linked library folder"
+                })
+                .strong(),
+            );
+            ui.label(
+                egui::RichText::new(if reorganise {
+                    "Your existing links are moved into this folder, one folder per system. \
+                     It must be separate from your game folders; your games stay where they are."
+                } else {
                     "The organised links are created inside this folder; your original \
-                     files stay where they are.",
-                )
+                     files stay where they are."
+                })
                 .color(theme::muted(ui)),
             );
             match &state.saved_library_root {
@@ -2141,8 +2468,12 @@ fn show_rom_organisation_page_with_options(
                 }
                 None => {
                     ui.label(
-                        egui::RichText::new("No linked library folder is chosen yet.")
-                            .color(theme::muted(ui)),
+                        egui::RichText::new(if reorganise {
+                            "No folder for the reorganised links is chosen yet."
+                        } else {
+                            "No linked library folder is chosen yet."
+                        })
+                        .color(theme::muted(ui)),
                     );
                     if widgets::action_button(
                         ui,
@@ -2390,12 +2721,17 @@ fn show_rom_organisation_page_with_options(
 
     if let Some(message) = &state.result_message {
         ui.add_space(8.0);
+        let top = ui.cursor().min.y;
         let tone = if state.result_complete {
             widgets::StatusTone::Success
         } else {
             widgets::StatusTone::Warning
         };
         widgets::banner(ui, "Result", message, tone);
+        if state.plan.is_none() && state.result_complete && state.applied.is_some() {
+            ui.label("This preview has been used. Preview again before renaming anything else.");
+        }
+        reveal_from(ui, &mut state.reveal, top);
         if let Some(transaction) = state.applied() {
             // Same condition as the Undo button below.
             crate::transaction_outcome::show(
@@ -2440,12 +2776,14 @@ fn show_rom_organisation_page_with_options(
 
     if let Some(error) = &state.error {
         ui.add_space(8.0);
+        let top = ui.cursor().min.y;
         let title = if state.error_after_changes {
             "Not finished"
         } else {
             "Not applied"
         };
         widgets::banner(ui, title, error, widgets::StatusTone::Blocked);
+        reveal_from(ui, &mut state.reveal, top);
     }
 
     // Offered whenever this page holds an Undo handle with something left to
@@ -2485,7 +2823,30 @@ fn show_rom_organisation_page_with_options(
         )
         .clicked()
     {
-        page_action = Some(RomOrganisationPageAction::Rollback);
+        state.pending_undo = true;
+        state.pending_apply = None;
+        state.reveal = true;
+    }
+    if state.pending_undo {
+        match state.applied.as_ref() {
+            Some(transaction) if undo_blocker.is_none() && !state.advanced_r2_selected => {
+                let confirmed = show_undo_confirmation(
+                    ui,
+                    transaction,
+                    !async_busy && older_writer.is_none(),
+                    &mut state.reveal,
+                );
+                match confirmed {
+                    Some(true) => {
+                        state.pending_undo = false;
+                        page_action = Some(RomOrganisationPageAction::Rollback);
+                    }
+                    Some(false) => state.pending_undo = false,
+                    None => {}
+                }
+            }
+            _ => state.pending_undo = false,
+        }
     }
 
     if let Some(warning) = &state.approval_persistence_warning {
@@ -2500,7 +2861,198 @@ fn show_rom_organisation_page_with_options(
             widgets::StatusTone::Pending,
         );
     }
+    // A reveal nothing on this page used (an outcome with no banner) must not
+    // jump the page later.
+    state.reveal = false;
     page_action
+}
+
+/// Scrolls the part of the page drawn since `top` into view, once.
+fn reveal_from(ui: &mut egui::Ui, reveal: &mut bool, top: f32) {
+    if std::mem::take(reveal) {
+        let bottom = ui.cursor().min.y.max(top);
+        let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=bottom);
+        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+    }
+}
+
+/// Entries an Undo of `transaction` may put back: every one that may have
+/// changed on disk. The engine decides per entry; this is only what to show.
+fn undo_affected_entries(
+    transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
+) -> Vec<&archivefs_core::dat::rename_apply::TransactionEntry> {
+    use archivefs_core::dat::rename_apply::EntryState;
+    transaction
+        .entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.state,
+                EntryState::Applying
+                    | EntryState::Applied
+                    | EntryState::RollingBack
+                    | EntryState::RollbackFailed
+            )
+        })
+        .collect()
+}
+
+/// The system a row was placed under and how that was decided. This is the
+/// platform assignment only: whether the game's name is verified is shown
+/// separately (the "Name from" line), so it never says "Verified".
+/// The line on a disc-set file's row: it moves only with its whole set.
+pub(crate) fn disc_set_line(entry: &OrganisationPlanEntry) -> Option<String> {
+    let sheet = entry.disc_set.as_deref()?;
+    matches!(
+        entry.status,
+        OrganisationStatus::Suggested | OrganisationStatus::AlreadyOrganised
+    )
+    .then(|| {
+        format!(
+            "Disc set: moves together with {} (names unchanged)",
+            sheet
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| sheet.display().to_string())
+        )
+    })
+}
+
+pub(crate) fn platform_line(display_name: &str, source: &str) -> String {
+    if source.trim().is_empty() {
+        format!("System: {display_name}")
+    } else {
+        format!("System: {display_name} (decided by: {source})")
+    }
+}
+
+/// True when Undo removes what Apply created (a link or copy) rather than
+/// putting a moved or renamed object back.
+fn undo_removes(entry: &archivefs_core::dat::rename_apply::TransactionEntry) -> bool {
+    use archivefs_core::dat::rename_apply::TransactionOperation as Op;
+    matches!(
+        entry.operation,
+        Op::CreateSymlink { .. } | Op::CreateHardlink { .. } | Op::CreateCopy { .. }
+    )
+}
+
+fn destination_folder(entry: &archivefs_core::dat::rename_apply::TransactionEntry) -> String {
+    entry
+        .destination_path
+        .parent()
+        .map(|folder| folder.display().to_string())
+        .unwrap_or_default()
+}
+
+/// What confirming Undo will do, worded for what the transaction did:
+/// created links are removed (game files untouched); moved links and
+/// renamed or moved files are put back under their earlier names.
+pub(crate) fn undo_confirmation_heading(
+    transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
+) -> String {
+    use archivefs_core::dat::rename_apply::ObjectKind;
+    let affected = undo_affected_entries(transaction);
+    let removed = affected.iter().filter(|e| undo_removes(e)).count();
+    let links_back = affected
+        .iter()
+        .filter(|e| !undo_removes(e) && e.identity.kind == ObjectKind::Symlink)
+        .count();
+    let files_back = affected.len() - removed - links_back;
+    let mut parts = Vec::new();
+    if removed > 0 {
+        parts.push(format!(
+            "It removes the {removed} link(s) this operation created; your game files are not touched."
+        ));
+    }
+    if links_back > 0 {
+        parts.push(format!(
+            "It puts {links_back} link(s) back in their earlier folders under their earlier names; your game files are not touched."
+        ));
+    }
+    if files_back > 0 || parts.is_empty() {
+        parts.push(format!(
+            "It puts {files_back} file(s) back under their earlier names."
+        ));
+    }
+    format!(
+        "Undo operation {}? {} Nothing changes until you confirm.",
+        transaction.transaction_id,
+        parts.join(" ")
+    )
+}
+
+/// Lines naming what an Undo would put back, at most `limit` of them.
+pub(crate) fn undo_confirmation_lines(
+    transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
+    limit: usize,
+) -> Vec<String> {
+    let affected = undo_affected_entries(transaction);
+    let mut lines: Vec<String> = affected
+        .iter()
+        .take(limit)
+        .map(|entry| {
+            let now = entry
+                .destination_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| entry.destination_path.display().to_string());
+            let folder = entry
+                .source_path
+                .parent()
+                .map(|folder| folder.display().to_string())
+                .unwrap_or_default();
+            if undo_removes(entry) {
+                format!(
+                    "remove {now} (in {folder})",
+                    folder = destination_folder(entry)
+                )
+            } else {
+                format!("{now} -> {} (in {folder})", entry.original_basename)
+            }
+        })
+        .collect();
+    if affected.len() > limit {
+        lines.push(format!("and {} more", affected.len() - limit));
+    }
+    lines
+}
+
+/// The Undo confirm card. `Some(true)` confirmed, `Some(false)` cancelled.
+fn show_undo_confirmation(
+    ui: &mut egui::Ui,
+    transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
+    enabled: bool,
+    reveal: &mut bool,
+) -> Option<bool> {
+    ui.add_space(6.0);
+    let top = ui.cursor().min.y;
+    let mut answer = None;
+    widgets::card(ui, |ui| {
+        ui.label(egui::RichText::new(undo_confirmation_heading(transaction)).strong());
+        for line in undo_confirmation_lines(transaction, 10) {
+            ui.label(line);
+        }
+        ui.label(
+            egui::RichText::new(
+                "Each file is checked again before it is moved back; anything that \
+                 changed since is left alone and reported.",
+            )
+            .color(theme::muted(ui)),
+        );
+        ui.horizontal(|ui| {
+            if widgets::action_button(ui, "Confirm undo", widgets::ActionStyle::Primary, enabled)
+                .clicked()
+            {
+                answer = Some(true);
+            }
+            if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Secondary, true).clicked()
+            {
+                answer = Some(false);
+            }
+        });
+    });
+    reveal_from(ui, reveal, top);
+    answer
 }
 
 const LIBRARY_DESTINATION_CARDS: [(&str, &str, PlayingLibraryDestination); 4] = [
@@ -2608,6 +3160,7 @@ fn show_library_destination_cards(ui: &mut egui::Ui, state: &mut RomOrganisation
 fn show_name_choice(ui: &mut egui::Ui, choice: Option<&NameChoice>) {
     let Some(choice) = choice else { return };
     ui.label(format!("Name from: {}", choice.source_label()));
+    ui.label(format!("Confidence: {}", choice.confidence_label()));
     if let Some(note) = &choice.note {
         ui.label(egui::RichText::new(note).color(theme::muted(ui)).small());
     }
@@ -2626,7 +3179,7 @@ fn show_plan(
     if !name_choices.is_empty() {
         let c = name_counts(plan, &name_choices);
         ui.label(format!(
-            "Names: {} verified catalogue names to apply · {} already correct · {} RomM names (no verified catalogue name) · {} archives skipped (catalogue names a file inside)",
+            "Names: {} verified catalogue names to apply · {} already correct · {} RomM hints (not verified, not used to name files or links in bulk) · {} archives skipped (catalogue names a file inside)",
             c.dat_changes, c.dat_already_correct, c.romm_fallbacks, c.archives_skipped
         ));
     }
@@ -2787,7 +3340,10 @@ fn show_plan(
                     }
                 }
                 let quick_mame = quick_only
-                    && entry.status == OrganisationStatus::Suggested
+                    && matches!(
+                        entry.status,
+                        OrganisationStatus::Suggested | OrganisationStatus::Blocked
+                    )
                     && entry.platform_display_name.eq_ignore_ascii_case("Arcade");
                 widgets::status_badge(
                     ui,
@@ -2811,13 +3367,22 @@ fn show_plan(
                                 .monospace(),
                         );
                         ui.label(
-                            egui::RichText::new(format!(
-                                "Destination link: {}",
-                                entry.destination_path.display()
-                            ))
+                            egui::RichText::new(match hint_gate::unverified_name_label(entry) {
+                                Some(label) => format!(
+                                    "{label}, no link is created: {}",
+                                    entry.destination_path.display()
+                                ),
+                                None => format!(
+                                    "Destination link: {}",
+                                    entry.destination_path.display()
+                                ),
+                            })
                             .monospace(),
                         );
                         ui.label("Source action: Untouched");
+                        ui.label(hint_gate::link_name_line(
+                            name_choices.get(&entry.source_path),
+                        ));
                         ui.label(format!("Result: {}", linked_library_preview_result(entry)));
                         if !entry.platform_display_name.is_empty() {
                             ui.label(
@@ -2835,11 +3400,17 @@ fn show_plan(
                         if quick_mame {
                             ui.label("MAME collections use the dedicated MAME tools.");
                         } else {
-                            ui.label(format!("Rename to: {}", entry.destination_path.display()));
+                            ui.label(match hint_gate::unverified_name_label(entry) {
+                                Some(label) => {
+                                    format!("{label}: {}", entry.destination_path.display())
+                                }
+                                None => format!("Rename to: {}", entry.destination_path.display()),
+                            });
                             show_name_choice(ui, name_choices.get(&entry.source_path));
                             ui.label(format!("Identity: Verified by {}", entry.platform_source));
                         }
                         ui.label(format!("Status: {}", entry.status.label()));
+                        ui.label(undo_availability(entry.status));
                         if let Some(reason) = &entry.reason {
                             ui.label(
                                 egui::RichText::new(reason)
@@ -2877,20 +3448,42 @@ fn show_plan(
                 } else {
                     ui.vertical(|ui| {
                         ui.label(format!("Current: {}", entry.source_path.display()));
-                        ui.label(format!("Will become: {}", entry.destination_path.display()));
-                        show_name_choice(ui, name_choices.get(&entry.source_path));
+                        if plan.mode == OrganisationMode::OrganiseSymlinkOnly {
+                            ui.label(hint_gate::existing_link_line(&entry.source_path));
+                        }
+                        let unverified = hint_gate::unverified_name_label(entry);
+                        ui.label(match unverified {
+                            Some(label) => {
+                                format!("{label}: {}", entry.destination_path.display())
+                            }
+                            None => format!("Will become: {}", entry.destination_path.display()),
+                        });
+                        if hint_gate::is_link_mode(plan.mode) {
+                            ui.label(hint_gate::link_name_line(
+                                name_choices.get(&entry.source_path),
+                            ));
+                        } else {
+                            show_name_choice(ui, name_choices.get(&entry.source_path));
+                        }
                         if !entry.platform_display_name.is_empty() {
-                            ui.label(format!(
-                                "Reason: Verified for {}",
-                                entry.platform_display_name
+                            ui.label(platform_line(
+                                &entry.platform_display_name,
+                                &entry.platform_source,
                             ));
                         }
+                        if let Some(line) = disc_set_line(entry) {
+                            ui.label(line);
+                        }
                         ui.label(match plan.mode {
+                            _ if unverified.is_some() => {
+                                "Action: none (the new name is not verified)"
+                            }
                             OrganisationMode::RenameInPlace => "Action: Rename file",
                             OrganisationMode::MoveRealFile => "Action: Move file",
                             OrganisationMode::OrganiseSymlinkOnly => "Action: Move existing link",
                             OrganisationMode::BuildLinkedLibrary => "Action: Create link",
                         });
+                        ui.label(undo_availability(entry.status));
                         if let Some(reason) = &entry.reason {
                             ui.label(
                                 egui::RichText::new(reason)
@@ -2965,7 +3558,9 @@ fn show_plan(
     .clicked()
     {
         state.pending_apply = Some(approved);
+        state.pending_undo = false;
         state.confirm_text.clear();
+        state.reveal = true;
     }
 
     // Explicit confirmation before any mutation. Large batches require typing
@@ -2976,6 +3571,7 @@ fn show_plan(
     }
     if let Some(count) = state.pending_apply {
         ui.add_space(6.0);
+        let top = ui.cursor().min.y;
         widgets::card(ui, |ui| {
             ui.label(
                 egui::RichText::new(format!(
@@ -3015,6 +3611,7 @@ fn show_plan(
                 }
             });
         });
+        reveal_from(ui, &mut state.reveal, top);
     }
 }
 
@@ -3310,6 +3907,46 @@ mod tests {
             .shapes
             .iter()
             .any(|clipped| shape_contains(&clipped.shape, needle))
+    }
+
+    #[test]
+    fn every_row_says_whether_undo_is_available() {
+        assert!(undo_availability(OrganisationStatus::Suggested).contains("yes"));
+        for status in [
+            OrganisationStatus::AlreadyOrganised,
+            OrganisationStatus::Conflict,
+            OrganisationStatus::Blocked,
+            OrganisationStatus::Unsupported,
+        ] {
+            assert!(
+                undo_availability(status).contains("not needed"),
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_catalogue_match_reads_as_verified() {
+        let choice = |source| NameChoice {
+            name: None,
+            source,
+            note: None,
+            skipped_archive: false,
+        };
+        let dat = choice(NameSource::VerifiedDat {
+            catalogue: "No-Intro".into(),
+        });
+        assert!(dat.confidence_label().starts_with("verified"));
+        assert!(
+            choice(NameSource::Romm)
+                .confidence_label()
+                .starts_with("hint")
+        );
+        assert!(
+            choice(NameSource::Original)
+                .confidence_label()
+                .starts_with("no match")
+        );
     }
 
     #[test]
@@ -3698,6 +4335,7 @@ mod tests {
         let names = NameResolver {
             romm: RommTitles::default(),
             database: None,
+            archive_ids: None,
             saved_archives: None,
             catalogues: Default::default(),
         };
@@ -3765,6 +4403,7 @@ mod tests {
             entries.push(OrganisationPlanEntry {
                 source_identity: None,
                 catalogue_binding: None,
+                disc_set: None,
                 source_path: source.clone(),
                 destination_path: source.with_file_name(name),
                 platform: None,
@@ -4351,7 +4990,7 @@ mod tests {
     }
 
     #[test]
-    fn advanced_protection_refuses_catalogue_bound_selection_before_io() {
+    fn advanced_protection_never_accepts_an_unsealed_catalogue_binding() {
         let mut entry = linked_library_plan_entry(OrganisationStatus::Suggested);
         entry.catalogue_binding = Some(serde_json::json!({"reviewed":true}));
         let approved =
@@ -4364,14 +5003,16 @@ mod tests {
             generation: 1,
             entries: vec![entry],
         };
-        let error = validate_r2_selection(&plan, &approved).unwrap_err();
-        assert!(error.contains("Standard Apply"), "{error}");
+        // Catalogue-backed files are eligible (owner option 1), but only with
+        // a binding the library confirms; this one is refused, no I/O done.
+        assert!(validate_r2_selection(&plan, &approved).is_err());
     }
 
     fn linked_library_plan_entry(status: OrganisationStatus) -> OrganisationPlanEntry {
         OrganisationPlanEntry {
             source_identity: None,
             catalogue_binding: None,
+            disc_set: None,
             source_path: PathBuf::from("/sources/Combat.bin"),
             destination_path: PathBuf::from("/library/atari2600/Combat.bin"),
             platform: Some("Atari2600".to_string()),
@@ -4426,6 +5067,7 @@ mod tests {
             entries: vec![OrganisationPlanEntry {
                 source_identity: None,
                 catalogue_binding: None,
+                disc_set: None,
                 source_path: PathBuf::from("/sources/Combat.bin"),
                 destination_path: library_root.join("atari2600").join("Combat (USA).bin"),
                 platform: Some("Atari2600".to_string()),
@@ -4677,3 +5319,21 @@ mod tests {
         assert_ne!(before, state.input_fingerprint());
     }
 }
+
+#[path = "rom_organisation_page_hint_gate.rs"]
+mod hint_gate;
+#[cfg(test)]
+#[path = "rom_organisation_page_preview_perf_tests.rs"]
+mod preview_perf_tests;
+
+#[cfg(test)]
+#[path = "rom_organisation_page_hint_gate_tests.rs"]
+mod hint_gate_tests;
+
+#[cfg(test)]
+#[path = "rom_organisation_page_hint_gate_runtime_tests.rs"]
+mod hint_gate_runtime_tests;
+
+#[cfg(test)]
+#[path = "rom_organisation_page_undo_tests.rs"]
+mod undo_tests;

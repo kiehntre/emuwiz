@@ -1288,3 +1288,900 @@ fn organise_and_undo_keep_favourites_and_collections_on_the_same_game() {
         assert_eq!(members(&f.db), expected);
     }
 }
+
+/// Saved catalogue checks (owner blocker 2026-11-22): a check of exactly the
+/// file being renamed moves with it on Apply and back on Undo, so a verified
+/// game stays verified after EmuWiz renames it.
+mod carried_catalogue_checks {
+    use super::*;
+    use crate::dat::library_identity_summary::DiscFileState;
+    use crate::identity_source::hashing::FileFingerprint;
+
+    fn check_of(path: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "audit_file": FileFingerprint::observe(path).unwrap(),
+            "disc_members": [],
+            "archive_member": null,
+            "untouched": "every other fact stays as it was",
+        })
+    }
+
+    fn insert(f: &Fixture, facts: &serde_json::Value) -> i64 {
+        let c = f.sql();
+        c.execute(
+            "INSERT INTO library_dat_identities(archive_id,dat_source_id,verification_state,completeness,audited_at,facts_json,created_at,updated_at) \
+             VALUES(?1,'dat-fixture-'||(SELECT COUNT(*) FROM library_dat_identities),'verified_single_match','exhaustive','t',?2,'t','t')",
+            params![f.id, serde_json::to_vec(facts).unwrap()],
+        )
+        .unwrap();
+        c.last_insert_rowid()
+    }
+
+    fn stored(f: &Fixture, row: i64) -> Vec<u8> {
+        f.sql()
+            .query_row(
+                "SELECT facts_json FROM library_dat_identities WHERE id=?1",
+                [row],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn recorded(f: &Fixture, row: i64) -> FileFingerprint {
+        let facts: serde_json::Value = serde_json::from_slice(&stored(f, row)).unwrap();
+        assert_eq!(facts["untouched"], "every other fact stays as it was");
+        serde_json::from_value(facts["audit_file"].clone()).unwrap()
+    }
+
+    /// Binds the preview again, as a fresh preview would, after the rows above.
+    fn rebind(f: &mut Fixture) {
+        for entry in &mut f.plan.entries {
+            entry.catalogue_binding = None;
+        }
+        prepare_organisation_catalogue(&mut f.plan, &f.db).unwrap();
+        f.tx = build_organisation_transaction(&f.plan, &f.approved, 1).unwrap();
+    }
+
+    #[test]
+    fn a_current_check_moves_with_its_file_on_apply_and_back_on_undo() {
+        for mode in [
+            OrganisationMode::RenameInPlace,
+            OrganisationMode::MoveRealFile,
+        ] {
+            let mut f = Fixture::new(mode);
+            let row = insert(&f, &check_of(&f.source));
+            rebind(&mut f);
+            f.apply().unwrap();
+            let moved = recorded(&f, row);
+            assert_eq!(moved.path, f.destination, "{mode:?}");
+            assert_eq!(
+                DiscFileState::of(&moved),
+                DiscFileState::Unchanged,
+                "{mode:?}"
+            );
+            f.reload();
+            f.undo().unwrap();
+            let back = recorded(&f, row);
+            assert_eq!(back.path, f.source, "{mode:?}");
+            assert_eq!(
+                DiscFileState::of(&back),
+                DiscFileState::Unchanged,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zip_member_check_moves_with_its_archive_and_keeps_its_member() {
+        // Owner item 2: the archive is read again in full and must be
+        // byte-identical, so the member inside is the one that was verified.
+        for mode in [
+            OrganisationMode::RenameInPlace,
+            OrganisationMode::MoveRealFile,
+        ] {
+            let mut f = Fixture::new(mode);
+            let mut member = check_of(&f.source);
+            let provenance = serde_json::json!({
+                "member_name": "Inside (USA).nes", "member_index": 0,
+                "archive_format": "zip", "algorithm": "SHA-1"
+            });
+            member["archive_member"] = provenance.clone();
+            let row = insert(&f, &member);
+            rebind(&mut f);
+            f.apply().unwrap();
+            let moved: serde_json::Value = serde_json::from_slice(&stored(&f, row)).unwrap();
+            assert_eq!(moved["archive_member"], provenance, "{mode:?}");
+            assert_eq!(recorded(&f, row).path, f.destination, "{mode:?}");
+            assert_eq!(
+                DiscFileState::of(&recorded(&f, row)),
+                DiscFileState::Unchanged
+            );
+            f.reload();
+            f.undo().unwrap();
+            assert_eq!(recorded(&f, row).path, f.source, "{mode:?}");
+            assert_eq!(
+                DiscFileState::of(&recorded(&f, row)),
+                DiscFileState::Unchanged
+            );
+        }
+    }
+
+    #[test]
+    fn a_zip_member_check_of_a_changed_archive_stays_stale() {
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        let mut member = check_of(&f.source);
+        member["archive_member"] = serde_json::json!({
+            "member_name": "Inside (USA).nes", "member_index": 0,
+            "archive_format": "zip", "algorithm": "SHA-1"
+        });
+        let row = insert(&f, &member);
+        rebind(&mut f);
+        let before = stored(&f, row);
+        // The archive's bytes change after the preview, same size and times.
+        let meta = std::fs::metadata(&f.source).unwrap();
+        let mut bytes = std::fs::read(&f.source).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&f.source, &bytes).unwrap();
+        let times = std::fs::FileTimes::new()
+            .set_modified(meta.modified().unwrap())
+            .set_accessed(meta.accessed().unwrap());
+        std::fs::File::options()
+            .write(true)
+            .open(&f.source)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        let _ = f.apply();
+        assert_eq!(
+            stored(&f, row),
+            before,
+            "a changed archive's member check never moves"
+        );
+    }
+
+    #[test]
+    fn stale_disc_and_changed_checks_stay_exactly_where_they_were() {
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        // Changed after it was saved: the change time no longer matches.
+        let mut stale = check_of(&f.source);
+        stale["audit_file"]["object"]["changed_seconds"] = serde_json::json!(1);
+        let stale = insert(&f, &stale);
+        // A check of a disc set is not a check of this one file.
+        let mut disc = check_of(&f.source);
+        disc["disc_members"] = serde_json::json!([FileFingerprint::observe(&f.source).unwrap()]);
+        let disc = insert(&f, &disc);
+        // Current when the preview was bound, then saved again elsewhere.
+        let resaved = insert(&f, &check_of(&f.source));
+        rebind(&mut f);
+        let other = f.temp.path().join("elsewhere.zip");
+        std::fs::write(&other, b"other").unwrap();
+        f.sql()
+            .execute(
+                "UPDATE library_dat_identities SET facts_json=?1 WHERE id=?2",
+                params![serde_json::to_vec(&check_of(&other)).unwrap(), resaved],
+            )
+            .unwrap();
+        let before: Vec<_> = [stale, disc, resaved]
+            .iter()
+            .map(|row| stored(&f, *row))
+            .collect();
+        f.apply().unwrap();
+        assert_eq!(
+            f.path_id(&f.destination),
+            Some(f.id),
+            "the game itself moved"
+        );
+        let after: Vec<_> = [stale, disc, resaved]
+            .iter()
+            .map(|row| stored(&f, *row))
+            .collect();
+        assert_eq!(after, before);
+        f.reload();
+        f.undo().unwrap();
+        let undone: Vec<_> = [stale, disc, resaved]
+            .iter()
+            .map(|row| stored(&f, *row))
+            .collect();
+        assert_eq!(undone, before);
+    }
+
+    #[test]
+    fn a_game_with_no_saved_check_gets_none() {
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        let count = |f: &Fixture| -> i64 {
+            f.sql()
+                .query_row("SELECT COUNT(*) FROM library_dat_identities", [], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        f.apply().unwrap();
+        assert_eq!(count(&f), 0, "Apply never makes a check");
+        f.reload();
+        f.undo().unwrap();
+        assert_eq!(count(&f), 0, "Undo never makes a check");
+    }
+
+    #[test]
+    fn a_check_made_stale_after_the_preview_stays_stale() {
+        // Same content, but the file changed after the preview (here its
+        // permissions, which set a new change time): the check was not
+        // valid immediately before the rename, so it is not carried.
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        let row = insert(&f, &check_of(&f.source));
+        rebind(&mut f);
+        let before = stored(&f, row);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&f.source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        f.apply().unwrap();
+        assert_eq!(f.path_id(&f.destination), Some(f.id), "the game moved");
+        assert_eq!(stored(&f, row), before, "the check was left as it was");
+    }
+
+    #[test]
+    fn content_changed_after_the_preview_moves_nothing() {
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        let row = insert(&f, &check_of(&f.source));
+        rebind(&mut f);
+        let before = stored(&f, row);
+        let modified = std::fs::metadata(&f.source).unwrap().modified().unwrap();
+        std::fs::write(&f.source, b"fixture CONTENTS").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&f.source)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert!(f.apply().is_err() || f.path_id(&f.destination).is_none());
+        assert!(f.source.exists() && !f.destination.exists());
+        assert_eq!(stored(&f, row), before);
+    }
+
+    #[test]
+    fn an_interrupted_apply_finished_by_recovery_carries_nothing() {
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        let row = insert(&f, &check_of(&f.source));
+        rebind(&mut f);
+        let before = stored(&f, row);
+        f.fault();
+        assert!(f.apply().is_err());
+        assert!(f.destination.exists());
+        assert_eq!(stored(&f, row), before, "the failed commit changed nothing");
+        f.clear_fault();
+        f.reload();
+        f.reconcile();
+        assert_eq!(f.tx.state, TransactionState::Applied);
+        assert_eq!(f.path_id(&f.destination), Some(f.id));
+        assert_eq!(
+            stored(&f, row),
+            before,
+            "recovery cannot prove the moment before the rename: the check stays stale"
+        );
+        assert_ne!(
+            DiscFileState::of(&recorded(&f, row)),
+            DiscFileState::Unchanged,
+            "and it does not describe the moved file"
+        );
+    }
+
+    #[test]
+    fn an_unverified_check_moves_but_is_never_made_verified() {
+        // A saved "no match" result is still a saved result: it follows the
+        // file, and its verification state stays exactly what it was.
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        let row = insert(&f, &check_of(&f.source));
+        f.sql()
+            .execute(
+                "UPDATE library_dat_identities SET verification_state='no_match' WHERE id=?1",
+                [row],
+            )
+            .unwrap();
+        rebind(&mut f);
+        let state = |f: &Fixture| -> String {
+            f.sql()
+                .query_row(
+                    "SELECT verification_state FROM library_dat_identities WHERE id=?1",
+                    [row],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        f.apply().unwrap();
+        assert_eq!(recorded(&f, row).path, f.destination);
+        assert_eq!(state(&f), "no_match");
+        let count: i64 = f
+            .sql()
+            .query_row("SELECT COUNT(*) FROM library_dat_identities", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1, "no check was made");
+    }
+
+    #[test]
+    fn a_check_made_stale_after_apply_stays_stale_through_undo() {
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        let row = insert(&f, &check_of(&f.source));
+        rebind(&mut f);
+        f.apply().unwrap();
+        assert_eq!(recorded(&f, row).path, f.destination);
+        assert_eq!(
+            DiscFileState::of(&recorded(&f, row)),
+            DiscFileState::Unchanged
+        );
+        // Changed outside EmuWiz after Apply (new change time).
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&f.destination, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before = stored(&f, row);
+        f.reload();
+        assert_eq!(
+            f.undo().unwrap().rollback.result,
+            crate::dat::rename_apply::RollbackResult::FullyRolledBack
+        );
+        assert_eq!(f.path_id(&f.source), Some(f.id), "the game went back");
+        assert_eq!(stored(&f, row), before, "the stale check did not move");
+    }
+
+    #[test]
+    fn a_journal_bound_without_checks_reads_and_moves_as_before() {
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        let binding = f.tx.entries[0].unknown
+            [crate::database::organisation_paths::CATALOGUE_BINDING_KEY]
+            .clone();
+        assert!(
+            binding.get("proofs").is_none(),
+            "no field when nothing moves"
+        );
+        let row = insert(&f, &check_of(&f.source));
+        let before = stored(&f, row);
+        // The preview was bound before this check existed (as an older
+        // journal would be): Apply moves the game and leaves the check.
+        f.apply().unwrap();
+        assert_eq!(f.path_id(&f.destination), Some(f.id));
+        assert_eq!(stored(&f, row), before);
+    }
+
+    // Advanced Protection (owner option 1): its engine moves the file, then
+    // the catalogue follows with the preview's own sealed binding.
+    mod protected {
+        use super::*;
+        use crate::dat::rom_organisation::protected_catalogue::{
+            CatalogueHold, checks_before_protected, complete_protected_catalogue,
+            validate_protected_catalogue,
+        };
+
+        fn verified(mode: OrganisationMode) -> (Fixture, i64) {
+            let mut f = Fixture::new(mode);
+            let row = insert(&f, &check_of(&f.source));
+            rebind(&mut f);
+            (f, row)
+        }
+
+        #[test]
+        fn the_row_and_its_check_follow_the_protected_rename_and_its_undo() {
+            let (f, row) = verified(OrganisationMode::RenameInPlace);
+            validate_protected_catalogue(&f.tx, &f.db).unwrap();
+            let checked = checks_before_protected(&f.tx, false);
+            assert_eq!(checked.values().flatten().collect::<Vec<_>>(), vec![&row]);
+            std::fs::rename(&f.source, &f.destination).unwrap();
+            let out = complete_protected_catalogue(&f.tx, false, &checked);
+            assert_eq!(out.updated, vec![f.destination.clone()]);
+            assert!(out.is_consistent());
+            assert_eq!(f.path_id(&f.destination), Some(f.id));
+            assert_eq!(f.path_id(&f.source), None);
+            let moved = recorded(&f, row);
+            assert_eq!(moved.path, f.destination);
+            assert_eq!(DiscFileState::of(&moved), DiscFileState::Unchanged);
+            // Running it again (an interrupted run finished) changes nothing.
+            let before = stored(&f, row);
+            let again = complete_protected_catalogue(&f.tx, false, &checked);
+            assert_eq!(again.updated, vec![f.destination.clone()]);
+            assert_eq!(stored(&f, row), before);
+            assert_eq!(f.path_id(&f.destination), Some(f.id));
+            // Undo: the engine puts the file back, the row and check follow.
+            let checked = checks_before_protected(&f.tx, true);
+            std::fs::rename(&f.destination, &f.source).unwrap();
+            let back = complete_protected_catalogue(&f.tx, true, &checked);
+            assert_eq!(back.updated, vec![f.source.clone()]);
+            assert_eq!(f.path_id(&f.source), Some(f.id));
+            let back = recorded(&f, row);
+            assert_eq!(back.path, f.source);
+            assert_eq!(DiscFileState::of(&back), DiscFileState::Unchanged);
+        }
+
+        #[test]
+        fn a_file_the_engine_did_not_move_keeps_its_row() {
+            let (f, row) = verified(OrganisationMode::RenameInPlace);
+            let before = stored(&f, row);
+            let checked = checks_before_protected(&f.tx, false);
+            let out = complete_protected_catalogue(&f.tx, false, &checked);
+            assert_eq!(out.not_moved, vec![f.source.clone()]);
+            assert!(out.updated.is_empty() && out.is_consistent());
+            assert_eq!(f.path_id(&f.source), Some(f.id));
+            assert_eq!(stored(&f, row), before);
+        }
+
+        #[test]
+        fn a_different_file_at_the_new_place_changes_nothing() {
+            let (f, row) = verified(OrganisationMode::RenameInPlace);
+            let before = stored(&f, row);
+            let bytes = std::fs::read(&f.source).unwrap();
+            std::fs::remove_file(&f.source).unwrap();
+            let checked = checks_before_protected(&f.tx, false);
+            std::fs::write(&f.destination, bytes).unwrap();
+            let out = complete_protected_catalogue(&f.tx, false, &checked);
+            assert_eq!(out.needs_review.len(), 1);
+            assert!(out.updated.is_empty());
+            assert_eq!(f.path_id(&f.source), Some(f.id));
+            assert_eq!(f.path_id(&f.destination), None);
+            assert_eq!(stored(&f, row), before);
+        }
+
+        #[test]
+        fn a_changed_library_row_is_a_stale_preview() {
+            let (f, _) = verified(OrganisationMode::RenameInPlace);
+            f.sql()
+                .execute(
+                    "UPDATE archives SET size_bytes=size_bytes+1 WHERE id=?1",
+                    [f.id],
+                )
+                .unwrap();
+            let refused = validate_protected_catalogue(&f.tx, &f.db).unwrap_err();
+            assert!(refused.contains("stale"), "{refused}");
+        }
+
+        #[test]
+        fn the_hold_keeps_other_writers_out_until_released() {
+            let (f, _) = verified(OrganisationMode::RenameInPlace);
+            let hold = CatalogueHold::take(f.db.path()).unwrap();
+            let other = f.sql();
+            other.busy_timeout(std::time::Duration::ZERO).unwrap();
+            let write = "UPDATE archives SET size_bytes=size_bytes WHERE id=1";
+            assert!(
+                other.execute(write, []).is_err(),
+                "a writer waits for the hold"
+            );
+            drop(hold);
+            other.execute(write, []).unwrap();
+        }
+
+        /// Owner 2026-11-23: the engine moved the file, the library step did
+        /// not run (Blue stopped), then a library scan runs.
+        fn interrupted(f: &Fixture) -> (PathBuf, PathBuf) {
+            use crate::dat::rom_organisation::protected_catalogue::{
+                PendingRecord, WORKSPACE_FOLDER, write_record,
+            };
+            let workspace = f.temp.path().join(WORKSPACE_FOLDER).join("key");
+            std::fs::create_dir_all(&workspace).unwrap();
+            let record = workspace.join("catalogue-1.json");
+            let checked = checks_before_protected(&f.tx, false);
+            write_record(
+                &record,
+                &PendingRecord {
+                    version: 1,
+                    created_ns: 1,
+                    state: "apply_pending".into(),
+                    transaction: f.tx.clone(),
+                    checked,
+                },
+            )
+            .unwrap();
+            std::fs::rename(&f.source, &f.destination).unwrap();
+            (workspace, record)
+        }
+
+        fn scan(f: &mut Fixture) -> crate::Result<crate::database::ScanPersistSummary> {
+            let games = f.temp.path().join("games");
+            let config = crate::Config {
+                configured_source_roots: Some(vec![games.clone()]),
+                source_folders: vec![games],
+                mount_root: f.temp.path().join("mount"),
+                ratarmount_bin: "ratarmount".into(),
+                master_rom_root: None,
+            };
+            crate::database::scan_and_persist(&mut f.db, &config, "test")
+        }
+
+        fn archives(f: &Fixture) -> Vec<(i64, Vec<u8>, Option<String>)> {
+            let c = f.sql();
+            let mut st = c
+                .prepare("SELECT id, absolute_path_cached, last_verified_missing_at FROM archives ORDER BY id")
+                .unwrap();
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        }
+
+        fn state_of(record: &Path) -> String {
+            let v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
+            v["state"].as_str().unwrap().to_string()
+        }
+
+        #[test]
+        fn a_rescan_first_finishes_an_interrupted_protected_rename() {
+            let (mut f, row) = verified(OrganisationMode::RenameInPlace);
+            let rows_before = archives(&f).len();
+            let (_, record) = interrupted(&f);
+            scan(&mut f).unwrap();
+            // The same game entry, at the new name, not missing; no new entry.
+            assert_eq!(f.path_id(&f.destination), Some(f.id));
+            assert_eq!(f.path_id(&f.source), None);
+            assert_eq!(archives(&f).len(), rows_before, "no duplicate entry");
+            assert!(
+                archives(&f).iter().all(|(_, _, missing)| missing.is_none()),
+                "nothing marked missing"
+            );
+            // Its verified check moved with it, still current.
+            let moved = recorded(&f, row);
+            assert_eq!(moved.path, f.destination);
+            assert_eq!(DiscFileState::of(&moved), DiscFileState::Unchanged);
+            assert_eq!(state_of(&record), "applied");
+        }
+
+        #[test]
+        fn a_rescan_is_refused_when_the_interrupted_rename_cannot_be_proved() {
+            let (mut f, row) = verified(OrganisationMode::RenameInPlace);
+            let (_, record) = interrupted(&f);
+            // Not the file the engine moved: replaced after the move.
+            let bytes = std::fs::read(&f.destination).unwrap();
+            std::fs::remove_file(&f.destination).unwrap();
+            std::fs::write(&f.destination, [bytes.as_slice(), b"x"].concat()).unwrap();
+            let before = (archives(&f), stored(&f, row));
+            let refused = scan(&mut f).unwrap_err().to_string();
+            assert!(refused.contains("Nothing was scanned"), "{refused}");
+            // It names the exact game folder and why, and how to resolve it.
+            let folder = f.source.parent().unwrap().display().to_string();
+            assert!(refused.contains(&folder), "{refused}");
+            assert!(
+                refused.contains("not at its new place as the same file"),
+                "{refused}"
+            );
+            assert!(
+                refused.contains("Let the library rescan these files"),
+                "{refused}"
+            );
+            assert_eq!((archives(&f), stored(&f, row)), before, "nothing changed");
+            assert_eq!(state_of(&record), "apply_pending", "kept for review");
+            // The reviewed way out, chosen in Advanced Protection: the record
+            // is kept (renamed), and the scan then runs, treating the file as
+            // moved outside EmuWiz. The old entry keeps its check.
+            let reviewed =
+                crate::dat::rom_organisation::protected_catalogue::release_for_rescan(&record)
+                    .unwrap();
+            assert!(reviewed.exists() && !record.exists());
+            assert_eq!(state_of(&reviewed), "apply_pending", "evidence unchanged");
+            scan(&mut f).unwrap();
+            assert!(
+                archives(&f)
+                    .iter()
+                    .any(|(id, _, missing)| *id == f.id && missing.is_some())
+            );
+            assert!(f.path_id(&f.destination).is_some_and(|id| id != f.id));
+            assert!(!stored(&f, row).is_empty(), "the old entry keeps its check");
+        }
+
+        #[test]
+        fn an_unreadable_record_blocks_the_scan_and_says_where() {
+            let (mut f, _) = verified(OrganisationMode::RenameInPlace);
+            let workspace = f
+                .temp
+                .path()
+                .join(crate::dat::rom_organisation::protected_catalogue::WORKSPACE_FOLDER)
+                .join("key");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(workspace.join("catalogue-9.json"), b"not json").unwrap();
+            let before = archives(&f);
+            let refused = scan(&mut f).unwrap_err().to_string();
+            assert!(refused.contains("cannot be read"), "{refused}");
+            assert!(
+                refused.contains(&workspace.display().to_string()),
+                "{refused}"
+            );
+            assert_eq!(archives(&f), before);
+        }
+
+        #[test]
+        fn a_library_folder_switched_off_does_not_block_the_others() {
+            use crate::dat::rom_organisation::protected_catalogue::finish_pending_before_scan;
+            let (f, _) = verified(OrganisationMode::RenameInPlace);
+            let (_, record) = interrupted(&f);
+            std::fs::remove_file(&f.destination).unwrap();
+            // A different library folder beside it: not concerned.
+            let other = f.temp.path().join("other-library");
+            std::fs::create_dir_all(&other).unwrap();
+            finish_pending_before_scan([other.as_path()]).unwrap();
+            assert_eq!(state_of(&record), "apply_pending");
+            assert!(finish_pending_before_scan([f.temp.path().join("games").as_path()]).is_err());
+        }
+
+        #[test]
+        fn a_rescan_waits_while_advanced_protection_is_working() {
+            let (mut f, _) = verified(OrganisationMode::RenameInPlace);
+            let (workspace, record) = interrupted(&f);
+            let lock = crate::dat::rom_organisation::protected_catalogue::WorkspaceLock::try_take(
+                &workspace,
+            )
+            .unwrap()
+            .unwrap();
+            let before = archives(&f);
+            let refused = scan(&mut f).unwrap_err().to_string();
+            assert!(refused.contains("is renaming files"), "{refused}");
+            assert_eq!(archives(&f), before);
+            drop(lock);
+            scan(&mut f).unwrap();
+            assert_eq!(f.path_id(&f.destination), Some(f.id));
+            assert_eq!(state_of(&record), "applied");
+        }
+        /// The real recovery engine's enrollment (the same calls the
+        /// `--r2-operator` process makes) links an anchor to the file, which
+        /// changes its change time and link count. Apply confirms that one
+        /// file again (owner approval 2026-11-23); nothing else is accepted.
+        mod enrolled {
+            use super::*;
+            use crate::dat::rename_apply::compact_recovery::{
+                controller::RecoveryAction, deployment as d,
+            };
+            use crate::dat::rom_organisation::protected_catalogue::{
+                confirm_enrolled, record_enrollment,
+            };
+            use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+            struct Enrolled {
+                f: Fixture,
+                row: i64,
+                root: PathBuf,
+                state: PathBuf,
+                signer: PathBuf,
+                workspace: PathBuf,
+                operator: RenameTransaction,
+            }
+
+            fn hashed_check(path: &Path) -> serde_json::Value {
+                let h =
+                    crate::identity_source::hashing::hash_file(path, &TrustedRoots::none(), None)
+                        .unwrap();
+                let mut facts = check_of(path);
+                facts["audited_hashes"] = serde_json::json!({
+                    "size_bytes": h.fingerprint.size_bytes, "crc32": h.crc32,
+                    "md5": h.md5, "sha1": h.sha1, "sha256": null});
+                facts["hash_evidence"] = serde_json::json!({
+                    "matched_algorithm": "SHA-1", "matched_value": h.sha1,
+                    "available_algorithms": ["SHA-1", "MD5", "CRC32"]});
+                facts
+            }
+
+            /// `None` where the filesystem is not one Advanced Protection
+            /// admits (unless `EMUWIZ_R2_REQUIRE_QUALIFIED=1`).
+            fn enrolled(record: bool) -> Option<Enrolled> {
+                let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+                let row = insert(&f, &hashed_check(&f.source));
+                rebind(&mut f);
+                let root = f.source.parent().unwrap().canonicalize().unwrap();
+                if let Err(e) = d::preview_root(&root) {
+                    assert_ne!(
+                        std::env::var("EMUWIZ_R2_REQUIRE_QUALIFIED").as_deref(),
+                        Ok("1"),
+                        "{e}"
+                    );
+                    return None;
+                }
+                let workspace = f.temp.path().canonicalize().unwrap().join("protection");
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&workspace)
+                    .unwrap();
+                let signer = workspace.join("operator");
+                let state = workspace.join("state-0");
+                let key = d::issuer_init(&signer).unwrap();
+                d::provision(
+                    &root,
+                    &state,
+                    &key,
+                    "Blue advanced safety operator",
+                    "Contract1-I",
+                )
+                .unwrap();
+                let plan = d::plan(&state, &[("Old.zip".into(), "New.zip".into())]).unwrap();
+                let bytes = serde_json::to_vec_pretty(&plan).unwrap();
+                if record {
+                    record_enrollment(&workspace, &f.tx, &plan.transaction_id).unwrap();
+                }
+                d::enroll(&state, &bytes, &d::plan_confirmation(&bytes).unwrap(), true).unwrap();
+                let operator = d::review(&state, RecoveryAction::Apply)
+                    .unwrap()
+                    .transaction;
+                assert_eq!(operator.transaction_id, plan.transaction_id);
+                // The anchor is linked: the saved check no longer looks current.
+                assert_eq!(std::fs::metadata(&f.source).unwrap().nlink(), 2);
+                assert!(matches!(
+                    DiscFileState::of(&recorded(&f, row)),
+                    DiscFileState::Changed(_)
+                ));
+                Some(Enrolled {
+                    f,
+                    row,
+                    root,
+                    state,
+                    signer,
+                    workspace,
+                    operator,
+                })
+            }
+
+            fn run(e: &Enrolled, action: RecoveryAction) {
+                let review = d::review(&e.state, action).unwrap();
+                assert!(review.actionable, "{:?}", review.refusal);
+                let grant = d::approve(&e.state, &e.signer, action, &review.confirmation).unwrap();
+                assert!(
+                    d::execute(&e.state, &grant, action, true)
+                        .unwrap()
+                        .completed
+                );
+            }
+
+            fn rows(checked: &std::collections::BTreeMap<usize, Vec<i64>>) -> Vec<i64> {
+                checked.values().flatten().copied().collect()
+            }
+
+            #[test]
+            fn apply_confirms_its_own_enrolled_file_and_the_check_follows_apply_and_undo() {
+                let Some(mut e) = enrolled(true) else {
+                    return;
+                };
+                rebind(&mut e.f);
+                assert!(rows(&checks_before_protected(&e.f.tx, false)).is_empty());
+                assert_eq!(confirm_enrolled(&e.workspace, &e.operator, &e.root), Ok(1));
+                assert_eq!(
+                    DiscFileState::of(&recorded(&e.f, e.row)),
+                    DiscFileState::Unchanged
+                );
+                // Confirming again (a retried Apply) changes nothing.
+                let confirmed = stored(&e.f, e.row);
+                assert_eq!(confirm_enrolled(&e.workspace, &e.operator, &e.root), Ok(0));
+                assert_eq!(stored(&e.f, e.row), confirmed);
+                rebind(&mut e.f);
+                validate_protected_catalogue(&e.f.tx, &e.f.db).unwrap();
+                let checked = checks_before_protected(&e.f.tx, false);
+                assert_eq!(rows(&checked), vec![e.row]);
+                run(&e, RecoveryAction::Apply);
+                assert!(!e.f.source.exists());
+                let out = complete_protected_catalogue(&e.f.tx, false, &checked);
+                assert_eq!(out.updated, vec![e.f.destination.clone()]);
+                assert!(out.is_consistent());
+                let moved = recorded(&e.f, e.row);
+                assert_eq!(moved.path, e.f.destination);
+                assert_eq!(DiscFileState::of(&moved), DiscFileState::Unchanged);
+                assert_eq!(e.f.path_id(&e.f.destination), Some(e.f.id));
+                // Undo: the engine puts the file back; the row and check follow.
+                let checked = checks_before_protected(&e.f.tx, true);
+                assert_eq!(rows(&checked), vec![e.row]);
+                run(&e, RecoveryAction::Undo);
+                let back = complete_protected_catalogue(&e.f.tx, true, &checked);
+                assert_eq!(back.updated, vec![e.f.source.clone()]);
+                let back = recorded(&e.f, e.row);
+                assert_eq!(back.path, e.f.source);
+                assert_eq!(DiscFileState::of(&back), DiscFileState::Unchanged);
+                assert_eq!(e.f.path_id(&e.f.source), Some(e.f.id));
+                assert_eq!(std::fs::read(&e.f.source).unwrap(), b"fixture contents");
+            }
+
+            #[test]
+            fn any_other_change_after_enrollment_refuses_and_leaves_the_check_stale() {
+                type Change = fn(&Enrolled) -> bool;
+                let cases: [(&str, Change, &str); 5] = [
+                    (
+                        "another hard link",
+                        |e| {
+                            std::fs::hard_link(&e.f.source, e.f.temp.path().join("extra")).unwrap();
+                            true
+                        },
+                        "hard link other than this operation's recovery anchor",
+                    ),
+                    (
+                        "permissions",
+                        |e| {
+                            let mode = std::fs::metadata(&e.f.source).unwrap().mode();
+                            std::fs::set_permissions(
+                                &e.f.source,
+                                std::fs::Permissions::from_mode((mode ^ 0o040) & 0o7777),
+                            )
+                            .unwrap();
+                            true
+                        },
+                        "its permissions changed",
+                    ),
+                    (
+                        "same-size rewrite with the modification time put back",
+                        |e| {
+                            let modified =
+                                std::fs::metadata(&e.f.source).unwrap().modified().unwrap();
+                            std::fs::write(&e.f.source, b"Fixture contents").unwrap();
+                            std::fs::File::options()
+                                .write(true)
+                                .open(&e.f.source)
+                                .unwrap()
+                                .set_modified(modified)
+                                .unwrap();
+                            true
+                        },
+                        "its content differs from the content that was prepared",
+                    ),
+                    (
+                        "an extended attribute",
+                        |e| {
+                            use std::os::unix::ffi::OsStrExt;
+                            let path =
+                                std::ffi::CString::new(e.f.source.as_os_str().as_bytes()).unwrap();
+                            // SAFETY: valid C strings and a 1-byte value.
+                            unsafe {
+                                libc::lsetxattr(
+                                    path.as_ptr(),
+                                    c"user.emuwiz-test".as_ptr(),
+                                    b"1".as_ptr().cast(),
+                                    1,
+                                    0,
+                                ) == 0
+                            }
+                        },
+                        "its extended attributes",
+                    ),
+                    (
+                        "the game checked again",
+                        |e| {
+                            let mut facts: serde_json::Value =
+                                serde_json::from_slice(&stored(&e.f, e.row)).unwrap();
+                            facts["audit_file"]["size_bytes"] = serde_json::json!(1);
+                            e.f.sql()
+                                .execute(
+                                    "UPDATE library_dat_identities SET facts_json=?1 WHERE id=?2",
+                                    params![serde_json::to_vec(&facts).unwrap(), e.row],
+                                )
+                                .unwrap();
+                            true
+                        },
+                        "checked again since it was prepared",
+                    ),
+                ];
+                for (name, change, reason) in cases {
+                    let Some(e) = enrolled(true) else {
+                        return;
+                    };
+                    if !change(&e) {
+                        eprintln!("skipped {name}: not supported on this filesystem");
+                        continue;
+                    }
+                    let before = stored(&e.f, e.row);
+                    let refused =
+                        confirm_enrolled(&e.workspace, &e.operator, &e.root).expect_err(name);
+                    assert!(refused.contains(reason), "{name}: {refused}");
+                    assert!(refused.contains("Nothing was changed"), "{name}: {refused}");
+                    assert_eq!(stored(&e.f, e.row), before, "{name}");
+                    assert_ne!(
+                        DiscFileState::of(&recorded(&e.f, e.row)),
+                        DiscFileState::Unchanged,
+                        "{name}"
+                    );
+                    assert!(e.f.source.exists(), "{name}");
+                }
+            }
+
+            #[test]
+            fn an_operation_enrolled_without_a_record_is_not_confirmed() {
+                let Some(e) = enrolled(false) else {
+                    return;
+                };
+                let before = stored(&e.f, e.row);
+                assert_eq!(confirm_enrolled(&e.workspace, &e.operator, &e.root), Ok(0));
+                assert_eq!(stored(&e.f, e.row), before);
+                assert!(matches!(
+                    DiscFileState::of(&recorded(&e.f, e.row)),
+                    DiscFileState::Changed(_)
+                ));
+            }
+        }
+    }
+}

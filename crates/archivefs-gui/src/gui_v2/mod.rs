@@ -17,6 +17,7 @@ mod browse_play;
 mod card_restore;
 mod cheat_extras_page;
 pub(crate) mod classic_trainers;
+mod collection_reconcile;
 mod collections;
 #[cfg(test)]
 mod dat_exact_tests;
@@ -107,6 +108,8 @@ mod psp_iso_analyser;
 mod quarantine_confirm;
 mod quarantine_outcome;
 mod r2_rename;
+#[cfg(test)]
+pub(crate) use r2_rename::validate_selection_for_test;
 mod recently_played;
 mod recording_integrity;
 #[cfg(test)]

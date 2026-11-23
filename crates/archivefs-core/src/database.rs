@@ -118,9 +118,11 @@ pub use disc_order::DatDiscOrderOutcome;
 #[cfg(test)]
 #[path = "database/catalogue_health_tests.rs"]
 mod catalogue_health_tests;
+mod collection_records;
 #[cfg(test)]
 #[path = "database/disc_order_tests.rs"]
 mod disc_order_tests;
+pub use collection_records::{CollectionRecordRow, CollectionSourceFolder};
 pub(crate) mod forget_missing;
 mod missing_cleanup;
 pub use missing_cleanup::MissingCleanupTarget;
@@ -10141,6 +10143,13 @@ pub(crate) fn scan_and_persist_folders_with_skipped(
     skipped: &[PathBuf],
     mount_root: &Path,
 ) -> Result<ScanPersistSummary> {
+    // An Advanced Protection rename whose library step is unfinished is
+    // finished first, or the scan is refused (it would otherwise mark the
+    // game missing and add it again unverified).
+    crate::dat::rom_organisation::protected_catalogue::finish_pending_before_scan(
+        folders.iter().map(|folder| folder.path.as_path()),
+    )
+    .map_err(ArchiveFsError::Database)?;
     database.begin_catalogue_refresh()?;
     let result =
         scan_and_persist_folders_transaction(database, folders, triggered_by, skipped, mount_root);

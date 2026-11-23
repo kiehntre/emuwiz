@@ -624,8 +624,28 @@ fn apply_transaction_inner(execution: &mut ApplyExecution<'_>) -> Result<ApplyOu
     // a recoverable record (the file is either at the source with the entry
     // Planned/Applying, or at the destination with the entry Applying, and
     // recovery reconciles either case).
+    // After Cancel, only disc sets already started are finished (a set is
+    // never left split by a cancel); nothing new is started.
+    let mut finishing: Option<std::collections::BTreeSet<String>> = None;
     for index in 0..transaction.entries.len() {
-        if cancelled(execution.cancel) {
+        if finishing.is_none() && cancelled(execution.cancel) {
+            let started: std::collections::BTreeSet<String> = transaction
+                .entries
+                .iter()
+                .filter(|entry| entry.state == EntryState::Applied)
+                .filter_map(crate::database::organisation_paths::disc_set_of)
+                .collect();
+            if !started.is_empty() {
+                finishing = Some(started);
+            }
+        }
+        if let Some(started) = &finishing {
+            if !crate::database::organisation_paths::disc_set_of(&transaction.entries[index])
+                .is_some_and(|lead| started.contains(&lead))
+            {
+                continue;
+            }
+        } else if cancelled(execution.cancel) {
             transaction.state = TransactionState::ApplyFailed;
             if super::exact_resume::has_envelope(transaction) {
                 super::exact_resume::set_state(
@@ -643,6 +663,53 @@ fn apply_transaction_inner(execution: &mut ApplyExecution<'_>) -> Result<ApplyOu
         }
         if transaction.entries[index].state == EntryState::Skipped {
             continue;
+        }
+
+        // The first file of a disc set to move: every file of the set is
+        // checked first, so a set that cannot move whole does not start.
+        if let Some(lead) =
+            crate::database::organisation_paths::disc_set_of(&transaction.entries[index])
+        {
+            let members: Vec<usize> = (0..transaction.entries.len())
+                .filter(|&other| {
+                    crate::database::organisation_paths::disc_set_of(&transaction.entries[other])
+                        .as_deref()
+                        == Some(lead.as_str())
+                })
+                .collect();
+            let started = members
+                .iter()
+                .any(|&member| transaction.entries[member].state != EntryState::Planned);
+            let refused = (!started)
+                .then(|| {
+                    members.iter().find_map(|&member| {
+                        run_preflight(&transaction.entries[member], &preflight_options)
+                            .err()
+                            .map(|failures| (member, failures))
+                    })
+                })
+                .flatten();
+            if let Some((member, failures)) = refused {
+                let reasons: Vec<String> = failures.iter().map(|f| f.reason()).collect();
+                let entry = &mut transaction.entries[member];
+                entry.preflight_passed = false;
+                entry.preflight_failures = reasons.clone();
+                entry.state = EntryState::ApplyFailed;
+                entry.failure_reason = Some(format!(
+                    "{}; nothing of the disc set of {lead} was moved",
+                    reasons.join("; ")
+                ));
+                transaction.state = TransactionState::ApplyFailed;
+                if super::exact_resume::has_envelope(transaction) {
+                    super::exact_resume::set_state(
+                        transaction,
+                        super::model::ExactResumeState::Failed,
+                    );
+                }
+                write_journal(&execution.journal_dir, transaction)
+                    .map_err(|error| ApplyError::Journal(error.to_string()))?;
+                break;
+            }
         }
 
         // Preflight (before entering the mutation window).
@@ -785,6 +852,8 @@ fn apply_transaction_inner(execution: &mut ApplyExecution<'_>) -> Result<ApplyOu
                 }
                 transaction.entries[index].state = EntryState::Applied;
                 transaction.entries[index].applied_at_unix = Some(crate::dat::sources::now_unix());
+                #[cfg(test)]
+                test_hook::applied(execution.cancel);
             }
             Err((state, reason)) => {
                 let uncertain_link = matches!(
@@ -822,7 +891,16 @@ fn apply_transaction_inner(execution: &mut ApplyExecution<'_>) -> Result<ApplyOu
             .map_err(|error| ApplyError::Journal(error.to_string()))?;
     }
 
-    if transaction.state == TransactionState::Applying {
+    if finishing.is_some() && transaction.state == TransactionState::Applying {
+        // Cancelled: the started sets are complete, the rest never began.
+        transaction.state = TransactionState::ApplyFailed;
+        if super::exact_resume::has_envelope(transaction) {
+            super::exact_resume::set_state(
+                transaction,
+                super::model::ExactResumeState::Interrupted,
+            );
+        }
+    } else if transaction.state == TransactionState::Applying {
         transaction.state = TransactionState::Applied;
         if super::exact_resume::has_envelope(transaction) {
             super::exact_resume::set_state(transaction, super::model::ExactResumeState::Completed);
@@ -1346,4 +1424,31 @@ fn confirm_rename_bound(
 
 fn cancelled(cancel: &AtomicBool) -> bool {
     cancel.load(Ordering::Relaxed)
+}
+
+/// Test hook: runs after each entry is applied, with the number applied so
+/// far and the cancel flag (failure injection: cancel, change or occupy a
+/// file mid-Apply).
+#[cfg(test)]
+pub(crate) mod test_hook {
+    use std::cell::RefCell;
+    use std::sync::atomic::AtomicBool;
+    type Hook = Box<dyn FnMut(usize, &AtomicBool)>;
+    thread_local! {
+        static AFTER_APPLIED: RefCell<Option<(usize, Hook)>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn after_applied(hook: impl FnMut(usize, &AtomicBool) + 'static) {
+        AFTER_APPLIED.with(|slot| *slot.borrow_mut() = Some((0, Box::new(hook))));
+    }
+    pub(crate) fn clear() {
+        AFTER_APPLIED.with(|slot| *slot.borrow_mut() = None);
+    }
+    pub(super) fn applied(cancel: &AtomicBool) {
+        AFTER_APPLIED.with(|slot| {
+            if let Some((count, hook)) = slot.borrow_mut().as_mut() {
+                *count += 1;
+                hook(*count, cancel);
+            }
+        });
+    }
 }

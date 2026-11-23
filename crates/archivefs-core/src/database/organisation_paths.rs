@@ -15,6 +15,19 @@ pub(crate) const CATALOGUE_BINDING_KEY: &str = KEY;
 /// Marks a set member (CUE/GDI track, M3U disc) that moves with its lead in
 /// the same transaction: `{"lead": "<lead source path>"}`.
 pub const COMPANION_KEY: &str = "organisation_companion_v1";
+/// Every file of a disc set (bound or not) names its set's lead here, so
+/// Apply and Undo can keep the set whole: `{"lead": "<lead source path>"}`.
+pub const DISC_SET_KEY: &str = "organisation_disc_set_v1";
+
+/// The disc set `entry` belongs to (its lead's source path), if any.
+pub(crate) fn disc_set_of(entry: &TransactionEntry) -> Option<String> {
+    entry
+        .unknown
+        .get(DISC_SET_KEY)?
+        .get("lead")?
+        .as_str()
+        .map(str::to_string)
+}
 /// Marks a game the person picked that the library has no row for (for
 /// example a disc set outside a PlayStation folder): it moves with no
 /// catalogue path to change.
@@ -80,6 +93,508 @@ struct Binding {
     fingerprint: bool,
     #[serde(default)]
     platform: Option<PlatformChange>,
+    /// Saved catalogue checks of this exact file that move with it. Empty
+    /// (and absent from older journals) means none: the check then stays at
+    /// the old path and the game must be checked again, as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    proofs: Vec<ProofCarry>,
+    /// Saved whole-disc checks of a disc set whose sheet this entry is, and
+    /// which moves whole in the same transaction ([`DiscSetCarry`]).
+    #[serde(
+        default,
+        rename = "disc_set_carry_v1",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    disc_sets: Vec<DiscSetCarry>,
+}
+
+/// One saved whole-disc check (`disc_members` non-empty, the sheet first)
+/// of a disc set that moves whole, names unchanged (owner decision
+/// 2026-11-23). The chain, each link failing closed (the check then stays
+/// where it was, stale, and the game must be checked again):
+/// 1. Bind (preview): every member's full-content proof was taken by the
+///    preview first; the check is then unchanged for every member (device,
+///    inode, size, modification and change time), so the hashed content is
+///    the checked content.
+/// 2. Just before Apply/Undo: every member is still unchanged at the path
+///    being moved ([`current_disc_set_checks`]).
+/// 3. After a complete Apply/Undo only ([`carry_disc_set_checks`]): each
+///    moved member is the same object, read in full again with the same
+///    content and observed stable; then, in one compare-and-swap on the
+///    stored facts, every member's fingerprint is re-pointed. Recovery and
+///    partial runs carry nothing. The verification state never changes.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct DiscSetCarry {
+    row: i64,
+    /// In the check's `disc_members` order: the path recorded at bind time
+    /// (the member's source) and its captured proof.
+    members: Vec<DiscMemberCarry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct DiscMemberCarry {
+    path: PathBuf,
+    proof: ProofCarry,
+}
+
+/// One saved catalogue check (`library_dat_identities` row) whose recorded
+/// file is the very object this move renames (owner decision 2026-11-22: an
+/// EmuWiz-controlled rename or Undo keeps a valid check; it never makes one).
+///
+/// The chain, each link failing closed (the check then stays where it was
+/// and the game must be checked again, as under #420):
+/// 1. Bind (preview): the check is unchanged for this object - device,
+///    inode, size, modification AND change time - after the preview captured
+///    the file's full-content proof (`sha256`).
+/// 2. Begin (Apply/Undo, catalogue write lock held, just before the rename):
+///    the check is still unchanged at the path being renamed. Recovery after
+///    an interruption carries nothing.
+/// 3. The executor re-reads the whole file before and after the rename and
+///    requires the same object and content (`identity_matches`).
+/// 4. Commit: the renamed file is observed, read in full again (same object
+///    and content), and observed again with identical results; only then is
+///    the check re-pointed to the new path and the new change time.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ProofCarry {
+    row: i64,
+    device: u64,
+    inode: u64,
+    size_bytes: u64,
+    modified_unix_seconds: i64,
+    modified_nanoseconds: i64,
+    /// The full-content proof the transaction captured (hex SHA-256).
+    sha256: String,
+}
+
+impl ProofCarry {
+    /// The recorded outer-file check in `facts`, if it describes this object
+    /// at `path`. A check of one member inside a zip/7z moves with the
+    /// archive (owner item 2, 2026-11-23): its freshness is the outer
+    /// archive's `audit_file`, and the whole archive is read again and must
+    /// be byte-identical, so every member is too. A disc set never moves this
+    /// way: it is several files, carried only as a whole set.
+    fn recorded(
+        &self,
+        facts: &serde_json::Value,
+        path: &Path,
+    ) -> Option<crate::identity_source::hashing::FileFingerprint> {
+        let empty = |key: &str| match facts.get(key) {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::Array(items)) => items.is_empty(),
+            Some(_) => false,
+        };
+        if !empty("disc_members") {
+            return None;
+        }
+        let proof: crate::identity_source::hashing::FileFingerprint =
+            serde_json::from_value(facts.get("audit_file")?.clone()).ok()?;
+        (proof.path == path && self.describes(&proof)).then_some(proof)
+    }
+
+    /// Whether `path` holds this object with this content now: observed,
+    /// read in full (no leaf link followed), and observed again unchanged.
+    /// Returns that observation, bound to the verified content.
+    fn verified_at(&self, path: &Path) -> Option<crate::identity_source::hashing::FileFingerprint> {
+        use crate::identity_source::hashing::FileFingerprint;
+        if !fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
+            return None;
+        }
+        let before = FileFingerprint::observe(path)?;
+        let content = crate::dat::rename_apply::identity::capture_identity(path).ok()?;
+        let after = FileFingerprint::observe(path)?;
+        let same_content = content.kind == crate::dat::rename_apply::model::ObjectKind::RegularFile
+            && content.dev == self.device
+            && content.ino == self.inode
+            && content.size_bytes == self.size_bytes
+            && content
+                .freshness
+                .as_ref()
+                .is_some_and(|f| hex_of(&f.sha256) == self.sha256);
+        (before == after && before.path == path && same_content && self.describes(&before))
+            .then_some(before)
+    }
+
+    fn describes(&self, proof: &crate::identity_source::hashing::FileFingerprint) -> bool {
+        proof.size_bytes == self.size_bytes
+            && proof.modified_unix_seconds == Some(self.modified_unix_seconds)
+            && proof.object.is_some_and(|object| {
+                object.device == self.device
+                    && object.inode == self.inode
+                    && object.modified_nanoseconds == self.modified_nanoseconds
+            })
+    }
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The saved single-file checks of `archive` that are current for exactly
+/// the object `entry` captured (its content proof was taken first, so an
+/// unchanged check now means that content is the content that was hashed).
+fn carried_proofs(
+    c: &Connection,
+    archive: i64,
+    entry: &TransactionEntry,
+) -> std::result::Result<Vec<ProofCarry>, String> {
+    use crate::dat::library_identity_summary::DiscFileState;
+    let identity = &entry.identity;
+    if proof_of(0, identity).is_none() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = c
+        .prepare("SELECT id,facts_json FROM library_dat_identities WHERE archive_id=?1 ORDER BY id")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([archive], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let mut carried = Vec::new();
+    for (row, bytes) in rows {
+        let Some(carry) = proof_of(row, identity) else {
+            continue;
+        };
+        let Ok(facts) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        if let Some(proof) = carry.recorded(&facts, &entry.source_path)
+            && DiscFileState::of(&proof) == DiscFileState::Unchanged
+        {
+            carried.push(carry);
+        }
+    }
+    Ok(carried)
+}
+
+/// The content proof a preview captured for a regular file, for `row`.
+fn proof_of(
+    row: i64,
+    identity: &crate::dat::rename_apply::model::ObjectIdentity,
+) -> Option<ProofCarry> {
+    let freshness = identity.freshness.as_ref()?;
+    if identity.kind != crate::dat::rename_apply::model::ObjectKind::RegularFile {
+        return None;
+    }
+    let modified = freshness
+        .modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some(ProofCarry {
+        row,
+        device: identity.dev,
+        inode: identity.ino,
+        size_bytes: identity.size_bytes,
+        modified_unix_seconds: identity.modified_unix,
+        modified_nanoseconds: i64::from(modified.subsec_nanos()),
+        sha256: hex_of(&freshness.sha256),
+    })
+}
+
+/// The disc set lead a set file names (`COMPANION_KEY`), if any.
+fn lead_of(entry: &TransactionEntry) -> Option<PathBuf> {
+    entry
+        .unknown
+        .get(COMPANION_KEY)?
+        .get("lead")?
+        .as_str()
+        .map(PathBuf::from)
+}
+
+/// The recorded `disc_members` of a check, when it has any.
+fn disc_members_of(
+    facts: &serde_json::Value,
+) -> Option<Vec<crate::identity_source::hashing::FileFingerprint>> {
+    let members: Vec<crate::identity_source::hashing::FileFingerprint> =
+        serde_json::from_value(facts.get("disc_members")?.clone()).ok()?;
+    (!members.is_empty()).then_some(members)
+}
+
+/// Bind: the saved whole-disc checks of `archive` that `entry` (a disc-set
+/// sheet moving as its set's lead) can carry: every member is a file of the
+/// same set in this transaction, a regular file whose preview proof matches
+/// the check, and the check is unchanged for every member now.
+fn disc_set_proofs(
+    c: &Connection,
+    archive: i64,
+    entry: &TransactionEntry,
+    all: &[TransactionEntry],
+) -> std::result::Result<Vec<DiscSetCarry>, String> {
+    use crate::dat::library_identity_summary::DiscFileState;
+    if lead_of(entry).as_deref() != Some(entry.source_path.as_path()) {
+        return Ok(Vec::new());
+    }
+    let mut stmt = c
+        .prepare("SELECT id,facts_json FROM library_dat_identities WHERE archive_id=?1 ORDER BY id")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([archive], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let mut carried = Vec::new();
+    'rows: for (row, bytes) in rows {
+        let Some(recorded) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .as_ref()
+            .and_then(disc_members_of)
+        else {
+            continue;
+        };
+        if recorded[0].path != entry.source_path {
+            continue;
+        }
+        let mut members = Vec::new();
+        for fingerprint in &recorded {
+            let Some(member) = all.iter().find(|e| e.source_path == fingerprint.path) else {
+                continue 'rows;
+            };
+            let Some(proof) = proof_of(row, &member.identity) else {
+                continue 'rows;
+            };
+            if !matches!(member.operation, TransactionOperation::RenameMove)
+                || lead_of(member).as_deref() != Some(entry.source_path.as_path())
+                || !fs::symlink_metadata(&fingerprint.path).is_ok_and(|m| m.is_file())
+                || !proof.describes(fingerprint)
+                || DiscFileState::of(fingerprint) != DiscFileState::Unchanged
+            {
+                continue 'rows;
+            }
+            members.push(DiscMemberCarry {
+                path: fingerprint.path.clone(),
+                proof,
+            });
+        }
+        carried.push(DiscSetCarry { row, members });
+    }
+    Ok(carried)
+}
+
+/// For each member of `carry`: the path it moves from and to in this
+/// transaction (`reverse` for Undo), or `None` if any member is not a
+/// rename of this transaction.
+fn disc_moves(
+    carry: &DiscSetCarry,
+    transaction: &RenameTransaction,
+    reverse: bool,
+) -> Option<
+    Vec<(
+        PathBuf,
+        PathBuf,
+        crate::dat::rename_apply::model::EntryState,
+    )>,
+> {
+    carry
+        .members
+        .iter()
+        .map(|member| {
+            let entry = transaction
+                .entries
+                .iter()
+                .find(|e| e.source_path == member.path)?;
+            if !matches!(entry.operation, TransactionOperation::RenameMove) {
+                return None;
+            }
+            let (from, to) = if reverse {
+                (&entry.destination_path, &entry.source_path)
+            } else {
+                (&entry.source_path, &entry.destination_path)
+            };
+            Some((from.clone(), to.clone(), entry.state))
+        })
+        .collect()
+}
+
+/// Whether the stored check still records every member at its `from` path,
+/// as the object the preview proved.
+fn records_members_at(
+    recorded: &[crate::identity_source::hashing::FileFingerprint],
+    carry: &DiscSetCarry,
+    moves: &[(
+        PathBuf,
+        PathBuf,
+        crate::dat::rename_apply::model::EntryState,
+    )],
+) -> bool {
+    recorded.len() == carry.members.len()
+        && recorded.iter().zip(&carry.members).zip(moves).all(
+            |((fingerprint, member), (from, _, _))| {
+                fingerprint.path == *from && member.proof.describes(fingerprint)
+            },
+        )
+}
+
+/// The sealed binding of each entry that carries disc-set checks.
+fn disc_bindings(transaction: &RenameTransaction) -> Vec<Binding> {
+    transaction
+        .entries
+        .iter()
+        .filter_map(|entry| entry.unknown.get(KEY))
+        .filter_map(|value| serde_json::from_value::<Binding>(value.clone()).ok())
+        .filter(|binding| !binding.disc_sets.is_empty())
+        .collect()
+}
+
+/// Just before Apply (or Undo, `reverse`): the bound disc-set checks still
+/// unchanged for every member at the path it is about to move from
+/// (metadata only, read-only). Only these may be carried afterwards.
+pub(crate) fn current_disc_set_checks(transaction: &RenameTransaction, reverse: bool) -> Vec<i64> {
+    use crate::dat::library_identity_summary::DiscFileState;
+    let mut current = Vec::new();
+    for binding in disc_bindings(transaction) {
+        if binding.verify_storage().is_err() {
+            continue;
+        }
+        let Ok(c) = open_read_only_connection(&binding.database) else {
+            continue;
+        };
+        for carry in &binding.disc_sets {
+            let Some(moves) = disc_moves(carry, transaction, reverse) else {
+                continue;
+            };
+            let stored: Option<Vec<u8>> = c
+                .query_row(
+                    "SELECT facts_json FROM library_dat_identities WHERE id=?1 AND archive_id=?2",
+                    params![carry.row, binding.archive],
+                    |r| r.get(0),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            let Some(recorded) = stored
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .as_ref()
+                .and_then(disc_members_of)
+            else {
+                continue;
+            };
+            if records_members_at(&recorded, carry, &moves)
+                && recorded
+                    .iter()
+                    .all(|fingerprint| DiscFileState::of(fingerprint) == DiscFileState::Unchanged)
+            {
+                current.push(carry.row);
+            }
+        }
+    }
+    current
+}
+
+/// After a complete Apply (or Undo, `reverse`): re-points each disc-set
+/// check in `current` to the moved files, when every member is proved to be
+/// the same object with the same content. Anything else changes nothing
+/// (the check stays stale). Returns how many checks moved.
+pub(crate) fn carry_disc_set_checks(
+    transaction: &RenameTransaction,
+    current: &[i64],
+    reverse: bool,
+) -> usize {
+    let mut carried = 0;
+    for binding in disc_bindings(transaction) {
+        for carry in binding
+            .disc_sets
+            .iter()
+            .filter(|carry| current.contains(&carry.row))
+        {
+            if carry_disc_set(&binding, carry, transaction, reverse) == Ok(true) {
+                carried += 1;
+            }
+        }
+    }
+    carried
+}
+
+fn carry_disc_set(
+    binding: &Binding,
+    carry: &DiscSetCarry,
+    transaction: &RenameTransaction,
+    reverse: bool,
+) -> std::result::Result<bool, String> {
+    use crate::dat::rename_apply::model::EntryState;
+    let done = if reverse {
+        EntryState::RolledBack
+    } else {
+        EntryState::Applied
+    };
+    let Some(moves) = disc_moves(carry, transaction, reverse) else {
+        return Ok(false);
+    };
+    if moves.iter().any(|(_, _, state)| *state != done) {
+        return Ok(false);
+    }
+    // Every moved file is read in full first, before the catalogue lock.
+    let mut moved = Vec::new();
+    for (member, (_, to, _)) in carry.members.iter().zip(&moves) {
+        match member.proof.verified_at(to) {
+            Some(now) => moved.push(now),
+            None => return Ok(false),
+        }
+    }
+    binding.verify_storage()?;
+    let c = open_durable_connection(&binding.database)?;
+    c.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| e.to_string())?;
+    let rollback = |c: &Connection| {
+        let _ = c.execute_batch("ROLLBACK");
+        Ok(false)
+    };
+    binding.verify_storage()?;
+    let stored: Option<Vec<u8>> = c
+        .query_row(
+            "SELECT facts_json FROM library_dat_identities WHERE id=?1 AND archive_id=?2",
+            params![carry.row, binding.archive],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(stored) = stored else {
+        return rollback(&c);
+    };
+    let Ok(mut facts) = serde_json::from_slice::<serde_json::Value>(&stored) else {
+        return rollback(&c);
+    };
+    let Some(recorded) = disc_members_of(&facts) else {
+        return rollback(&c);
+    };
+    // Still the check this move began from, and nothing changed since the
+    // files were read again.
+    if !records_members_at(&recorded, carry, &moves)
+        || !moved.iter().all(|now| {
+            fs::symlink_metadata(&now.path).is_ok_and(|m| m.is_file()) && now.still_current()
+        })
+    {
+        return rollback(&c);
+    }
+    let sheet_from = &moves[0].0;
+    let audit_is_sheet = facts
+        .get("audit_file")
+        .and_then(|value| {
+            serde_json::from_value::<crate::identity_source::hashing::FileFingerprint>(
+                value.clone(),
+            )
+            .ok()
+        })
+        .is_some_and(|audit| audit.path == *sheet_from);
+    if audit_is_sheet {
+        facts["audit_file"] = serde_json::to_value(&moved[0]).map_err(|e| e.to_string())?;
+    }
+    facts["disc_members"] = serde_json::to_value(&moved).map_err(|e| e.to_string())?;
+    let updated = serde_json::to_vec(&facts).map_err(|e| e.to_string())?;
+    let n = c
+        .execute(
+            "UPDATE library_dat_identities SET facts_json=?1 WHERE id=?2 AND facts_json=?3",
+            params![updated, carry.row, stored],
+        )
+        .map_err(|e| e.to_string())?;
+    if n != 1 || binding.verify_storage().is_err() {
+        return rollback(&c);
+    }
+    c.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 impl Binding {
@@ -114,6 +629,53 @@ fn row_ids(
         .collect::<std::result::Result<_, _>>()
         .map_err(|e| e.to_string())
 }
+/// Every archive row's id by its stored absolute path, read once for one
+/// [`bind`] call (the path column has no index, so a query per entry scanned
+/// the whole table each time). Same answers as
+/// `row_ids(c, "archives", "absolute_path_cached", path)`: only BLOB values
+/// can equal the BLOB parameter, and each path's ids are in id order. Never
+/// kept beyond the call; Apply, Undo and recovery query the table directly.
+struct ArchivePaths {
+    ids: std::collections::HashMap<Vec<u8>, Vec<i64>>,
+}
+
+impl ArchivePaths {
+    fn read(c: &Connection) -> std::result::Result<Self, String> {
+        let mut stmt = c
+            .prepare(
+                "SELECT id, absolute_path_cached FROM archives \
+                 WHERE typeof(absolute_path_cached) = 'blob' ORDER BY id",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+        let mut ids: std::collections::HashMap<Vec<u8>, Vec<i64>> =
+            std::collections::HashMap::new();
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let id: i64 = row.get(0).map_err(|e| e.to_string())?;
+            let path: Vec<u8> = row.get(1).map_err(|e| e.to_string())?;
+            ids.entry(path).or_default().push(id);
+        }
+        Ok(Self { ids })
+    }
+
+    fn row_ids(&self, path: &[u8]) -> Vec<i64> {
+        self.ids.get(path).cloned().unwrap_or_default()
+    }
+}
+
+/// Archive ids at `path`: from the per-bind lookup when one is given,
+/// otherwise straight from the table.
+fn archive_ids(
+    c: &Connection,
+    paths: Option<&ArchivePaths>,
+    path: &[u8],
+) -> std::result::Result<Vec<i64>, String> {
+    match paths {
+        Some(paths) => Ok(paths.row_ids(path)),
+        None => row_ids(c, "archives", "absolute_path_cached", path),
+    }
+}
+
 fn fingerprint(c: &Connection, a: &Association) -> std::result::Result<bool, String> {
     c.query_row("SELECT EXISTS(SELECT 1 FROM scan_fingerprints WHERE source_folder_id=?1 AND relative_path=?2)", params![a.folder, a.relative], |r| r.get(0)).map_err(|e| e.to_string())
 }
@@ -214,6 +776,7 @@ pub(crate) fn bind(
     let path = fs::canonicalize(database.path()).map_err(|e| e.to_string())?;
     let meta = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
     let c = &database.connection;
+    let paths = ArchivePaths::read(c)?;
     let mut bindings = Vec::new();
     for entry in &transaction.entries {
         if entry.unknown.contains_key(KEY) {
@@ -223,15 +786,38 @@ pub(crate) fn bind(
             bindings.push(None);
             continue;
         }
+        // Reorganise existing links: a link object with no library row at
+        // either path (the game's row is its target, which never moves) has
+        // no catalogue path to change, and need not sit in a library folder.
+        if entry.unknown.contains_key(UNCATALOGUED_KEY)
+            && entry.identity.kind == crate::dat::rename_apply::model::ObjectKind::Symlink
+            && row_ids(
+                c,
+                "archives",
+                "absolute_path_cached",
+                entry.source_path.as_os_str().as_bytes(),
+            )?
+            .is_empty()
+            && row_ids(
+                c,
+                "archives",
+                "absolute_path_cached",
+                entry.destination_path.as_os_str().as_bytes(),
+            )?
+            .is_empty()
+        {
+            bindings.push(None);
+            continue;
+        }
         let old = association(c, &entry.source_path)?;
         let new = association(c, &entry.destination_path)?;
-        let ids = row_ids(c, "archives", "absolute_path_cached", &old.absolute)?;
+        let ids = paths.row_ids(&old.absolute);
         // A set's track or disc file with no library row of its own moves
         // with its set and has no catalogue path to change.
         let companion = entry.unknown.contains_key(COMPANION_KEY)
             || entry.unknown.contains_key(UNCATALOGUED_KEY);
         if companion && ids.is_empty() {
-            if !row_ids(c, "archives", "absolute_path_cached", &new.absolute)?.is_empty() {
+            if !paths.row_ids(&new.absolute).is_empty() {
                 return Err("catalogue absolute path collision".into());
             }
             bindings.push(None);
@@ -284,12 +870,14 @@ pub(crate) fn bind(
             inode: meta.ino(),
             archive: ids[0],
             fingerprint: fingerprint(c, &old)?,
+            proofs: carried_proofs(c, ids[0], entry)?,
+            disc_sets: disc_set_proofs(c, ids[0], entry, &transaction.entries)?,
             old,
             new,
             projections,
             platform,
         };
-        let guard = CatalogueMove::validate(binding.clone(), entry)?;
+        let guard = CatalogueMove::validate(binding.clone(), entry, &paths)?;
         drop(guard);
         bindings.push(Some(
             serde_json::to_value(binding).map_err(|e| e.to_string())?,
@@ -308,6 +896,9 @@ pub(crate) struct CatalogueMove {
     binding: Binding,
     reverse: bool,
     already: bool,
+    /// The bound checks still unchanged at the path being renamed when this
+    /// move began (never in recovery): the only ones commit may carry.
+    carry: Vec<ProofCarry>,
 }
 impl Drop for CatalogueMove {
     fn drop(&mut self) {
@@ -321,14 +912,21 @@ impl CatalogueMove {
         reverse: bool,
         recovery: bool,
     ) -> std::result::Result<Self, String> {
-        Self::open_with(b, entry, reverse, recovery, true)
+        Self::open_with(b, entry, reverse, recovery, true, None)
     }
 
     /// The same checks as [`Self::open`], on a read-only connection in a
     /// deferred (read) transaction: preview validation takes no write lock
     /// on the catalogue. The result cannot commit.
-    fn validate(b: Binding, entry: &TransactionEntry) -> std::result::Result<Self, String> {
-        Self::open_with(b, entry, false, false, false)
+    ///
+    /// `paths` is the calling [`bind`]'s one-pass archive path lookup, used
+    /// for the archive path checks instead of a table scan per entry.
+    fn validate(
+        b: Binding,
+        entry: &TransactionEntry,
+        paths: &ArchivePaths,
+    ) -> std::result::Result<Self, String> {
+        Self::open_with(b, entry, false, false, false, Some(paths))
     }
 
     fn open_with(
@@ -337,6 +935,7 @@ impl CatalogueMove {
         reverse: bool,
         recovery: bool,
         write: bool,
+        paths: Option<&ArchivePaths>,
     ) -> std::result::Result<Self, String> {
         if b.old.absolute != entry.source_path.as_os_str().as_bytes()
             || b.new.absolute != entry.destination_path.as_os_str().as_bytes()
@@ -404,8 +1003,8 @@ impl CatalogueMove {
             return Err("catalogue association changed; manual review required".into());
         }
         let (at, free) = if already { (to, from) } else { (from, to) };
-        if row_ids(&c, "archives", "absolute_path_cached", &at.absolute)? != vec![b.archive]
-            || !row_ids(&c, "archives", "absolute_path_cached", &free.absolute)?.is_empty()
+        if archive_ids(&c, paths, &at.absolute)? != vec![b.archive]
+            || !archive_ids(&c, paths, &free.absolute)?.is_empty()
         {
             return Err("catalogue absolute path collision".into());
         }
@@ -448,11 +1047,19 @@ impl CatalogueMove {
             // still roll back. Make it durable before anyone records it.
             persist_visible_state(&b.database)?;
         }
+        // Catalogue checks move only with a move that starts now, from a
+        // check that is still unchanged for this object at its path.
+        let carry = if write && !recovery {
+            current_checks(&c, &b, from)?
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             connection: c,
             binding: b,
             reverse,
             already,
+            carry,
         })
     }
     /// Whether recovery found the row already at the move's target.
@@ -488,6 +1095,9 @@ impl CatalogueMove {
             if let Some(change) = &b.platform {
                 self.commit_platform(change, to)?;
             }
+            for carry in &self.carry {
+                self.carry_proof(carry, from, to)?;
+            }
             for (i, (t, p)) in PROJECTIONS.iter().enumerate() {
                 for id in &b.projections[i] {
                     let n = self
@@ -511,7 +1121,88 @@ impl CatalogueMove {
     }
 }
 
+/// The bound checks whose row still records this object at `from` and is
+/// unchanged there now (device, inode, size, modification and change time).
+fn current_checks(
+    c: &Connection,
+    b: &Binding,
+    from: &Association,
+) -> std::result::Result<Vec<ProofCarry>, String> {
+    use crate::dat::library_identity_summary::DiscFileState;
+    let from_path = Path::new(OsStr::from_bytes(&from.absolute));
+    let mut current = Vec::new();
+    for carry in &b.proofs {
+        let stored: Option<Vec<u8>> = c
+            .query_row(
+                "SELECT facts_json FROM library_dat_identities WHERE id=?1 AND archive_id=?2",
+                params![carry.row, b.archive],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(facts) = stored.and_then(|s| serde_json::from_slice(&s).ok()) else {
+            continue;
+        };
+        if carry
+            .recorded(&facts, from_path)
+            .is_some_and(|proof| DiscFileState::of(&proof) == DiscFileState::Unchanged)
+        {
+            current.push(carry.clone());
+        }
+    }
+    Ok(current)
+}
+
 impl CatalogueMove {
+    /// Re-points one bound catalogue check from `from` to `to`, in this
+    /// commit. Skipped (the check stays where it was and the game is checked
+    /// again later) unless the row still records this object at `from` and
+    /// the renamed file at `to` is that same object with the same content
+    /// (read in full again), unchanged apart from the change time a rename
+    /// sets. Compare-and-swap on the stored facts.
+    fn carry_proof(
+        &self,
+        carry: &ProofCarry,
+        from: &Association,
+        to: &Association,
+    ) -> std::result::Result<(), String> {
+        let c = &self.connection;
+        let stored: Option<Vec<u8>> = c
+            .query_row(
+                "SELECT facts_json FROM library_dat_identities WHERE id=?1 AND archive_id=?2",
+                params![carry.row, self.binding.archive],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(stored) = stored else {
+            return Ok(());
+        };
+        let Ok(mut facts) = serde_json::from_slice::<serde_json::Value>(&stored) else {
+            return Ok(());
+        };
+        let from_path = Path::new(OsStr::from_bytes(&from.absolute));
+        let to_path = Path::new(OsStr::from_bytes(&to.absolute));
+        if carry.recorded(&facts, from_path).is_none() {
+            return Ok(());
+        }
+        let Some(now) = carry.verified_at(to_path) else {
+            return Ok(());
+        };
+        facts["audit_file"] = serde_json::to_value(&now).map_err(|e| e.to_string())?;
+        let updated = serde_json::to_vec(&facts).map_err(|e| e.to_string())?;
+        let n = c
+            .execute(
+                "UPDATE library_dat_identities SET facts_json=?1 WHERE id=?2 AND facts_json=?3",
+                params![updated, carry.row, stored],
+            )
+            .map_err(|e| e.to_string())?;
+        if n != 1 {
+            return Err("catalogue check compare-and-swap failed".into());
+        }
+        Ok(())
+    }
+
     fn commit_platform(
         &self,
         change: &PlatformChange,
@@ -590,6 +1281,50 @@ pub(crate) fn begin(
     let binding = serde_json::from_value(value.clone())
         .map_err(|e| format!("invalid catalogue binding: {e}"))?;
     CatalogueMove::open(binding, entry, reverse, recovery).map(Some)
+}
+
+/// Advanced Protection: the saved checks of `entry` still current for the
+/// file at the path it is about to leave (read-only), taken under the
+/// catalogue hold just before its engine moves the file. Only these may
+/// follow it ([`begin_protected`]).
+pub(crate) fn current_protected_checks(entry: &TransactionEntry, reverse: bool) -> Vec<i64> {
+    let Some(value) = entry.unknown.get(KEY) else {
+        return Vec::new();
+    };
+    let Ok(binding) = serde_json::from_value::<Binding>(value.clone()) else {
+        return Vec::new();
+    };
+    if binding.verify_storage().is_err() {
+        return Vec::new();
+    }
+    let Ok(c) = open_read_only_connection(&binding.database) else {
+        return Vec::new();
+    };
+    let from = if reverse { &binding.new } else { &binding.old };
+    current_checks(&c, &binding, from)
+        .map(|checks| checks.iter().map(|carry| carry.row).collect())
+        .unwrap_or_default()
+}
+
+/// [`begin`] after Advanced Protection's engine has moved the file: the same
+/// sealed checks, carrying only the checks that were current just before the
+/// move (`checked`); each is still read in full again at its new place.
+pub(crate) fn begin_protected(
+    entry: &TransactionEntry,
+    reverse: bool,
+    checked: &[i64],
+) -> std::result::Result<Option<CatalogueMove>, String> {
+    let Some(mut change) = begin(entry, reverse, false)? else {
+        return Ok(None);
+    };
+    change.carry = change
+        .binding
+        .proofs
+        .iter()
+        .filter(|carry| checked.contains(&carry.row))
+        .cloned()
+        .collect();
+    Ok(Some(change))
 }
 
 /// A read-only catalogue connection for validation (no write lock, no
@@ -764,6 +1499,27 @@ pub(crate) fn validate_bound(
     let path = fs::canonicalize(database.path()).map_err(|e| e.to_string())?;
     for entry in &transaction.entries {
         if !matches!(entry.operation, TransactionOperation::RenameMove) {
+            continue;
+        }
+        // Reorganise existing links only (a link object): other workflows'
+        // uncatalogued moves keep their previous handling below.
+        if entry.unknown.contains_key(UNCATALOGUED_KEY)
+            && !entry.unknown.contains_key(KEY)
+            && entry.identity.kind == crate::dat::rename_apply::model::ObjectKind::Symlink
+        {
+            // Uncatalogued means no library row at either path; one that
+            // appeared since the preview must not be left pointing at a path
+            // this move empties or fills.
+            let c = &database.connection;
+            for path in [&entry.source_path, &entry.destination_path] {
+                let absolute = path.as_os_str().as_bytes();
+                if !row_ids(c, "archives", "absolute_path_cached", absolute)?.is_empty() {
+                    return Err(format!(
+                        "{} now has a library entry, so it is no longer an uncatalogued move; regenerate the preview",
+                        path.display()
+                    ));
+                }
+            }
             continue;
         }
         if (entry.unknown.contains_key(COMPANION_KEY)
@@ -953,4 +1709,148 @@ pub(crate) fn folder_rows_moved(
     } else {
         None
     })
+}
+
+/// The enabled, registered source folders, as stored (read-only). Used as
+/// the approved folders an existing link's game file must be inside.
+pub(crate) fn enabled_source_roots(
+    database: &Database,
+) -> std::result::Result<Vec<PathBuf>, String> {
+    let mut stmt = database
+        .connection
+        .prepare("SELECT path FROM source_folders WHERE removed_from_config_at IS NULL AND NOT EXISTS(SELECT 1 FROM source_enablement e WHERE e.source_folder_id=source_folders.id AND e.enabled=0)")
+        .map_err(|e| e.to_string())?;
+    let roots = stmt
+        .query_map([], |r| Ok(PathBuf::from(OsString::from_vec(r.get(0)?))))
+        .map_err(|e| e.to_string())?;
+    roots.map(|root| root.map_err(|e| e.to_string())).collect()
+}
+
+#[cfg(test)]
+mod carried_check_tests {
+    use super::*;
+
+    fn carry_for(path: &Path) -> ProofCarry {
+        let identity = crate::dat::rename_apply::identity::capture_identity(path).unwrap();
+        let freshness = identity.freshness.unwrap();
+        let modified = freshness
+            .modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        ProofCarry {
+            row: 1,
+            device: identity.dev,
+            inode: identity.ino,
+            size_bytes: identity.size_bytes,
+            modified_unix_seconds: identity.modified_unix,
+            modified_nanoseconds: i64::from(modified.subsec_nanos()),
+            sha256: hex_of(&freshness.sha256),
+        }
+    }
+
+    #[test]
+    fn only_the_same_object_with_the_same_content_is_verified() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game.bin");
+        std::fs::write(&game, b"verified contents").unwrap();
+        let carry = carry_for(&game);
+        let seen = carry.verified_at(&game).expect("the same file verifies");
+        assert_eq!(seen.path, game);
+
+        // A link in its place (even to the very file) is never followed.
+        let link = temp.path().join("link.bin");
+        std::os::unix::fs::symlink(&game, &link).unwrap();
+        assert!(carry.verified_at(&link).is_none());
+
+        // A copy with identical content is another object.
+        let copy = temp.path().join("copy.bin");
+        std::fs::copy(&game, &copy).unwrap();
+        assert!(carry.verified_at(&copy).is_none());
+
+        // Same object, same size and modification time, other content.
+        let modified = std::fs::metadata(&game).unwrap().modified().unwrap();
+        std::fs::write(&game, b"VERIFIED contents").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&game)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert!(carry.verified_at(&game).is_none());
+
+        // Missing.
+        assert!(carry.verified_at(&temp.path().join("gone.bin")).is_none());
+    }
+}
+
+#[path = "organisation_paths_reattest.rs"]
+pub(crate) mod reattest;
+
+#[cfg(test)]
+mod archive_paths_tests {
+    use super::{ArchivePaths, archive_ids, row_ids};
+    use rusqlite::{Connection, params};
+
+    #[test]
+    fn the_one_pass_lookup_answers_exactly_as_the_path_query() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE archives (id INTEGER PRIMARY KEY, absolute_path_cached BLOB)",
+        )
+        .unwrap();
+        let blob = |id: i64, path: &str| {
+            c.execute(
+                "INSERT INTO archives (id, absolute_path_cached) VALUES (?1, ?2)",
+                params![id, path.as_bytes()],
+            )
+            .unwrap();
+        };
+        blob(5, "/games/a.nes");
+        blob(9, "/games/shared.nes"); // two rows, inserted out of id order
+        blob(3, "/games/shared.nes");
+        blob(7, "/games/caf\u{e9}.nes");
+        // Stored as TEXT or NULL: a BLOB parameter never equals these.
+        c.execute(
+            "INSERT INTO archives (id, absolute_path_cached) VALUES (11, '/games/text.nes')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO archives (id, absolute_path_cached) VALUES (12, NULL)",
+            [],
+        )
+        .unwrap();
+        let mut odd = b"/games/".to_vec();
+        odd.extend_from_slice(&[0xff, 0xfe, b'.', b'n']);
+        c.execute(
+            "INSERT INTO archives (id, absolute_path_cached) VALUES (13, ?1)",
+            params![odd],
+        )
+        .unwrap();
+
+        let paths = ArchivePaths::read(&c).unwrap();
+        let probes: Vec<Vec<u8>> = vec![
+            b"/games/a.nes".to_vec(),
+            b"/games/shared.nes".to_vec(),
+            "/games/caf\u{e9}.nes".as_bytes().to_vec(),
+            b"/games/text.nes".to_vec(),
+            b"/games/missing.nes".to_vec(),
+            b"/games/A.nes".to_vec(),
+            b"".to_vec(),
+            odd,
+        ];
+        for probe in &probes {
+            let queried = row_ids(&c, "archives", "absolute_path_cached", probe).unwrap();
+            assert_eq!(
+                paths.row_ids(probe),
+                queried,
+                "{}",
+                String::from_utf8_lossy(probe)
+            );
+            assert_eq!(archive_ids(&c, Some(&paths), probe).unwrap(), queried);
+            assert_eq!(archive_ids(&c, None, probe).unwrap(), queried);
+        }
+        assert_eq!(paths.row_ids(b"/games/shared.nes"), vec![3, 9]);
+        assert!(paths.row_ids(b"/games/text.nes").is_empty());
+    }
 }

@@ -143,6 +143,47 @@ impl VerifiedGameFixture {
         })
     }
 
+    /// Several synthetic games, each listed in the catalogue under its own
+    /// DAT file name (which may differ from the file's name, so a verified
+    /// rename has somewhere to go), plus files the catalogue does not list.
+    /// Same production scan, DAT verification and persistence as
+    /// [`build_at`](Self::build_at); `rom_path` is the first listed game.
+    /// Test-support only.
+    pub fn build_at_with_listed_games(
+        root: &Path,
+        listed: &[(&str, &[u8], &str)],
+        unlisted: &[(&str, &[u8])],
+    ) -> Result<Self, String> {
+        let ((first, first_bytes, _), rest) = listed
+            .split_first()
+            .ok_or("at least one listed game is needed")?;
+        let mut files: Vec<(&str, &[u8])> = rest.iter().map(|(f, b, _)| (*f, *b)).collect();
+        files.extend(unlisted.iter().copied());
+        let mut games = String::new();
+        for (_, bytes, dat_name) in listed {
+            let hashes = hashes_of(bytes)?;
+            let game = dat_name
+                .rsplit_once('.')
+                .map_or(*dat_name, |(game, _)| game);
+            games.push_str(&format!(
+                "<game name=\"{game}\"><description>{game}</description>\
+                 <rom name=\"{dat_name}\" size=\"{}\" crc=\"{}\" md5=\"{}\" sha1=\"{}\"/></game>",
+                bytes.len(),
+                hashes.crc32,
+                hashes.md5,
+                hashes.sha1
+            ));
+        }
+        Self::build_profile(root, first, first_bytes, &files, move |_| {
+            Ok(format!(
+                "<?xml version=\"1.0\"?>\n<!DOCTYPE datafile PUBLIC \"-//Logiqx//DTD ROM Management Datafile//EN\" \"http://www.logiqx.com/Dats/datafile.dtd\">\n\
+                 <datafile><header><name>{DAT_PLATFORM}</name><description>{DAT_PLATFORM} (EmuWiz fixture)</description>\
+                 <version>20261021-000000</version><author>EmuWiz fixture</author><homepage>No-Intro</homepage></header>\
+                 {games}</datafile>\n"
+            ))
+        })
+    }
+
     fn build_with(
         root: &Path,
         catalogue: impl FnOnce(&[u8]) -> Result<String, String>,

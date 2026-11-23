@@ -3,6 +3,16 @@ mod backend;
 mod copy;
 mod view;
 use backend::{Helper, Info, Preview, Review, Selection};
+
+/// Test seam: Advanced Protection's own validation (the call its prepare,
+/// apply and review steps make) on a selection, with nothing signed or run.
+#[cfg(test)]
+pub(crate) fn validate_selection_for_test(
+    plan: archivefs_core::dat::rom_organisation::OrganisationPlan,
+    approved: std::collections::BTreeSet<String>,
+) -> Result<archivefs_core::dat::rename_apply::model::RenameTransaction, String> {
+    Selection { plan, approved }.validate()
+}
 use eframe::egui;
 use serde_json::Value;
 use std::{
@@ -41,6 +51,9 @@ pub(super) struct State {
     preview_confirm: bool,
     action_confirm: bool,
     reuse_confirm: bool,
+    /// Set when an Apply or Undo ran: the page refreshes its game list.
+    pub(super) refresh_list: bool,
+    release_confirm: bool,
 }
 impl State {
     pub(super) fn can_choose_standard(&self) -> bool {
@@ -67,6 +80,7 @@ impl State {
         self.preview_confirm = false;
         self.action_confirm = false;
         self.reuse_confirm = false;
+        self.release_confirm = false;
         let (tx, rx) = mpsc::channel();
         self.job = Some(Job {
             receiver: rx,
@@ -89,7 +103,7 @@ impl State {
         match r {
             Err(e) => {
                 self.needs_refresh = self.info.is_some();
-                self.message = e;
+                self.message = copy::explain_refusal(&e, self.root.as_deref());
                 self.preview = None;
                 self.review = None;
                 self.reuse = None;
@@ -128,6 +142,7 @@ impl State {
                         self.review = Some(r);
                     }
                     ResultValue::Executed(v, i) => {
+                        self.refresh_list = true;
                         self.result = Some(v);
                         self.info = Some(i);
                         self.review = None;
@@ -206,7 +221,25 @@ impl State {
 #[cfg(test)]
 mod tests;
 
+/// Owner 2026-11-23: Advanced Protection is deferred for this release. New
+/// operations are not offered; an operation it already started (enrolled
+/// and not released) still opens here, and History always shows its
+/// records, so nothing it holds is hidden.
+pub(super) const OFFERED_IN_THIS_RELEASE: bool = false;
+
+/// Whether the Advanced Protection choice is shown for these files.
+pub(super) fn offered(can_standard: bool) -> bool {
+    OFFERED_IN_THIS_RELEASE || !can_standard
+}
+
 pub(super) fn choice(ui: &mut egui::Ui, selected: &mut bool, busy: bool, can_standard: bool) {
+    if !offered(can_standard) {
+        if !busy {
+            *selected = false;
+        }
+        ui.label(copy::DEFERRED);
+        return;
+    }
     ui.horizontal_wrapped(|ui| {
         ui.add_enabled_ui(!busy && can_standard, |ui| {
             ui.radio_value(selected, false, copy::STANDARD);
@@ -219,6 +252,7 @@ pub(super) fn choice(ui: &mut egui::Ui, selected: &mut bool, busy: bool, can_sta
         ui.label(copy::COMPARISON);
         ui.label(copy::SCOPE);
         ui.label(copy::LIMITS);
+        ui.label(copy::DISK_SPACE);
         ui.label(copy::BENCHMARKS);
     });
     if !can_standard {
