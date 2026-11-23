@@ -591,13 +591,37 @@ knows, the identity the code derives from that real UUID with the identity that
 filesystem reports. On the development machine all 16 mounted entries agreed. It
 checks nothing where no such filesystem is visible, and it never writes.
 
-**4. A real ext4 disk, end to end: NOT YET RUN.** Accepting a real disk by its real
-UUID, refusing the same commands once it is unmounted (with and without a
-same-named folder underneath) or replaced by another ext4 disk, the same through
-Blue's storage steps, and a mount change during a batch and during a write, need
-ext4 filesystems that are really mounted, which needs root. The harness is written
-and awaits approval. Until it has passed, the link between the UUID check and a real
-disk is unverified beyond points 2 and 3.
+**4. A real ext4 disk, end to end (2026-11-23, commit 1b24288d).** Three disposable
+ext4 filesystems in image files (two different ones, and a block copy of the first,
+so with the same UUID) were attached as loop devices and mounted in a private mount
+namespace, with EmuWiz run as the ordinary user on a scratch profile. The UUIDs were
+read with `blkid` and `dumpe2fs`, and the identity expected for each was worked out
+by the harness, not by EmuWiz.
+
+- Automated run, 120 checks, none failed. Each filesystem reported the identity of
+  its UUID. With the right UUID, `storage --set`, `--store`, the environment
+  variables and Blue's storage steps accepted the folder and games were prepared on
+  that disk. With no UUID or the other disk's UUID they refused, and the disk's
+  contents were identical before and after. With the disk unmounted (nothing
+  underneath, then same-named folders underneath holding a store's folders and an
+  old binding file) and with the other disk mounted at the path, every route
+  refused and what was there stayed byte for byte as it was. With the copy mounted
+  beside the original, every route refused because two connected disks report the
+  identity. A mount change during a batch and during a write ended the command
+  without success and wrote nothing to the other disk; work resumed once the disk
+  was back.
+- Blue itself, by hand on a private display, in six mount states: the other disk's
+  UUID was visibly refused and "Use this folder" stayed disabled; the right disk
+  was accepted and saved with its UUID only after confirming; with the disk absent,
+  with the other disk at the path, and with the copy connected, the check was
+  visibly refused, nothing was created, and the saved choice did not change; with
+  the disk back it was accepted again. Screenshots and before/after listings of
+  each state are kept with the run's logs.
+
+Not shown by this run: a disk that is successfully unmounted while a command is
+writing to it. Both times the kernel refused the plain unmount because the disk was
+in use, and the change made instead was another disk mounted over the path. The
+checks 2 and 3 above and this run used one machine, one kernel (6.8) and ext4 only.
 
 Earlier runs with real mounts (2026-11-22), made on the design before this one, in
 which the disk was remembered from the path and a tmpfs stood in for the disk. The
