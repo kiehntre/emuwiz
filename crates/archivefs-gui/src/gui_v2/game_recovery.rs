@@ -1460,6 +1460,34 @@ fn disk_line(disk: &recovery::disk_identity::MountedDisk) -> String {
     )
 }
 
+/// Where copies are kept now, in one line. When the saved folder cannot be
+/// used there is no place to name: the reason is in the message above.
+fn now_line(view: &StorageView) -> String {
+    if view.current.as_os_str().is_empty() {
+        return "Now: nowhere. The folder you chose cannot be used at the moment (see above)."
+            .to_string();
+    }
+    format!(
+        "Now: {}{}. Free there: {}.",
+        view.current.display(),
+        if view.chosen {
+            " (your choice)"
+        } else {
+            " (EmuWiz's own data folder)"
+        },
+        view.available.map_or("unknown".to_string(), human_bytes)
+    )
+}
+
+/// The result of the last check is about the disk and folder that were
+/// checked. Once either box changes it says nothing about what is typed now,
+/// so it is no longer shown.
+fn forget_check(view: &mut Option<StorageView>) {
+    if let Some(view) = view {
+        view.checked = None;
+    }
+}
+
 fn show_storage(ui: &mut egui::Ui, state: &mut State) {
     let idle = state.job.is_none();
     let mut job: Option<(Option<FolderOnDisk>, Option<Option<FolderOnDisk>>)> = None;
@@ -1482,12 +1510,7 @@ fn show_storage(ui: &mut egui::Ui, state: &mut State) {
                             if *ok { StatusTone::Success } else { StatusTone::Blocked },
                         );
                     }
-                    ui.label(format!(
-                        "Now: {}{}. Free there: {}.",
-                        view.current.display(),
-                        if view.chosen { " (your choice)" } else { " (EmuWiz's own data folder)" },
-                        view.available.map_or("unknown".to_string(), human_bytes)
-                    ));
+                    ui.label(now_line(view));
                     if let Some(check) = &view.checked {
                         if check.usable() {
                             banner(
@@ -1528,20 +1551,32 @@ fn show_storage(ui: &mut egui::Ui, state: &mut State) {
                     .radio(chosen, disk_line(disk))
                     .on_hover_text(format!("Filesystem UUID {}", disk.uuid))
                     .clicked()
+                    && !chosen
                 {
                     state.storage_filesystem = disk.uuid.clone();
+                    forget_check(&mut state.storage);
                 }
             }
             ui.horizontal(|ui| {
                 ui.label("Disk (filesystem UUID):");
-                ui.text_edit_singleline(&mut state.storage_filesystem)
+                if ui
+                    .text_edit_singleline(&mut state.storage_filesystem)
                     .on_hover_text(
                         "Filled in when you choose a disk above. You can also type the UUID that `lsblk -f` shows for the disk.",
-                    );
+                    )
+                    .changed()
+                {
+                    forget_check(&mut state.storage);
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("Folder on that disk:");
-                ui.text_edit_singleline(&mut state.storage_folder);
+                if ui
+                    .text_edit_singleline(&mut state.storage_folder)
+                    .changed()
+                {
+                    forget_check(&mut state.storage);
+                }
             });
             let typed: FolderOnDisk = (
                 PathBuf::from(state.storage_folder.trim()),
@@ -1661,6 +1696,28 @@ mod storage_card_tests {
         found
     }
 
+    /// Whether the temporary folder is on ext4. EmuWiz accepts a store
+    /// folder outside its own data folder only on ext4, so a test that needs
+    /// an accepted folder cannot run on overlayfs, tmpfs and the like: it
+    /// says so and is skipped (it runs on the CI runners, which are ext4).
+    fn temp_on_ext4_or_skip(test: &str) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let folder = std::env::temp_dir();
+        let name = std::ffi::CString::new(folder.as_os_str().as_bytes()).unwrap();
+        // SAFETY: zeroed is a valid initial value for this plain C struct,
+        // `name` is NUL-terminated and `stats` is writable and sized.
+        let mut stats: libc::statfs = unsafe { std::mem::zeroed() };
+        let on_ext4 = unsafe { libc::statfs(name.as_ptr(), &mut stats) } == 0
+            && stats.f_type == libc::EXT4_SUPER_MAGIC;
+        if !on_ext4 {
+            eprintln!(
+                "SKIPPED {test}: the temporary folder {} is not on ext4, so there is no folder EmuWiz would accept",
+                folder.display()
+            );
+        }
+        on_ext4
+    }
+
     fn view(checked: Option<recovery::storage::StorageCheck>) -> StorageView {
         StorageView {
             current: PathBuf::new(),
@@ -1678,6 +1735,11 @@ mod storage_card_tests {
     /// or not a folder of the same name exists there.
     #[test]
     fn choosing_a_folder_for_an_absent_disk_writes_nothing_and_saves_nothing() {
+        if !temp_on_ext4_or_skip(
+            "choosing_a_folder_for_an_absent_disk_writes_nothing_and_saves_nothing",
+        ) {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let setting = root.join("config/prepared_media_folder.txt");
@@ -1756,6 +1818,9 @@ mod storage_card_tests {
     /// the named UUID is saved with the choice.
     #[test]
     fn a_folder_on_the_named_disk_is_checked_confirmed_and_saved() {
+        if !temp_on_ext4_or_skip("a_folder_on_the_named_disk_is_checked_confirmed_and_saved") {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let setting = root.join("config/prepared_media_folder.txt");
@@ -1862,6 +1927,39 @@ mod storage_card_tests {
             }
             other => panic!("EMUWIZ_ACCEPT_EXPECT must be accepted or refused, not {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_card_says_plainly_when_the_saved_folder_cannot_be_used() {
+        let mut shown = view(None);
+        shown.current = PathBuf::from("/data/prepared-media");
+        assert_eq!(
+            now_line(&shown),
+            "Now: /data/prepared-media (EmuWiz's own data folder). Free there: unknown."
+        );
+        shown.current = PathBuf::new();
+        shown.chosen = true;
+        assert_eq!(
+            now_line(&shown),
+            "Now: nowhere. The folder you chose cannot be used at the moment (see above)."
+        );
+    }
+
+    #[test]
+    fn an_earlier_check_is_not_shown_for_a_changed_disk_or_folder() {
+        let folder = PathBuf::from("/mnt/disk/prepared");
+        let checked = recovery::storage::check_folder(&folder, &[], None);
+        let mut shown = Some(view(Some(checked)));
+        assert!(shown.as_ref().unwrap().checked.is_some());
+        forget_check(&mut shown);
+        assert!(shown.as_ref().unwrap().checked.is_none());
+        // And with it gone the folder cannot be used until checked again.
+        assert!(!may_use_folder(
+            shown.as_ref(),
+            "/mnt/disk/prepared",
+            "",
+            true
+        ));
     }
 
     #[test]
