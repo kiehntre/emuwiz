@@ -324,3 +324,29 @@ fn blue_says_a_deleted_protected_game_may_not_free_its_space() {
     assert!(text.contains("Undo releases it"));
     assert!(text.contains("Never delete these recovery folders by hand"));
 }
+
+/// Owner 2026-11-23: Advanced Protection is deferred. New operations are not
+/// offered, the choice snaps back to Standard Rename, and an operation it
+/// already started (Standard not allowed for those files) still opens.
+#[test]
+fn advanced_protection_is_deferred_but_started_operations_stay_reachable() {
+    assert!(!super::OFFERED_IN_THIS_RELEASE);
+    assert!(!super::offered(true));
+    assert!(super::offered(false));
+    let ctx = egui::Context::default();
+    let mut selected = true;
+    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            super::choice(ui, &mut selected, false, true);
+        });
+    });
+    assert!(!selected, "Standard Rename is used for new operations");
+    let mut started = true;
+    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            super::choice(ui, &mut started, false, false);
+        });
+    });
+    assert!(started, "an enrolled operation keeps its own panel");
+    assert!(copy::DEFERRED.contains("stays in History"));
+}

@@ -76,6 +76,25 @@ pub fn mode_changes_real_files(mode: OrganisationMode) -> bool {
     )
 }
 
+/// Link modes: the original stays put, but a linked library holds only the
+/// files it links. A disc-set file linked without its sheet (or a sheet
+/// linked under another name) gives an incomplete game, so these modes are
+/// guarded for disc sets too (owner 2026-11-23: never silently create
+/// incomplete sets).
+pub fn mode_links_files(mode: OrganisationMode) -> bool {
+    matches!(
+        mode,
+        OrganisationMode::BuildLinkedLibrary | OrganisationMode::OrganiseSymlinkOnly
+    )
+}
+
+/// Whether the bulk guard runs for this mode (preview and again at Apply).
+pub fn mode_is_guarded(mode: OrganisationMode) -> bool {
+    mode_changes_real_files(mode) || mode_links_files(mode)
+}
+
+const LINKED_DISC_SET: &str = "Linked libraries do not include disc lists (.cue, .m3u, .gdi) in this release, so linking this file on its own would give an incomplete game. Nothing will be linked for this file. Use Rename or Move for disc sets.";
+
 /// What one guard run did: how many rows it blocked and how much it read.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct GuardStats {
@@ -117,7 +136,7 @@ pub(crate) fn guard_with_index(
     mut saves: SaveSearchIndex,
 ) -> GuardStats {
     let mut stats = GuardStats::default();
-    if !mode_changes_real_files(plan.mode) {
+    if !mode_is_guarded(plan.mode) {
         return stats;
     }
     let mut sidecars = SidecarCache::default();
@@ -192,7 +211,7 @@ pub fn refuse_if_newly_blocked(
     approved: &BTreeSet<String>,
     save_locations: &RetroArchSaveLocations,
 ) -> Result<(), String> {
-    if !mode_changes_real_files(plan.mode) {
+    if !mode_is_guarded(plan.mode) {
         return Ok(());
     }
     let mut fresh = plan.clone();
@@ -241,6 +260,19 @@ fn refusal_for(
                 .then(|| plan_root.to_path_buf())
         })
         .or_else(|| source.parent().map(Path::to_path_buf))?;
+    if mode_links_files(mode) {
+        if super::disc_sets::sheet_kind(source).is_some() {
+            return Some(format!("This is a disc list. {LINKED_DISC_SET}"));
+        }
+        return match sidecars.referencing(source, &source_root, None) {
+            Err(reason) => Some(reason),
+            Ok(Some(referrer)) => Some(format!(
+                "{} names this file. {LINKED_DISC_SET}",
+                referrer.display()
+            )),
+            Ok(None) => None,
+        };
+    }
     let resolution = resolutions.for_path(source, generation);
     if let Err(reason) = refuse_arcade_set_in(folders, &resolution, &source_root) {
         return Some(reason);

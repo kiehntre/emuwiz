@@ -193,9 +193,10 @@ fn an_arcade_romset_folder_blocks_even_without_the_arcade_platform() {
 }
 
 #[test]
-fn moving_real_files_is_guarded_and_link_modes_are_left_alone() {
+fn moving_real_files_is_guarded_and_link_modes_refuse_disc_sets() {
     let mut lib = Lib::new();
     let disc = lib.game("psx", "Quest.iso", "psx");
+    let solo = lib.game("psx", "Solo.iso", "psx");
     std::fs::write(
         lib.root.join("psx").join("Quest.cue"),
         "FILE \"Quest.iso\" BINARY\n",
@@ -211,13 +212,70 @@ fn moving_real_files_is_guarded_and_link_modes_are_left_alone() {
         blocked, suggested_before,
         "every movable row with a cue is blocked"
     );
+    // Owner 2026-11-23: a linked library never gets a disc without its
+    // sheet. The disc a sheet names is refused with the reason; a game
+    // without a sheet is linked as before.
+    for mode in [
+        OrganisationMode::BuildLinkedLibrary,
+        OrganisationMode::OrganiseSymlinkOnly,
+    ] {
+        let mut linked = lib.plan(
+            mode,
+            &[(&disc, "Quest (USA).iso"), (&solo, "Solo (USA).iso")],
+        );
+        let before = statuses(&linked);
+        guard_bulk_rename_plan(&lib.db, &mut linked, &no_saves());
+        let after = statuses(&linked);
+        if before["Quest.iso"].0 == OrganisationStatus::Suggested {
+            assert_eq!(
+                after["Quest.iso"].0,
+                OrganisationStatus::Blocked,
+                "{mode:?}"
+            );
+            assert!(
+                after["Quest.iso"].1.contains("Quest.cue names this file"),
+                "{mode:?}: {}",
+                after["Quest.iso"].1
+            );
+            assert!(
+                after["Quest.iso"]
+                    .1
+                    .contains("Linked libraries do not include disc lists"),
+                "{mode:?}"
+            );
+            assert!(
+                after["Quest.iso"].1.contains("Nothing will be linked"),
+                "{mode:?}"
+            );
+        }
+        assert_eq!(
+            after["Solo.iso"], before["Solo.iso"],
+            "{mode:?}: a game without a sheet is unchanged"
+        );
+    }
+    // A linked plan must actually exercise the refusal (not only skip it).
     let mut linked = lib.plan(
         OrganisationMode::BuildLinkedLibrary,
         &[(&disc, "Quest (USA).iso")],
     );
-    let before = statuses(&linked);
-    assert_eq!(guard_bulk_rename_plan(&lib.db, &mut linked, &no_saves()), 0);
-    assert_eq!(statuses(&linked), before, "links never touch the real file");
+    assert_eq!(
+        linked.entries[0].status,
+        OrganisationStatus::Suggested,
+        "{:?}",
+        linked.entries[0].reason
+    );
+    assert_eq!(guard_bulk_rename_plan(&lib.db, &mut linked, &no_saves()), 1);
+    // A sheet that appears after a linked preview refuses that Apply.
+    let late = lib.game("psx", "Late.iso", "psx");
+    let linked = lib.plan(
+        OrganisationMode::BuildLinkedLibrary,
+        &[(&late, "Late (USA).iso")],
+    );
+    let approved = approved_suggested(&linked);
+    assert_eq!(approved.len(), 1);
+    std::fs::write(lib.root.join("psx").join("Late.m3u"), "Late.iso\n").unwrap();
+    let refused = refuse_if_newly_blocked(&lib.db, &linked, &approved, &no_saves()).unwrap_err();
+    assert!(refused.contains("Nothing was changed"), "{refused}");
 }
 
 #[test]

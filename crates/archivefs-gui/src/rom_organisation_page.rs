@@ -713,7 +713,7 @@ impl RomOrganisationPageState {
         // A bulk rename or move refuses what the one-game Rename refuses
         // (arcade sets, files a cue sheet or playlist names, games with
         // RetroArch saves): those rows become Blocked with the reason.
-        if bulk_guard::mode_changes_real_files(plan.mode) && plan.suggested().next().is_some() {
+        if bulk_guard::mode_is_guarded(plan.mode) && plan.suggested().next().is_some() {
             progress.phase("Checking disc lists, arcade sets and saves", "steps", None);
             progress.flush();
             let guarded = default_database_path()

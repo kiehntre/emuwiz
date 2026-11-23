@@ -221,7 +221,25 @@ impl State {
 #[cfg(test)]
 mod tests;
 
+/// Owner 2026-11-23: Advanced Protection is deferred for this release. New
+/// operations are not offered; an operation it already started (enrolled
+/// and not released) still opens here, and History always shows its
+/// records, so nothing it holds is hidden.
+pub(super) const OFFERED_IN_THIS_RELEASE: bool = false;
+
+/// Whether the Advanced Protection choice is shown for these files.
+pub(super) fn offered(can_standard: bool) -> bool {
+    OFFERED_IN_THIS_RELEASE || !can_standard
+}
+
 pub(super) fn choice(ui: &mut egui::Ui, selected: &mut bool, busy: bool, can_standard: bool) {
+    if !offered(can_standard) {
+        if !busy {
+            *selected = false;
+        }
+        ui.label(copy::DEFERRED);
+        return;
+    }
     ui.horizontal_wrapped(|ui| {
         ui.add_enabled_ui(!busy && can_standard, |ui| {
             ui.radio_value(selected, false, copy::STANDARD);

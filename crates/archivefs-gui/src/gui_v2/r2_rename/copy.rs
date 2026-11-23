@@ -1,5 +1,6 @@
 pub(super) const STANDARD: &str = "Standard Rename (recommended)";
 pub(super) const ADVANCED: &str = "Advanced Protection";
+pub(super) const DEFERRED: &str = "Standard Rename: reviewed preview, file identity checks before every change, never overwrites, journalled Undo from History. (Advanced Protection is not offered in this release; anything it already started stays in History.)";
 pub(super) const COMPARISON: &str = "Standard Rename keeps the existing reviewed preview, freshness checks and Undo. It is the recommended everyday choice. Advanced Protection adds durable original-file anchors, transaction-bound one-shot approval, conservative interrupted recovery and verified ownership release. Its extra checks take longer.";
 pub(super) const SCOPE: &str = "Advanced Protection eligibility: local ext4 with 4096-byte blocks; one to eight direct regular files in one folder; supported RenameMove only. Links, nested moves, other filesystems and larger batches are not supported.";
 pub(super) const LIMITS: &str = "Advanced Protection does not prevent other programs modifying files and is not resistant to complete authority-store rollback. Keep other writers away during the operation; do not restore old recovery records over live state.";
