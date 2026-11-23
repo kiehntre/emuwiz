@@ -78,6 +78,90 @@ pub(super) struct StorageView {
     /// The result of checking the folder typed into the box, if any.
     checked: Option<recovery::storage::StorageCheck>,
     message: Option<(bool, String)>,
+    /// The connected ext4 disks, for the person to say which one they mean.
+    disks: Vec<recovery::disk_identity::MountedDisk>,
+}
+
+/// A folder and the UUID of the disk the person says it is on.
+type FolderOnDisk = (PathBuf, String);
+
+/// Checks a folder for the named disk and, with `apply`, saves the choice
+/// (`Some(None)` goes back to EmuWiz's own data folder). `library` is the
+/// list of game folders, or why it could not be read: without it nothing is
+/// checked or changed. Returns the check and the message to show.
+///
+/// The disk is never taken from where the folder happens to be: without a
+/// UUID, or on any other filesystem than the one it names, nothing is
+/// created, nothing is saved, and the choice in use stays as it was.
+fn storage_action(
+    setting: &Path,
+    library: &Result<Vec<PathBuf>, String>,
+    check: Option<FolderOnDisk>,
+    apply: Option<Option<FolderOnDisk>>,
+) -> (
+    Option<recovery::storage::StorageCheck>,
+    Option<(bool, String)>,
+) {
+    use recovery::storage::{check_folder, set_folder_at};
+    let back_to_default = |library: &[PathBuf]| {
+        match set_folder_at(setting, None, library, None) {
+        Ok(_) => (
+            true,
+            "New prepared copies will be kept in EmuWiz's own data folder again. Games already prepared keep working from the folder their copies are in.".to_string(),
+        ),
+        Err(detail) => (false, format!("The folder was not changed: {detail}")),
+    }
+    };
+    match library {
+        Err(detail) => {
+            let message = if check.is_some() || apply.as_ref().is_some_and(Option::is_some) {
+                Some((
+                    false,
+                    format!("The folder was not checked or changed: {detail}."),
+                ))
+            } else if let Some(None) = &apply {
+                // Going back to the default needs no library check.
+                Some(back_to_default(&[]))
+            } else {
+                None
+            };
+            (None, message)
+        }
+        Ok(library) => {
+            let message = match &apply {
+                Some(Some((folder, uuid))) => Some(
+                    match set_folder_at(setting, Some(folder), library, Some(uuid)) {
+                        Ok(_) => (
+                            true,
+                            "New prepared copies will be kept in this folder, on the disk you named. Games already prepared keep working from the folder their copies are in.".to_string(),
+                        ),
+                        Err(detail) => (false, format!("The folder was not changed: {detail}")),
+                    },
+                ),
+                Some(None) => Some(back_to_default(library)),
+                None => None,
+            };
+            let checked = check.map(|(folder, uuid)| check_folder(&folder, library, Some(&uuid)));
+            (checked, message)
+        }
+    }
+}
+
+/// Whether "Use this folder" may be pressed: the last check passed, it was
+/// for exactly the folder and the disk now in the boxes, it verified that
+/// disk, and the person ticked the confirmation.
+fn may_use_folder(view: Option<&StorageView>, folder: &str, uuid: &str, confirmed: bool) -> bool {
+    let typed = PathBuf::from(folder.trim());
+    let named = recovery::disk_identity::ExpectedFilesystem::parse(uuid).ok();
+    confirmed
+        && view.is_some_and(|view| {
+            view.checked.as_ref().is_some_and(|check| {
+                check.usable()
+                    && check.folder == typed
+                    && check.filesystem_uuid.is_some()
+                    && check.filesystem_uuid.as_deref() == named.as_ref().map(|named| named.uuid())
+            })
+        })
 }
 
 /// The "prepare several games" part of the page.
@@ -149,6 +233,8 @@ pub(super) struct State {
     bulk: Bulk,
     storage: Option<StorageView>,
     storage_folder: String,
+    /// The UUID of the disk the folder is on, chosen from the list or typed.
+    storage_filesystem: String,
     storage_confirm: bool,
 }
 
@@ -172,6 +258,7 @@ impl Default for State {
             bulk: Bulk::default(),
             storage: None,
             storage_folder: String::new(),
+            storage_filesystem: String::new(),
             storage_confirm: false,
         }
     }
@@ -324,6 +411,7 @@ impl State {
                         chosen: false,
                         available: None,
                         checked: None,
+                        disks: Vec::new(),
                         message: Some((false, detail)),
                     });
                 }
@@ -746,57 +834,30 @@ impl State {
         self.bulk = Bulk::default();
     }
 
-    /// Reads the storage setting; with `check`, examines that folder; with
-    /// `apply`, saves it (`None` clears the choice) after it passes.
+    /// Reads the storage setting; with `check`, examines that folder for
+    /// the named disk; with `apply`, saves it (`None` clears the choice)
+    /// after it passes.
     fn storage_job(
         &mut self,
         ctx: &egui::Context,
-        check: Option<PathBuf>,
-        apply: Option<Option<PathBuf>>,
+        check: Option<FolderOnDisk>,
+        apply: Option<Option<FolderOnDisk>>,
     ) {
         self.start(ctx, "Checking the folder…", move || {
             // Without the list of game folders the "not inside a game folder"
             // check cannot be made, so nothing is checked or changed.
             let library = recovery::storage::library_folders();
-            let mut message = None;
-            let mut checked = None;
-            match &library {
-                Err(detail) => {
-                    if check.is_some() || apply.as_ref().is_some_and(Option::is_some) {
-                        message = Some((
-                            false,
-                            format!("The folder was not checked or changed: {detail}."),
-                        ));
-                    } else if let Some(None) = &apply {
-                        // Going back to the default needs no library check.
-                        message = Some(match recovery::storage::set_folder(None, &[]) {
-                            Ok(_) => (
-                                true,
-                                "Prepared copies will be kept in EmuWiz's own data folder again.".to_string(),
-                            ),
-                            Err(detail) => (false, format!("The folder was not changed: {detail}")),
-                        });
-                    }
-                }
-                Ok(library) => {
-                    if let Some(choice) = &apply {
-                        message = Some(
-                            match recovery::storage::set_folder(choice.as_deref(), library) {
-                                Ok(Some(_)) => (
-                                    true,
-                                    "New prepared copies will be kept in this folder. Games already prepared keep working from the folder their copies are in.".to_string(),
-                                ),
-                                Ok(None) => (
-                                    true,
-                                    "New prepared copies will be kept in EmuWiz's own data folder again. Games already prepared keep working from the folder their copies are in.".to_string(),
-                                ),
-                                Err(detail) => (false, format!("The folder was not changed: {detail}")),
-                            },
-                        );
-                    }
-                    checked = check.map(|folder| recovery::storage::check_folder(&folder, library, false));
-                }
-            }
+            let (checked, message) = match recovery::storage::setting_file() {
+                Ok(setting) => storage_action(&setting, &library, check, apply),
+                Err(detail) => (
+                    None,
+                    Some((
+                        false,
+                        format!("The folder was not checked or changed: {detail}."),
+                    )),
+                ),
+            };
+            let disks = recovery::disk_identity::mounted_ext4_disks();
             Outcome::Storage(match recovery::storage::describe_current() {
                 Ok((store, chosen)) => Ok(StorageView {
                     available: store.available_bytes().ok(),
@@ -804,6 +865,7 @@ impl State {
                     chosen,
                     checked,
                     message,
+                    disks,
                 }),
                 // The saved folder can no longer be used: say so, and keep
                 // "use EmuWiz's own data folder" available.
@@ -812,7 +874,11 @@ impl State {
                     current: PathBuf::new(),
                     chosen: true,
                     checked,
-                    message: message.or(Some((false, format!("The folder chosen for prepared copies cannot be used: {detail}.")))),
+                    disks,
+                    message: message.or(Some((
+                        false,
+                        format!("The folder chosen for prepared copies cannot be used: {detail}."),
+                    ))),
                 }),
             })
         });
@@ -1376,9 +1442,27 @@ fn show_bulk(
 }
 
 /// Where prepared copies are kept, and choosing another folder for them.
+/// One connected disk: its name, its filesystem UUID (what is actually
+/// chosen, and the only thing here that does not depend on where the disk
+/// happens to be mounted), where it is mounted and how much room it has.
+fn disk_line(disk: &recovery::disk_identity::MountedDisk) -> String {
+    format!(
+        "{}, UUID {}, at {} ({} free)",
+        disk.label
+            .as_deref()
+            .map_or("Disk without a name".to_string(), |label| format!(
+                "\"{label}\""
+            )),
+        disk.uuid,
+        disk.mount_point.display(),
+        disk.available_bytes
+            .map_or("unknown".to_string(), human_bytes)
+    )
+}
+
 fn show_storage(ui: &mut egui::Ui, state: &mut State) {
     let idle = state.job.is_none();
-    let mut job: Option<(Option<PathBuf>, Option<Option<PathBuf>>)> = None;
+    let mut job: Option<(Option<FolderOnDisk>, Option<Option<FolderOnDisk>>)> = None;
     let opened = egui::CollapsingHeader::new("Where prepared copies are kept")
         .id_salt("game-recovery-storage")
         .show(ui, |ui| {
@@ -1408,7 +1492,7 @@ fn show_storage(ui: &mut egui::Ui, state: &mut State) {
                         if check.usable() {
                             banner(
                                 ui,
-                                "This folder can be used",
+                                "This folder is on the disk you named and can be used",
                                 &format!(
                                     "Free there: {}. {}",
                                     check.available_bytes.map_or("unknown".to_string(), human_bytes),
@@ -1427,16 +1511,48 @@ fn show_storage(ui: &mut egui::Ui, state: &mut State) {
                     }
                 }
             }
+            // Which disk first. A folder being there does not prove the
+            // right disk is connected, so the person names the disk and the
+            // folder is then verified to be on it.
+            ui.label(
+                "To use another disk, first say which disk you mean. Only disks formatted as ext4 can be used. If your disk is not listed, it is not connected (or not ext4).",
+            );
+            let disks = state
+                .storage
+                .as_ref()
+                .map(|view| view.disks.clone())
+                .unwrap_or_default();
+            for disk in &disks {
+                let chosen = state.storage_filesystem.trim() == disk.uuid;
+                if ui
+                    .radio(chosen, disk_line(disk))
+                    .on_hover_text(format!("Filesystem UUID {}", disk.uuid))
+                    .clicked()
+                {
+                    state.storage_filesystem = disk.uuid.clone();
+                }
+            }
             ui.horizontal(|ui| {
-                ui.label("Another folder:");
+                ui.label("Disk (filesystem UUID):");
+                ui.text_edit_singleline(&mut state.storage_filesystem)
+                    .on_hover_text(
+                        "Filled in when you choose a disk above. You can also type the UUID that `lsblk -f` shows for the disk.",
+                    );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Folder on that disk:");
                 ui.text_edit_singleline(&mut state.storage_folder);
             });
-            let typed = PathBuf::from(state.storage_folder.trim());
-            let checked_ok = state.storage.as_ref().is_some_and(|view| {
-                view.checked
-                    .as_ref()
-                    .is_some_and(|check| check.usable() && check.folder == typed)
-            });
+            let typed: FolderOnDisk = (
+                PathBuf::from(state.storage_folder.trim()),
+                state.storage_filesystem.trim().to_string(),
+            );
+            let may_use = may_use_folder(
+                state.storage.as_ref(),
+                &state.storage_folder,
+                &state.storage_filesystem,
+                state.storage_confirm,
+            );
             ui.checkbox(
                 &mut state.storage_confirm,
                 "Yes, keep new prepared copies in this folder. Copies already prepared elsewhere are not moved.",
@@ -1446,7 +1562,9 @@ fn show_storage(ui: &mut egui::Ui, state: &mut State) {
                     ui,
                     "Check this folder",
                     ActionStyle::Secondary,
-                    idle && !state.storage_folder.trim().is_empty(),
+                    idle
+                        && !state.storage_folder.trim().is_empty()
+                        && !state.storage_filesystem.trim().is_empty(),
                 )
                 .clicked()
                 {
@@ -1456,7 +1574,7 @@ fn show_storage(ui: &mut egui::Ui, state: &mut State) {
                     ui,
                     "Use this folder",
                     ActionStyle::Primary,
-                    idle && checked_ok && state.storage_confirm,
+                    idle && may_use,
                 )
                 .clicked()
                 {
@@ -1481,5 +1599,291 @@ fn show_storage(ui: &mut egui::Ui, state: &mut State) {
     if let Some((check, apply)) = job {
         state.storage_confirm = false;
         state.storage_job(ui.ctx(), check, apply);
+    }
+}
+
+/// The storage card's first-time folder selection.
+///
+/// TEST SUPPORT THAT WORKS BACKWARDS: a test cannot format or mount a disk,
+/// so `disk_of` reads the identity of the filesystem the temp folder is on
+/// and builds a UUID that has that identity, which the application itself
+/// must never do. These tests show that Blue refuses, and writes nothing,
+/// when the named disk is not the one the folder is on; they do not show
+/// that a real disk's real UUID is accepted (see the acceptance run in
+/// docs/GAME_RECOVERY_ENGINE.md). The temp folder must be on ext4 for the
+/// accepting part to pass.
+#[cfg(test)]
+mod storage_card_tests {
+    use super::*;
+
+    fn disk_of(path: &Path) -> String {
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: zeroed is a valid initial value for this plain C struct.
+        let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `name` is NUL-terminated and `stats` is writable and sized.
+        assert_eq!(unsafe { libc::statvfs(name.as_ptr(), &mut stats) }, 0);
+        let hex: String = (stats.f_fsid as u64)
+            .to_le_bytes()
+            .iter()
+            .chain([0_u8; 8].iter())
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        )
+    }
+
+    fn private_folder(path: &Path) {
+        std::fs::create_dir(path).unwrap();
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+    }
+
+    fn contents(folder: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut todo = vec![folder.to_path_buf()];
+        while let Some(folder) = todo.pop() {
+            for entry in std::fs::read_dir(&folder).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    todo.push(path.clone());
+                }
+                found.push(path);
+            }
+        }
+        found.sort();
+        found
+    }
+
+    fn view(checked: Option<recovery::storage::StorageCheck>) -> StorageView {
+        StorageView {
+            current: PathBuf::new(),
+            chosen: false,
+            available: None,
+            checked,
+            message: None,
+            disks: Vec::new(),
+        }
+    }
+
+    /// The disk a person means is never taken from where the folder happens
+    /// to be: with that disk absent, "Check this folder" and "Use this
+    /// folder" refuse, create nothing underneath, and save nothing, whether
+    /// or not a folder of the same name exists there.
+    #[test]
+    fn choosing_a_folder_for_an_absent_disk_writes_nothing_and_saves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let setting = root.join("config/prepared_media_folder.txt");
+        let record = setting.with_file_name("prepared_media_folder_filesystems.json");
+        let library: Result<Vec<PathBuf>, String> = Ok(Vec::new());
+        // The empty mount point of the disk that is not connected.
+        let mount_point = root.join("mnt-disk");
+        private_folder(&mount_point);
+        let folder = mount_point.join("prepared");
+        let intended = "6f1d2c3b-4a59-4e68-9778-a6b5c4d3e2f1".to_string();
+        assert_ne!(disk_of(&mount_point), intended);
+        let nothing_saved = || {
+            assert!(!setting.exists(), "a choice was saved");
+            assert!(!record.exists(), "a disk record was written");
+        };
+        let refused = |uuid: &str, reason: &str| {
+            let request = (folder.clone(), uuid.to_string());
+            let (checked, message) =
+                storage_action(&setting, &library, Some(request.clone()), None);
+            let check = checked.unwrap();
+            assert!(message.is_none());
+            assert!(
+                !check.usable()
+                    && check.filesystem_uuid.is_none()
+                    && check
+                        .problems
+                        .iter()
+                        .any(|problem| problem.contains(reason)),
+                "expected {reason:?}: {check:?}"
+            );
+            // The button stays off, whatever is ticked.
+            assert!(!may_use_folder(
+                Some(&view(Some(check))),
+                folder.to_str().unwrap(),
+                uuid,
+                true
+            ));
+            // And pressing through anyway changes nothing.
+            let (_, message) = storage_action(&setting, &library, None, Some(Some(request)));
+            let (ok, text) = message.unwrap();
+            assert!(!ok && text.contains(reason), "expected {reason:?}: {text}");
+        };
+
+        refused(&intended, "is not on the disk with filesystem UUID");
+        refused("", "Say which disk this folder is on");
+        refused("my usb disk", "is not a filesystem UUID");
+        assert!(contents(&mount_point).is_empty(), "created underneath");
+        nothing_saved();
+
+        // A folder of the same name exists underneath, with a binding file
+        // left by an earlier build.
+        private_folder(&folder);
+        std::fs::write(folder.join("emuwiz-storage-binding.json"), b"{}").unwrap();
+        let before = contents(&mount_point);
+        refused(&intended, "is not on the disk with filesystem UUID");
+        refused("", "Say which disk this folder is on");
+        assert_eq!(contents(&mount_point), before, "written underneath");
+        nothing_saved();
+
+        // Without the list of game folders nothing is checked or changed.
+        let unreadable: Result<Vec<PathBuf>, String> = Err("no list".into());
+        let request = (folder.clone(), disk_of(&folder));
+        let (checked, message) = storage_action(
+            &setting,
+            &unreadable,
+            Some(request.clone()),
+            Some(Some(request)),
+        );
+        assert!(checked.is_none() && message.is_some_and(|(ok, _)| !ok));
+        assert_eq!(contents(&mount_point), before);
+        nothing_saved();
+    }
+
+    /// With the disk named and the folder really on it, the check passes,
+    /// "Use this folder" needs that exact check plus the confirmation, and
+    /// the named UUID is saved with the choice.
+    #[test]
+    fn a_folder_on_the_named_disk_is_checked_confirmed_and_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let setting = root.join("config/prepared_media_folder.txt");
+        let record = setting.with_file_name("prepared_media_folder_filesystems.json");
+        let library: Result<Vec<PathBuf>, String> = Ok(Vec::new());
+        let folder = root.join("copies");
+        let text = folder.to_str().unwrap();
+        let here = disk_of(&root);
+        let request = (folder.clone(), here.to_uppercase());
+
+        let (checked, _) = storage_action(&setting, &library, Some(request.clone()), None);
+        let check = checked.unwrap();
+        assert!(check.usable(), "{check:?}");
+        assert_eq!(check.filesystem_uuid.as_deref(), Some(here.as_str()));
+        assert!(!folder.exists(), "checking creates nothing");
+        let shown = view(Some(check));
+        assert!(may_use_folder(Some(&shown), text, &here, true));
+        assert!(may_use_folder(
+            Some(&shown),
+            text,
+            &here.to_uppercase(),
+            true
+        ));
+        // Not without the confirmation, not for another folder, not for
+        // another disk than the one the check verified, not unchecked.
+        assert!(!may_use_folder(Some(&shown), text, &here, false));
+        assert!(!may_use_folder(
+            Some(&shown),
+            root.to_str().unwrap(),
+            &here,
+            true
+        ));
+        assert!(!may_use_folder(
+            Some(&shown),
+            text,
+            "6f1d2c3b-4a59-4e68-9778-a6b5c4d3e2f1",
+            true
+        ));
+        assert!(!may_use_folder(Some(&shown), text, "", true));
+        assert!(!may_use_folder(Some(&view(None)), text, &here, true));
+        assert!(!may_use_folder(None, text, &here, true));
+
+        let (_, message) = storage_action(&setting, &library, None, Some(Some(request)));
+        assert!(message.as_ref().is_some_and(|(ok, _)| *ok), "{message:?}");
+        assert!(folder.is_dir());
+        assert_eq!(
+            recovery::storage::configured_folder_at(&setting),
+            Ok(Some(folder.clone()))
+        );
+        assert!(std::fs::read_to_string(&record).unwrap().contains(&here));
+
+        // Back to EmuWiz's own data folder: the choice is cleared, the
+        // folder and its copies are left alone.
+        let (_, message) = storage_action(&setting, &library, None, Some(None));
+        assert!(message.is_some_and(|(ok, _)| ok));
+        assert_eq!(recovery::storage::configured_folder_at(&setting), Ok(None));
+        assert!(folder.is_dir());
+    }
+
+    /// For the real-disk acceptance run only (ignored otherwise): Blue's own
+    /// storage-card steps, "Check this folder" then "Use this folder", for a
+    /// folder and a filesystem UUID that come from outside. Nothing here is
+    /// built backwards: the UUID is the one read from the real disk by other
+    /// tools. `EMUWIZ_ACCEPT_EXPECT` says whether it must be `accepted` or
+    /// `refused`; a refusal must also leave the choice unsaved.
+    #[test]
+    #[ignore = "needs a real ext4 disk; run by the acceptance harness"]
+    fn acceptance_with_a_real_disk() {
+        let need = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"));
+        let folder = PathBuf::from(need("EMUWIZ_ACCEPT_FOLDER"));
+        let uuid = need("EMUWIZ_ACCEPT_FILESYSTEM");
+        let expect = need("EMUWIZ_ACCEPT_EXPECT");
+        let setting = PathBuf::from(need("EMUWIZ_ACCEPT_SETTING"));
+        let library: Result<Vec<PathBuf>, String> = Ok(Vec::new());
+        let saved_before = recovery::storage::configured_folder_at(&setting);
+        let request = (folder.clone(), uuid.clone());
+
+        let (checked, _) = storage_action(&setting, &library, Some(request.clone()), None);
+        let check = checked.expect("a check result");
+        println!("check: {check:?}");
+        let button = may_use_folder(
+            Some(&view(Some(check.clone()))),
+            folder.to_str().unwrap(),
+            &uuid,
+            true,
+        );
+        let (_, message) = storage_action(&setting, &library, None, Some(Some(request)));
+        println!("use: {message:?}");
+        let (ok, _) = message.expect("a message");
+        match expect.as_str() {
+            "accepted" => {
+                assert!(check.usable() && button && ok);
+                assert_eq!(
+                    recovery::storage::configured_folder_at(&setting),
+                    Ok(Some(folder))
+                );
+            }
+            "refused" => {
+                assert!(!check.usable() && check.filesystem_uuid.is_none() && !button && !ok);
+                assert_eq!(
+                    recovery::storage::configured_folder_at(&setting),
+                    saved_before
+                );
+            }
+            other => panic!("EMUWIZ_ACCEPT_EXPECT must be accepted or refused, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_disk_is_shown_by_what_it_is() {
+        let disk = recovery::disk_identity::MountedDisk {
+            uuid: "6f1d2c3b-4a59-4e68-9778-a6b5c4d3e2f1".into(),
+            label: Some("Games".into()),
+            mount_point: PathBuf::from("/mnt/usb"),
+            available_bytes: None,
+        };
+        assert_eq!(
+            disk_line(&disk),
+            "\"Games\", UUID 6f1d2c3b-4a59-4e68-9778-a6b5c4d3e2f1, at /mnt/usb (unknown free)"
+        );
+        let unnamed = recovery::disk_identity::MountedDisk {
+            label: None,
+            ..disk
+        };
+        // A disk without a name is told apart by its UUID, never by where it
+        // is mounted alone.
+        assert!(disk_line(&unnamed).starts_with(
+            "Disk without a name, UUID 6f1d2c3b-4a59-4e68-9778-a6b5c4d3e2f1, at /mnt/usb"
+        ));
     }
 }

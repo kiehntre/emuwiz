@@ -52,6 +52,9 @@ use crate::safe_read::{TrustedRoots, open_directory_no_symlinks};
 
 /// Overrides the store root. Must be an absolute path.
 pub const PREPARED_MEDIA_DIR_ENV: &str = "EMUWIZ_PREPARED_MEDIA_DIR";
+/// The UUID of the ext4 filesystem the folder named with
+/// [`PREPARED_MEDIA_DIR_ENV`] must be on. Required with it.
+pub const PREPARED_MEDIA_FILESYSTEM_ENV: &str = "EMUWIZ_PREPARED_MEDIA_FILESYSTEM";
 const DEFAULT_LEAF: &str = "prepared-media";
 const FORMAT_VERSION: u32 = 1;
 /// Kept free on the destination filesystem beyond the set's own size.
@@ -416,7 +419,7 @@ fn pretended_filesystem(path: &Path) -> Option<Filesystem> {
 
 /// The filesystem an open folder is on. `path` is how it was reached and is
 /// not opened again: the answer is about the handle.
-fn filesystem_of(directory: &File, path: &Path) -> std::io::Result<Filesystem> {
+pub(super) fn filesystem_of(directory: &File, path: &Path) -> std::io::Result<Filesystem> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
     #[cfg(test)]
@@ -440,7 +443,7 @@ fn filesystem_of(directory: &File, path: &Path) -> std::io::Result<Filesystem> {
 
 /// Decodes the octal escapes the kernel uses in `/proc/self/mountinfo`
 /// (space, tab, newline and backslash in a mount point's path).
-fn unescape_mount_path(field: &str) -> PathBuf {
+pub(super) fn unescape_mount_path(field: &str) -> PathBuf {
     use std::os::unix::ffi::OsStringExt;
     let bytes = field.as_bytes();
     let mut path = Vec::with_capacity(bytes.len());
@@ -531,35 +534,6 @@ pub(crate) fn mount_root_refusal(resolved: &Path) -> Option<String> {
         )),
         Err(detail) => Some(detail),
     }
-}
-
-/// Whether a filesystem id is only the device number in another form (XFS,
-/// FAT, exFAT and others report that). Such an id says which connector a
-/// disk is on, not which disk it is: another disk that gets the same device
-/// number would look identical.
-pub(crate) fn id_is_device_number(id: u64, device: u64) -> bool {
-    let major = u64::from(libc::major(device));
-    let minor = u64::from(libc::minor(device));
-    // The kernel's `huge_encode_dev`, stored in the id's two halves in
-    // either order.
-    let encoded = (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12);
-    let old_style = (major << 8) | (minor & 0xff);
-    [encoded, old_style, device]
-        .into_iter()
-        .any(|form| id == form || id == form << 32 || id == form.rotate_left(32))
-}
-
-/// The filesystem `path` (an existing folder) is on, read by path.
-pub(crate) fn filesystem_at(path: &Path) -> Option<Filesystem> {
-    use std::os::unix::fs::MetadataExt;
-    #[cfg(test)]
-    if let Some(pretended) = pretended_filesystem(path) {
-        return Some(pretended);
-    }
-    Some(Filesystem {
-        device: fs::metadata(path).ok()?.dev(),
-        id: filesystem_id(path),
-    })
 }
 
 fn c_name(name: &str) -> std::io::Result<std::ffi::CString> {
@@ -768,74 +742,121 @@ impl PreparedMediaStore {
         }
     }
 
+    /// A store in a folder used earlier, tied to the filesystem recorded for
+    /// it. It is only read from and removed from; it is never created (see
+    /// [`Self::ensure_layout`]).
+    pub(crate) fn earlier(folder: PathBuf, recorded: u64) -> Self {
+        Self {
+            chosen_filesystem: Some(recorded),
+            ..Self::at(folder)
+        }
+    }
+
     /// A store in a folder named for this one run (`how` says by what: the
-    /// CLI's `--store`, or `EMUWIZ_PREPARED_MEDIA_DIR`).
+    /// CLI's `--store`, or `EMUWIZ_PREPARED_MEDIA_DIR`), which must be on
+    /// the ext4 filesystem with the UUID given beside it (`--store-filesystem`,
+    /// `EMUWIZ_PREPARED_MEDIA_FILESYSTEM`).
     ///
-    /// The folder must already be there and pass the checks a chosen folder
-    /// passes. It is never created: a named folder that is missing may be
-    /// inside a disk that is not connected, and creating it would put the
-    /// copies on the disk underneath. The store is then tied to the
-    /// filesystem the folder is on now, for as long as this value is used.
-    pub fn named(folder: impl Into<PathBuf>, how: &str) -> Result<Self, String> {
+    /// A folder being there proves nothing about which disk is (a folder of
+    /// the same name can exist on the disk underneath an unmounted one), and
+    /// nothing learned from the path can say which disk was meant. So the
+    /// caller names the disk, every run, and the folder is accepted only when
+    /// the filesystem it is on reports that identity (see
+    /// [`super::disk_identity`]). Without a UUID the folder is refused.
+    ///
+    /// The folder must already be there, be a real folder (not a link) only
+    /// the person can change, and not be a mount point. Nothing is created
+    /// and nothing is written here. The store is then tied to that
+    /// filesystem for as long as this value is used.
+    pub fn named(
+        folder: impl Into<PathBuf>,
+        filesystem_uuid: Option<&str>,
+        how: &str,
+    ) -> Result<Self, String> {
+        use super::disk_identity::{ExpectedFilesystem, HOW_TO_FIND_UUID, verify_on};
         let folder = folder.into();
         if !folder.is_absolute() {
             return Err(format!("{how} needs an absolute path"));
         }
+        let Some(filesystem_uuid) = filesystem_uuid else {
+            return Err(format!(
+                "{how}: say which disk {} is on by giving the UUID of its ext4 filesystem ({}). A folder being there does not prove the right disk is connected; {HOW_TO_FIND_UUID}",
+                folder.display(),
+                if how == PREPARED_MEDIA_DIR_ENV {
+                    PREPARED_MEDIA_FILESYSTEM_ENV
+                } else {
+                    "--store-filesystem <UUID>"
+                }
+            ));
+        };
+        let expected = ExpectedFilesystem::parse(filesystem_uuid)
+            .map_err(|error| format!("{how}: {error}"))?;
         super::storage::still_safe(&folder).map_err(|error| format!("{how}: {error}"))?;
         // `still_safe` accepts a missing folder (it has nothing to say about
-        // one); here a missing folder is the refusal.
+        // one); here a missing folder is the refusal. It is never created:
+        // it may be inside a disk that is not connected.
         if fs::symlink_metadata(&folder).is_err() {
             return Err(format!(
-                "{how}: {} is not there (is its disk connected?). EmuWiz does not create this folder itself; create it first if this is where the copies should go",
+                "{how}: {} is not there (is its disk connected?). EmuWiz does not create this folder itself",
                 folder.display()
             ));
         }
         let resolved = fs::canonicalize(&folder)
             .map_err(|error| format!("{how}: {}: {error}", folder.display()))?;
-        if let Some(refusal) = mount_root_refusal(&resolved) {
-            return Err(format!("{how}: {refusal}"));
-        }
-        let filesystem = filesystem_at(&resolved).ok_or_else(|| {
+        let directory = open_directory_no_symlinks(&resolved).map_err(|refusal| {
             format!(
-                "{how}: which disk {} is on could not be checked",
+                "{how}: {} is not a plain folder ({refusal:?})",
                 folder.display()
             )
         })?;
-        let id = match filesystem.id {
-            None => {
-                return Err(format!(
-                    "{how}: EmuWiz cannot tell which disk {} is on (network and FUSE filesystems report no identity), so it could not notice that disk going away",
-                    folder.display()
-                ));
-            }
-            Some(id) if id_is_device_number(id, filesystem.device) => {
-                return Err(format!(
-                    "{how}: the filesystem {} is on has no identity of its own (XFS, FAT and exFAT report only which connector the disk is on); use a disk formatted as ext4 or Btrfs",
-                    folder.display()
-                ));
-            }
-            Some(id) => id,
-        };
+        // Which disk first: the answer decides whether anything else about
+        // this folder matters.
+        verify_on(&directory, &resolved, &expected).map_err(|error| format!("{how}: {error}"))?;
+        if let Some(refusal) = mount_root_refusal(&resolved) {
+            return Err(format!("{how}: {refusal}"));
+        }
         Ok(Self {
             root: folder,
             root_must_exist: true,
-            chosen_filesystem: Some(id),
+            chosen_filesystem: Some(expected.id()),
             pinned: None,
         })
     }
 
     /// The store for this profile: `EMUWIZ_PREPARED_MEDIA_DIR` when set (an
-    /// existing folder, see [`Self::named`]), otherwise the saved choice,
-    /// otherwise `<data>/prepared-media`.
+    /// existing folder on the filesystem `EMUWIZ_PREPARED_MEDIA_FILESYSTEM`
+    /// names, see [`Self::named`]), otherwise the saved choice, otherwise
+    /// `<data>/prepared-media`. A refused override is an error: there is no
+    /// falling back to another folder.
     pub fn for_profile() -> Result<Self, String> {
-        Self::for_profile_given(std::env::var_os(PREPARED_MEDIA_DIR_ENV))
+        Self::for_profile_given(
+            std::env::var_os(PREPARED_MEDIA_DIR_ENV),
+            std::env::var_os(PREPARED_MEDIA_FILESYSTEM_ENV),
+        )
     }
 
-    /// [`Self::for_profile`] with the value of `EMUWIZ_PREPARED_MEDIA_DIR`
-    /// given explicitly.
-    pub(crate) fn for_profile_given(named: Option<std::ffi::OsString>) -> Result<Self, String> {
-        if let Some(value) = named {
-            return Self::named(PathBuf::from(value), PREPARED_MEDIA_DIR_ENV);
+    /// [`Self::for_profile`] with the values of the two variables given
+    /// explicitly.
+    pub(crate) fn for_profile_given(
+        named: Option<std::ffi::OsString>,
+        filesystem: Option<std::ffi::OsString>,
+    ) -> Result<Self, String> {
+        match (named, filesystem) {
+            (Some(folder), filesystem) => {
+                let uuid = match &filesystem {
+                    Some(value) => Some(value.to_str().ok_or_else(|| {
+                        format!("{PREPARED_MEDIA_FILESYSTEM_ENV} is not a filesystem UUID")
+                    })?),
+                    None => None,
+                };
+                return Self::named(PathBuf::from(folder), uuid, PREPARED_MEDIA_DIR_ENV);
+            }
+            (None, Some(_)) => {
+                return Err(format!(
+                    "{PREPARED_MEDIA_FILESYSTEM_ENV} is set without {PREPARED_MEDIA_DIR_ENV}; set both or neither"
+                ));
+            }
+            (None, None) => {}
         }
         match Self::configured(super::storage::configured_folder()?)? {
             Some(store) => Ok(store),
@@ -926,9 +947,7 @@ impl PreparedMediaStore {
             if super::storage::still_safe(&folder).is_ok()
                 && let Ok(Some(recorded)) = super::storage::recorded_filesystem(&folder)
             {
-                let mut store = Self::at(folder);
-                store.chosen_filesystem = Some(recorded);
-                add(store);
+                add(Self::earlier(folder, recorded));
             }
         }
         stores
@@ -1285,13 +1304,29 @@ impl PreparedMediaStore {
         };
         let filesystem = filesystem_of(&directory, resolved).map_err(unknown)?;
         let root_inode = directory.metadata().map_err(unknown)?.ino();
-        if let Some(chosen) = self.chosen_filesystem
-            && filesystem.id != Some(chosen)
-        {
-            return Err(format!(
-                "{} is not on the disk it was on when it was chosen (is its disk connected?)",
-                resolved.display()
-            ));
+        if let Some(chosen) = self.chosen_filesystem {
+            // The same proof as when the folder was chosen or named: ext4,
+            // the recorded identity, and no second connected disk with it.
+            use super::disk_identity::NotVerified;
+            let place = resolved.display();
+            super::disk_identity::verify_id_on(&directory, resolved, chosen).map_err(
+                |refusal| match refusal {
+                    NotVerified::OtherDisk => format!(
+                        "{place} is not on the disk it was on when it was chosen (is its disk connected?)"
+                    ),
+                    NotVerified::NotExt4 => format!(
+                        "{place} is not on an ext4 filesystem, so which disk it is on cannot be verified (is its disk connected?)"
+                    ),
+                    NotVerified::NotMounted => format!(
+                        "the disk {place} was chosen on is not among the mounted ext4 disks, so the folder cannot be verified"
+                    ),
+                    NotVerified::Shared => format!(
+                        "more than one connected disk reports the identity of the disk {place} was chosen on (a copied disk?); disconnect the other disk"
+                    ),
+                    NotVerified::Unknown(error) => unknown(error),
+                    NotVerified::Table(detail) => detail,
+                },
+            )?;
         }
         let now = Pinned {
             filesystem,
@@ -1392,7 +1427,10 @@ impl PreparedMediaStore {
         if !self.root.is_absolute() {
             return Err("the store root is not an absolute path".into());
         }
-        if self.root_must_exist || self.pinned.is_some() {
+        // Only EmuWiz's own default folder is ever created. A folder tied to
+        // a disk must be there already: creating it could put it on whatever
+        // is underneath when its disk is absent.
+        if self.root_must_exist || self.pinned.is_some() || self.chosen_filesystem.is_some() {
             if fs::symlink_metadata(&self.root).is_err() {
                 return Err(format!(
                     "{} is not there (is its disk connected?)",
@@ -1830,7 +1868,11 @@ impl PreparedMediaStore {
             kept.push(retired.clone());
         }
         sync_directory(&store.staging_dir());
-        store.unlink_sources_of(set_id);
+        // The link records are removed by path: only while the store is
+        // still the folder on the disk this removal started with.
+        if store.still_there().is_ok() {
+            store.unlink_sources_of(set_id);
+        }
         store.journal(
             "prepared_copy_removed",
             set_id,

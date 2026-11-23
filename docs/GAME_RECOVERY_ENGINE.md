@@ -159,18 +159,17 @@ out. With no usable copy (never prepared, or the ZIP or the copy has changed) th
 is left exactly as it was for a game whose last scan could not finish, for a game
 with an identity of its own, and for every other Amiga, CD32 and CDTV entry.
 
-The store is `<data>/prepared-media` (`EMUWIZ_PREPARED_MEDIA_DIR` overrides it with
-the absolute path of a folder that already exists; see below). Do not point it inside
-a library source folder: a scan would then list the prepared files as games.
+The store is `<data>/prepared-media`. Do not point it inside a library source folder:
+a scan would then list the prepared files as games.
 
-A folder named for one run, with `EMUWIZ_PREPARED_MEDIA_DIR` or the CLI's `--store`,
-is never created by EmuWiz. It must already be there, be a real folder (not a link)
-that only you can change, not be a mount point, and be on a filesystem with an
-identity of its own (the same rule as for a chosen folder). A named folder that is
-missing is refused with "is not there (is its disk connected?)": it may be a folder
-inside a disk that is not mounted, and creating it would put the copies on the disk
-underneath. Once accepted, the store is tied to the filesystem the folder is on at
-that moment for the rest of the command.
+For one run, another folder can be named with the CLI's `--store <folder>
+--store-filesystem <UUID>`, or with `EMUWIZ_PREPARED_MEDIA_DIR` together with
+`EMUWIZ_PREPARED_MEDIA_FILESYSTEM`. The UUID is the one of the ext4 filesystem the
+folder is on (`lsblk -f` shows it for every connected disk). The folder is used only
+when it is on that filesystem; without a UUID it is refused. It is never created by
+EmuWiz: it must already be there, be a real folder (not a link) that only you can
+change, and not be a mount point. A refused override is an error; EmuWiz does not
+fall back to another folder. See "Where copies are kept" for why.
 
 ## Renames and moves of a prepared ZIP
 
@@ -224,21 +223,35 @@ missing core, a damaged prepared copy or a changed ZIP (each is a tested case).
 ## Where copies are kept
 
 Default: `<data>/prepared-media`. Another folder can be chosen on the page ("Where
-prepared copies are kept") or with `emuwiz-cli recovery storage --set <folder>`; the
-choice is one line in `prepared_media_folder.txt` in the configuration folder. A
-folder is accepted only if it is a real folder (not a link) that belongs to you and
-that others cannot write to, is not inside a game folder and does not contain one,
-is writable, is on a filesystem with a no-replace rename that can be recognised
-again later (ext4, Btrfs), and is not itself a mount point (see below).
-Its location is judged before anything is created there. Copies already prepared in
-another folder are not moved. Folders used earlier are remembered: games prepared
-there keep starting from them, and the launch check still covers them. The saved
-folder is checked again every time it is used; one that is missing (its disk is not
-connected), or has since become a link, another user's, or writable by others is
-refused with a message and never recreated somewhere else, and a damaged
-setting is an error, never a silent return to the default. If your game folders
-cannot be read, a new folder is not accepted (the "not inside a game folder" check
-could not be made).
+prepared copies are kept") or with `emuwiz-cli recovery storage --set <folder>
+--filesystem <UUID>`; the choice is one line in `prepared_media_folder.txt` in the
+configuration folder.
+
+You say which disk the folder is on, and EmuWiz verifies it. On the page you pick
+the disk from the list of connected ext4 disks (shown with its name, where it is
+mounted and its free space; the list comes from the system's device database, which
+reads the name and UUID from the device itself) or type its filesystem UUID; with
+the CLI you give the UUID (`emuwiz-cli recovery storage` lists the connected ext4
+disks, and so does `lsblk -f`). EmuWiz never works out the disk from where the
+folder happens to be.
+
+A folder is accepted only if it is on the filesystem you named, is a real folder
+(not a link) that belongs to you and that others cannot write to, is not inside a
+game folder and does not contain one, is writable, and is not itself a mount point
+(see below). Which disk it is on is established first, before anything else is
+looked at and before anything is written: until then nothing is created, not even
+the folder. A folder that does not exist yet is created only inside a folder that
+was verified to be on the named disk, through that folder's open handle. Only ext4
+(with ext2 and ext3) is supported; see below.
+
+Copies already prepared in another folder are not moved. Folders used earlier are
+remembered: games prepared there keep starting from them, and the launch check still
+covers them. The saved folder is checked again every time it is used; one that is
+missing (its disk is not connected), or has since become a link, another user's, or
+writable by others is refused with a message and never recreated somewhere else, and
+a damaged setting is an error, never a silent return to the default. If your game
+folders cannot be read, a new folder is not accepted (the "not inside a game folder"
+check could not be made).
 
 ### The folder must stay on the disk it is expected on
 
@@ -256,13 +269,30 @@ the folder is on, not just that the folder exists. What is enforced:
   it cannot be told whether a folder is a mount point, the folder is refused. The
   check reads the system's mount table (`/proc/self/mountinfo`), so where `/proc`
   is not available nothing can be prepared.
-- **When a folder is chosen**, the filesystem's own id (the one that survives a
-  restart; the device number does not) is recorded beside the setting, in
-  `prepared_media_folder_filesystems.json`. Refused as a place for prepared copies,
-  in the application itself: a filesystem that reports no id (FUSE and network
-  mounts), because EmuWiz could not notice it going away; and a filesystem whose id
-  is only its device number (XFS, FAT, exFAT), because another disk connected in its
-  place would look the same.
+- **The disk is named by the person, never read from the path.** When a folder is
+  chosen (on the page or with `storage --set`) or named for one run (`--store`,
+  `EMUWIZ_PREPARED_MEDIA_DIR`), the UUID of its ext4 filesystem must be given with
+  it. A UUID is a property of the disk itself and is the same wherever, and whether,
+  the disk is mounted. EmuWiz opens the folder (or, for a folder that does not exist
+  yet, the folder above it), and asks the system which filesystem that open folder
+  is on. On ext4 the identity the system reports for a mounted filesystem is
+  computed from the UUID alone, so the two can be compared without reading the
+  device. The folder is accepted only when they match and exactly one connected disk
+  reports that identity. With the disk not mounted, the folder underneath is on a
+  filesystem with another UUID and is refused, whatever exists there: a folder of
+  the same name, a store's folders, files from an earlier build. Nothing is created,
+  probed or saved before this has passed.
+- **Refused, in the application itself:** no UUID; text that is not a UUID; a
+  filesystem that is not ext4 (Btrfs, XFS, FAT, exFAT, network and FUSE mounts,
+  tmpfs: there the reported identity cannot be derived from a UUID, so the disk
+  cannot be verified); a folder on any other filesystem than the named one; an
+  identity that two connected disks report (a copied disk); a list of mounted disks
+  that cannot be read.
+- **The named UUID is saved** beside the setting, in
+  `prepared_media_folder_filesystems.json`, only after the folder was verified. A
+  record written by the build that remembered whatever filesystem a folder happened
+  to be on (format 1; never in an installed build) is not trusted: the folder is
+  refused until it is chosen again with its disk named.
 - **Every time the chosen folder is used** (preparing, a batch, reuse, re-linking,
   removal, clean-up, and looking up a copy for a launch) the folder must be on the
   recorded filesystem. If it is not, or the filesystem cannot be identified, or
@@ -348,33 +378,37 @@ with `members()`, `fingerprint()` and `verify_structure()` rather than a rewrite
   worked through in turns. Games that can never be prepared stay in the list, so a
   library with more than 500 of those ahead of the rest would need them moved first.
 - Limits of the "folder must stay on its disk" check (see "Where copies are kept"):
-  - A folder given with `EMUWIZ_PREPARED_MEDIA_DIR` or the CLI's `--store` (developer
-    and test options; Blue and the saved choice do not use them) has no filesystem
-    recorded from an earlier run. It must already exist and is never created, so a
-    folder inside a disk that is not mounted is refused as missing. What is not
-    noticed: a folder of the same name that really exists on the disk underneath the
-    mount point (made by hand, or by a build before this rule). It is accepted,
-    because nothing says which disk was meant. The saved choice does not have this
-    gap.
-  - The default folder (`<data>/prepared-media`) has no recorded filesystem either
-    and is created when first used. It is tied to its folder and filesystem only
-    from the start of each operation or batch, not from one run to the next: if
-    EmuWiz's whole data folder is on a disk that is not mounted when EmuWiz starts,
-    the default store is created on whatever is there, like the rest of EmuWiz's
-    data.
-  - Compatibility: a folder on a network or FUSE filesystem, or on XFS, FAT or
-    exFAT, cannot be chosen or named at all, and neither can a mount point. Prepared
-    copies can therefore only be kept on filesystems that report an identity of
-    their own (ext4 and Btrfs are the tested ones). The default folder is not held
-    to this rule.
-  - The filesystem id is whatever the kernel reports; ext4 and Btrfs derive it from
-    the filesystem's own UUID. Recognising an id that is only a device number relies
-    on the forms the kernel uses today; a filesystem that hid its device number in
-    another form would be accepted, and another disk at the same device number
-    would then not be noticed.
-  - Two filesystems with the same id (a block-level clone of a disk) cannot be told
-    apart. A pooled filesystem (mergerfs) with one member disk missing keeps its id,
-    so it is not noticed.
+  - Naming a disk by its UUID proves which filesystem a folder is on; it does not
+    prove the person named the disk they meant. Someone who gives the UUID of the
+    system disk for a folder that is on the system disk has chosen the system disk.
+  - The identity the system reports is 64 bits computed from the 128-bit UUID. Two
+    different UUIDs could in principle give the same identity; the chance is about
+    1 in 18 billion billion for any pair. A block-level copy of a disk has the same
+    UUID: with both copies connected and mounted where EmuWiz can see them it is
+    refused as ambiguous, when a folder is chosen or named and each time a saved
+    choice is used; with only one connected it cannot be told from the original. A
+    copy whose mount is hidden under another mount is not seen.
+  - Compatibility: only ext4 (with ext2 and ext3) can hold prepared copies outside
+    EmuWiz's own data folder. Btrfs, XFS, FAT, exFAT, network and FUSE filesystems
+    and tmpfs are refused, because their reported identity cannot be checked against
+    a UUID. What has and has not been verified about the rule for ext4 is listed
+    under Evidence.
+  - Folders given with `--store` or `EMUWIZ_PREPARED_MEDIA_DIR` are developer and
+    test options; Blue does not use them. They keep no state: the UUID must be given
+    on every run.
+  - The default folder (`<data>/prepared-media`) has no named disk and is created
+    when first used. It is tied to its folder and filesystem only from the start of
+    each operation or batch, not from one run to the next: if EmuWiz's whole data
+    folder is on a disk that is not mounted when EmuWiz starts, the default store is
+    created on whatever is there, like the rest of EmuWiz's data.
+  - The list of connected disks on the page needs the system's device database
+    (udev). Where it is not available the list is empty and the UUID is typed.
+  - The check relies on how ext4 computes the identity it reports from its UUID
+    (the kernel's `ext4_statfs`). A kernel that computed it differently would make
+    every folder be refused, not wrongly accepted.
+  - Whether a folder is on ext4 is what the system reports for it. A filesystem
+    stacked on ext4 that passes on both ext4's type and its identity would be taken
+    for the disk underneath it.
   - A disk that is unmounted "lazily" while a preparation is running stays usable
     by that preparation's open files; the files already being written finish on the
     real disk, and the next check stops the work.
@@ -382,23 +416,20 @@ with `members()`, `fingerprint()` and `verify_structure()` rather than a rewrite
     old link record, the batch file when a batch is forgotten, the work folder of a
     failed attempt, and the files of a prepared copy being removed. In the instant
     between the check and the deletion a changed mount could make it miss, or, only
-    if the other disk holds a store with identically named folders and files of the
-    recorded sizes, delete those. No original is involved.
+    if the other disk holds a store with identically named folders, delete from it:
+    files of a prepared copy only if they also have the recorded sizes; a link record
+    or the batch file whatever its size. No original is involved.
   - The mount-point refusal is made when a folder is chosen, when a saved choice is
     used, when a folder is named with `--store` or `EMUWIZ_PREPARED_MEDIA_DIR`, and
     when a store is made ready for preparing. Removal, clean-up, re-linking and
     forgetting a batch in a default folder that is itself a mount point are not
     refused for that reason; they act only on a store that already exists there, on
     the filesystem it had when the command started.
-  - The top folder of a Btrfs subvolume has another device number than its parent
-    and is refused as a mount point even when it is not mounted separately; a
-    folder at a path that the mount table still lists but a later mount hides is
-    refused too. Use a folder inside.
-  - A filesystem stacked on another (overlayfs, eCryptfs) can pass on the lower
-    filesystem's id, so XFS, FAT or exFAT underneath one is not recognised.
-  - Copies in a folder that can no longer be chosen (a mount point, or a disk
-    formatted as XFS, FAT or exFAT) stay refused; no build that allowed such a
-    choice was ever installed.
+  - A folder at a path that the mount table still lists but a later mount hides is
+    refused as a mount point. Use a folder inside.
+  - Copies in a folder that can no longer be chosen (a mount point, or a disk that
+    is not ext4) stay refused; no build that allowed such a choice was ever
+    installed.
   - If the record of filesystems cannot be read, choosing a folder writes a new
     one; earlier folders then have no entry and are not used (and files in them are
     refused at launch) until each is chosen again.
@@ -499,24 +530,78 @@ Batch preparation of the same 79 ZIPs (`prepare-all`, same sandbox, a fresh stor
 
 ### The folder must stay on its disk (2026-11-22)
 
-- Tests in `recovery::tests::mount_identity_tests` (thirteen; the first seven are
-  described here, the others cover the mount-point refusal, device-number ids, the
-  sequence mounted, unmounted, another disk, remounted, the launch check for an
-  earlier folder without a usable record, and the two rules for a folder named with
-  `--store` or `EMUWIZ_PREPARED_MEDIA_DIR`: it must already exist and is never
-  created, and it is tied to the filesystem it started on), with one CLI test that a
-  missing `--store` folder is refused by every command and never created: the
-  filesystem is recorded
-  when a folder is chosen and one without an identity is refused; an unavailable
-  mount (the empty mount point) is refused and nothing is created in it; a changed
-  filesystem is refused for preparing, reuse, re-linking, removal and launch; a ready
-  store is tied to its folder and filesystem; a preparation stops at each write
-  boundary; a work folder on another disk is never written to; a batch that loses
-  its destination between two games writes nothing more and continues when the disk
-  is back. A test cannot mount a disk, so the loss is either a record that names
-  another filesystem than the folder is really on, or a test-only hook that reports
-  another filesystem from a chosen moment. Each of nineteen protections was removed
-  in turn and at least one of these tests failed each time.
+The evidence is of four kinds, and they prove different things.
+
+**1. Regression tests with a made-up disk.** A test cannot format or mount a disk.
+The tests in `recovery::tests::mount_identity_tests` (21), the CLI's recovery tests
+(6) and Blue's `storage_card_tests` (3) therefore either pretend, through a
+test-only hook, that a folder is on another filesystem, or build a UUID backwards
+from the identity of the filesystem the test folder is really on. The application
+must never do the second, and the test support says so where it is defined. These
+tests show that the refusals work and that nothing is written when one applies: no
+UUID; text that is not a UUID; the disk absent with nothing underneath; the disk
+absent with a same-named folder underneath (holding a store's folders and a binding
+file from an earlier build); another disk at the path; a filesystem that is not
+ext4; an identity two connected disks share; a link in place of the folder or the
+folder above it; a mount change landing at each step between the checks and the
+creation of a new folder; a record from the build that did not verify the disk; and,
+as before, a mount change at each write boundary of a preparation and between the
+games of a batch. They do **not** show that a real disk's real UUID is accepted.
+
+A selection of 29 changes was also made to the code, one at a time, to see whether a
+test notices: 27 remove or disable one safety check, one reads the UUID the wrong way
+round, and one makes Blue pass no UUID when saving (which the core then refuses). For every change the build output of the crates involved was deleted
+first, and the result was counted only when the build tool reported compiling them
+again from the changed source; the unchanged code passed the same tests on such a
+clean build before and after. 28 changes were noticed. One was not: the check of a
+newly created folder through the handle it was created by, in
+`create_on_verified_disk`. Removing it changes no outcome a test can observe, because
+the folder above is verified through its handle before the folder is created, and the
+folder is verified again straight afterwards. That check is kept as a second
+safeguard and is **not** covered by a test of its own (nor is the check that follows
+it, on its own; the two are only tested together).
+
+This is not complete mutation coverage. Checks that have tests but were not among
+the 29 changes include: the refusals of text that is not a UUID; the refusal of a
+record from the earlier build; the probe; the single checks before each write of a
+preparation (only the comparison they share was changed); and the CLI's refusal of
+`--filesystem` or `--store-filesystem` given alone. The code that counts the
+connected disks reporting an identity, including counting the folder's own device,
+is replaced by a test hook in every refusing test, so it is exercised only by the
+tests that run on a real ext4 temporary folder and by the real-disk run below.
+
+Two earlier runs of 26 changes are superseded and must not be relied on. The first
+noticed 23 (two did not, one did not compile). The second reported 25, but its tool
+put files back with their old timestamps, so the build tool could reuse a build made
+from changed source: its last three results (the CLI and Blue changes) could not be
+shown to come from the changed source alone. Both logs are kept.
+
+**2. The rule from UUID to identity, against fixed values.**
+`recovery::tests::disk_identity_tests` checks the conversion against four UUIDs
+whose identities were worked out separately from the code (by hand and with an
+independent script, from the kernel's `ext4_statfs`), one of which gives a different
+result if the bytes are read in the wrong order; and that malformed text, the
+all-zero UUID and a UUID whose halves cancel are refused.
+
+**3. Read-only, on real filesystems.** One test compares, for every ext4 filesystem
+mounted on the machine running the tests whose UUID the system's device database
+knows, the identity the code derives from that real UUID with the identity that
+filesystem reports. On the development machine all 16 mounted entries agreed. It
+checks nothing where no such filesystem is visible, and it never writes.
+
+**4. A real ext4 disk, end to end: NOT YET RUN.** Accepting a real disk by its real
+UUID, refusing the same commands once it is unmounted (with and without a
+same-named folder underneath) or replaced by another ext4 disk, the same through
+Blue's storage steps, and a mount change during a batch and during a write, need
+ext4 filesystems that are really mounted, which needs root. The harness is written
+and awaits approval. Until it has passed, the link between the UUID check and a real
+disk is unverified beyond points 2 and 3.
+
+Earlier runs with real mounts (2026-11-22), made on the design before this one, in
+which the disk was remembered from the path and a tmpfs stood in for the disk. The
+current build refuses tmpfs, so they cannot be repeated as they were; they are kept
+as a record of what the write-boundary checks did, which this change did not touch:
+
 - With real mounts, in a sandbox (system read-only, private mount namespace, a
   throw-away tmpfs standing in for the removable disk, three synthetic ZIPs): the
   top folder of the mounted disk was chosen and a game prepared; after the unmount,

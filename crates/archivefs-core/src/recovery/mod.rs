@@ -23,6 +23,7 @@ pub mod capability;
 pub mod cue_sheet;
 pub mod diagnose;
 pub mod disc_zip;
+pub mod disk_identity;
 pub mod model;
 pub mod moves;
 pub mod prepared_media;

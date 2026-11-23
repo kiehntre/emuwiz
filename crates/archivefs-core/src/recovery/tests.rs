@@ -173,6 +173,8 @@ struct Lab {
 
 impl Lab {
     fn new() -> Self {
+        // The tests do not depend on what the temporary folder is really on.
+        assume_ext4();
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::create_dir_all(root.join("games/amiga-cd32")).unwrap();
@@ -2398,6 +2400,79 @@ mod bulk_tests {
 }
 
 // ---------------------------------------------------------------------------
+// Test support for "which disk": READ THIS BEFORE TRUSTING THESE TESTS
+// ---------------------------------------------------------------------------
+//
+// A test cannot format or mount a disk, so the tests below cannot hold a real
+// ext4 filesystem with a UUID of its own. `disk_of` WORKS BACKWARDS: it reads
+// the identity of the filesystem the test folder is on (or the one a test
+// pretends it is on) and builds a UUID that has that identity. That is the
+// very thing the application must never do, and it is done here only to
+// reach the code behind the check.
+//
+// These tests therefore show that the refusals work (no UUID, wrong UUID,
+// missing or replaced disk, unsupported filesystem, ambiguous identity,
+// links, mount changes) and that nothing is written when one applies. They
+// do NOT show that a real disk's real UUID is accepted: the link between an
+// ext4 UUID and the kernel's identity is checked separately, against fixed
+// values computed outside this code (`disk_identity_tests`) and with a real
+// ext4 filesystem in the acceptance run (docs/GAME_RECOVERY_ENGINE.md).
+
+/// A UUID with the given identity, built backwards (see above).
+fn uuid_with_identity(id: u64) -> String {
+    let hex: String = id
+        .to_le_bytes()
+        .iter()
+        .chain([0_u8; 8].iter())
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// Makes this test's folders count as ext4 with one connected disk per
+/// identity, unless the test has said otherwise. Each test runs on its own
+/// thread, so this never reaches another test.
+fn assume_ext4() {
+    use crate::recovery::disk_identity::{EXT4_OVERRIDE, SAME_IDENTITY_OVERRIDE};
+    EXT4_OVERRIDE.with(|hook| {
+        let mut hook = hook.borrow_mut();
+        if hook.is_none() {
+            *hook = Some(Box::new(|_| Some(true)));
+        }
+    });
+    SAME_IDENTITY_OVERRIDE.with(|hook| {
+        let mut hook = hook.borrow_mut();
+        if hook.is_none() {
+            *hook = Some(Box::new(|_| Some(Ok(1))));
+        }
+    });
+}
+
+/// The UUID of "the disk this folder is on", built backwards from the
+/// filesystem the folder (or the nearest folder above it that exists) is on
+/// now, real or pretended. Also applies [`assume_ext4`].
+fn disk_of(path: &Path) -> String {
+    assume_ext4();
+    let mut probe = path;
+    while std::fs::symlink_metadata(probe).is_err() {
+        match probe.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => probe = parent,
+            _ => return uuid_with_identity(0x0bad_0bad_0bad_0bad),
+        }
+    }
+    uuid_with_identity(
+        crate::recovery::prepared_media::filesystem_id(probe).unwrap_or(0x0bad_0bad_0bad_0bad),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // The storage folder
 // ---------------------------------------------------------------------------
 
@@ -2412,7 +2487,8 @@ mod storage_tests {
         let library = root.join("games");
         std::fs::create_dir_all(library.join("amiga-cd32")).unwrap();
         let libraries = vec![library.clone()];
-        let problems = |folder: &Path| check_folder(folder, &libraries, false).problems;
+        let problems =
+            |folder: &Path| check_folder(folder, &libraries, Some(&disk_of(folder))).problems;
 
         assert!(!problems(Path::new("relative/folder")).is_empty());
         assert!(!problems(&root.join("a/../b")).is_empty());
@@ -2451,7 +2527,7 @@ mod storage_tests {
                 .any(|problem| problem.contains("does not exist"))
         );
 
-        let good = check_folder(&real, &libraries, false);
+        let good = check_folder(&real, &libraries, Some(&disk_of(&real)));
         assert!(good.usable(), "{:?}", good.problems);
         assert!(good.available_bytes.is_some());
         assert!(
@@ -2460,7 +2536,7 @@ mod storage_tests {
         );
         // A folder that does not exist yet is examined without creating it.
         let new = root.join("new-folder");
-        assert!(check_folder(&new, &libraries, false).usable());
+        assert!(check_folder(&new, &libraries, Some(&disk_of(&new))).usable());
         assert!(!new.exists());
     }
 
@@ -2478,7 +2554,8 @@ mod storage_tests {
             set_folder_at(
                 &setting,
                 Some(&library.join("copies")),
-                std::slice::from_ref(&library)
+                std::slice::from_ref(&library),
+                Some(&disk_of(&library)),
             )
             .is_err()
         );
@@ -2487,9 +2564,14 @@ mod storage_tests {
 
         let chosen = root.join("big-disk/emuwiz-prepared");
         std::fs::create_dir_all(chosen.parent().unwrap()).unwrap();
-        let check = set_folder_at(&setting, Some(&chosen), std::slice::from_ref(&library))
-            .unwrap()
-            .unwrap();
+        let check = set_folder_at(
+            &setting,
+            Some(&chosen),
+            std::slice::from_ref(&library),
+            Some(&disk_of(&chosen)),
+        )
+        .unwrap()
+        .unwrap();
         assert!(check.usable());
         assert_eq!(configured_folder_at(&setting), Ok(Some(chosen.clone())));
         assert_eq!(
@@ -2519,7 +2601,7 @@ mod storage_tests {
         assert!(configured_folder_at(&setting).is_err());
         std::fs::write(&setting, "/a\n/b\n").unwrap();
         assert!(configured_folder_at(&setting).is_err());
-        assert_eq!(set_folder_at(&setting, None, &[]), Ok(None));
+        assert_eq!(set_folder_at(&setting, None, &[], None), Ok(None));
         assert_eq!(configured_folder_at(&setting), Ok(None));
         assert!(chosen.exists(), "clearing the choice deletes nothing");
     }
@@ -2665,14 +2747,14 @@ mod second_review_tests {
         let setting = root.join("config/prepared_media_folder.txt");
         let first = root.join("first");
         let second = root.join("second");
-        set_folder_at(&setting, Some(&first), &[]).unwrap();
+        set_folder_at(&setting, Some(&first), &[], Some(&disk_of(&first))).unwrap();
         assert_eq!(still_safe(&first), Ok(()));
         assert!(
             previous_folders_at(&setting.with_file_name("prepared_media_previous_folders.txt"))
                 .is_empty()
         );
-        set_folder_at(&setting, Some(&second), &[]).unwrap();
-        set_folder_at(&setting, None, &[]).unwrap();
+        set_folder_at(&setting, Some(&second), &[], Some(&disk_of(&second))).unwrap();
+        set_folder_at(&setting, None, &[], None).unwrap();
         assert_eq!(
             previous_folders_at(&setting.with_file_name("prepared_media_previous_folders.txt")),
             vec![second.clone(), first.clone()],
@@ -3189,8 +3271,8 @@ mod mount_identity_tests {
     use super::*;
     use crate::recovery::bulk::*;
     use crate::recovery::prepared_media::{
-        FILESYSTEM_OVERRIDE, Filesystem, MOUNT_ROOT_OVERRIDE, filesystem_id, id_is_device_number,
-        is_mount_root, launch_refusal_judged, mount_points_in,
+        FILESYSTEM_OVERRIDE, Filesystem, MOUNT_ROOT_OVERRIDE, filesystem_id, is_mount_root,
+        launch_refusal_judged, mount_points_in,
     };
     use crate::recovery::storage::*;
     use std::cell::Cell;
@@ -3281,14 +3363,14 @@ mod mount_identity_tests {
             .unwrap();
     }
 
-    /// Choosing a folder records which filesystem it is on, and a filesystem
-    /// that cannot be recognised later is refused in the application itself.
+    /// Choosing a folder records the disk the person named for it, and a
+    /// filesystem without an identity is refused in the application itself.
     #[test]
-    fn choosing_a_folder_records_its_filesystem_and_refuses_one_without_identity() {
+    fn choosing_a_folder_records_the_named_disk_and_refuses_one_without_identity() {
         let lab = Lab::new();
         let setting = lab.root.join("config/prepared_media_folder.txt");
         let chosen = lab.root.join("chosen");
-        set_folder_at(&setting, Some(&chosen), &[]).unwrap();
+        set_folder_at(&setting, Some(&chosen), &[], Some(&disk_of(&chosen))).unwrap();
         let real = filesystem_id(&chosen);
         assert!(real.is_some());
         assert_eq!(recorded_filesystem_at(&setting, &chosen), Ok(real));
@@ -3297,9 +3379,20 @@ mod mount_identity_tests {
             Ok(None)
         );
 
-        // A filesystem that reports no id (FUSE, network): refused, nothing
-        // saved, and the folder the check made is not left behind.
+        // The record holds the UUID the person named, not something read
+        // from the folder.
+        let record = std::fs::read_to_string(
+            setting.with_file_name("prepared_media_folder_filesystems.json"),
+        )
+        .unwrap();
+        assert!(record.contains("\"format_version\": 2"), "{record}");
+        assert!(record.contains(&disk_of(&chosen)), "{record}");
+
+        // A filesystem that reports no id (FUSE, network) cannot be the disk
+        // of any UUID: refused, nothing saved, nothing created.
         let nameless = lab.root.join("on-a-network-share");
+        private_folder(&nameless);
+        let named = disk_of(&nameless);
         let active = Rc::new(Cell::new(true));
         let _pretend = pretend_below(
             &nameless,
@@ -3309,18 +3402,23 @@ mod mount_identity_tests {
             },
             active.clone(),
         );
-        let check = check_folder(&nameless, &[], false);
-        assert!(check.usable(), "nothing is known before it exists");
-        let refused = set_folder_at(&setting, Some(&nameless), &[]);
-        assert!(
-            refused
-                .as_ref()
-                .is_err_and(|detail| detail.contains("cannot tell which disk")),
-            "{refused:?}"
-        );
-        assert!(!nameless.exists());
+        for folder in [nameless.clone(), nameless.join("inside")] {
+            let check = check_folder(&folder, &[], Some(&named));
+            assert!(
+                !check.usable() && check.filesystem_uuid.is_none(),
+                "{check:?}"
+            );
+            let refused = set_folder_at(&setting, Some(&folder), &[], Some(&named));
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|detail| detail.contains("is not on the disk with filesystem UUID")),
+                "{refused:?}"
+            );
+            assert_eq!(recorded_filesystem_at(&setting, &folder), Ok(None));
+        }
+        assert!(everything_under(&nameless).is_empty());
         assert_eq!(configured_folder_at(&setting), Ok(Some(chosen.clone())));
-        assert_eq!(recorded_filesystem_at(&setting, &nameless), Ok(None));
 
         // A record that is not EmuWiz's is an error, never "no record".
         std::fs::write(
@@ -3330,7 +3428,7 @@ mod mount_identity_tests {
         .unwrap();
         assert!(recorded_filesystem_at(&setting, &chosen).is_err());
         // Choosing again writes a good record.
-        set_folder_at(&setting, Some(&chosen), &[]).unwrap();
+        set_folder_at(&setting, Some(&chosen), &[], Some(&disk_of(&chosen))).unwrap();
         assert_eq!(recorded_filesystem_at(&setting, &chosen), Ok(real));
     }
 
@@ -3737,16 +3835,6 @@ mod mount_identity_tests {
             mount_points_in(table),
             vec![PathBuf::from("/mnt2"), PathBuf::from("/mnt/My Disk\\x")]
         );
-        let real_mount = Path::new("/proc");
-        let refused = check_folder(real_mount, &[], false);
-        assert!(
-            refused
-                .problems
-                .iter()
-                .any(|problem| problem.contains("top folder of a disk")),
-            "{refused:?}"
-        );
-
         // A folder of our own, as if a disk were mounted on it.
         let zip = lab.standard_zip();
         let setting = lab.root.join("config/prepared_media_folder.txt");
@@ -3754,7 +3842,12 @@ mod mount_identity_tests {
         private_folder(&mount_point);
         let recorded = filesystem_id(&mount_point);
         let pretend = pretend_mount_root(&mount_point);
-        let chosen = set_folder_at(&setting, Some(&mount_point), &[]);
+        let chosen = set_folder_at(
+            &setting,
+            Some(&mount_point),
+            &[],
+            Some(&disk_of(&mount_point)),
+        );
         assert!(
             chosen
                 .as_ref()
@@ -3788,46 +3881,69 @@ mod mount_identity_tests {
         );
         // A folder inside the disk is fine.
         let inside = mount_point.join("prepared");
-        set_folder_at(&setting, Some(&inside), &[]).unwrap();
+        set_folder_at(&setting, Some(&inside), &[], Some(&disk_of(&inside))).unwrap();
         assert_eq!(configured_folder_at(&setting), Ok(Some(inside.clone())));
         drop(pretend);
         // Not a mount point after all: the same folder is accepted.
-        set_folder_at(&setting, Some(&mount_point), &[]).unwrap();
+        set_folder_at(
+            &setting,
+            Some(&mount_point),
+            &[],
+            Some(&disk_of(&mount_point)),
+        )
+        .unwrap();
     }
 
-    /// An id that is only the device number does not identify a disk.
+    /// Only ext4 is supported: there the identity the kernel reports comes
+    /// from the UUID alone. Any other filesystem is refused whatever UUID is
+    /// given, when a folder is checked, chosen or named, and nothing is
+    /// created or written on it.
     #[test]
-    fn a_filesystem_identified_only_by_its_device_number_is_refused_when_chosen() {
-        let sdb1 = libc::makedev(8, 17);
-        assert!(id_is_device_number(0x811, sdb1));
-        assert!(id_is_device_number(0x811 << 32, sdb1));
-        let nvme = libc::makedev(259, 300);
-        let encoded = (300 & 0xff) | (259 << 8) | ((300 & !0xff_u64) << 12);
-        assert!(id_is_device_number(encoded, nvme));
-        assert!(!id_is_device_number(0x736d_3899_3d24_8fc4, sdb1));
-        assert!(!id_is_device_number(0x9611_5acb_debb_fc0d, nvme));
-
+    fn a_filesystem_that_is_not_ext4_is_refused_and_not_written_to() {
+        use crate::recovery::disk_identity::EXT4_OVERRIDE;
         let lab = Lab::new();
         let setting = lab.root.join("config/prepared_media_folder.txt");
-        let folder = lab.root.join("on-xfs");
-        let active = Rc::new(Cell::new(true));
-        let _pretend = pretend_below(
-            &folder,
-            Filesystem {
-                device: sdb1,
-                id: Some(0x811),
-            },
-            active,
-        );
-        let refused = set_folder_at(&setting, Some(&folder), &[]);
+        let disk = lab.root.join("on-xfs");
+        private_folder(&disk);
+        let existing = disk.join("prepared");
+        private_folder(&existing);
+        let named = disk_of(&existing);
+        let below = disk.clone();
+        EXT4_OVERRIDE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path| Some(!path.starts_with(&below))));
+        });
+        for folder in [existing.clone(), disk.join("new-folder")] {
+            let check = check_folder(&folder, &[], Some(&named));
+            assert!(
+                check
+                    .problems
+                    .iter()
+                    .any(|problem| problem.contains("is not on an ext4 filesystem")),
+                "{check:?}"
+            );
+            assert!(check.filesystem_uuid.is_none());
+            let refused = set_folder_at(&setting, Some(&folder), &[], Some(&named));
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|detail| detail.contains("is not on an ext4 filesystem")),
+                "{refused:?}"
+            );
+        }
+        let by_name = PreparedMediaStore::named(&existing, Some(&named), "--store");
         assert!(
-            refused
+            by_name
                 .as_ref()
-                .is_err_and(|detail| detail.contains("no identity of its own")),
-            "{refused:?}"
+                .is_err_and(|detail| detail.contains("is not on an ext4 filesystem")),
+            "{by_name:?}"
         );
-        assert!(!folder.exists());
+        assert_eq!(everything_under(&disk), vec![existing.clone()]);
         assert_eq!(configured_folder_at(&setting), Ok(None));
+        assert!(
+            !setting
+                .with_file_name("prepared_media_folder_filesystems.json")
+                .exists()
+        );
     }
 
     /// The whole life of a removable disk in one sequence: mounted,
@@ -3847,7 +3963,8 @@ mod mount_identity_tests {
         // 0 = unmounted (what is really there), 1 = the disk, 2 = another.
         let phase = Rc::new(Cell::new(1_u8));
         let now = phase.clone();
-        let below = chosen.clone();
+        // The disk is mounted on `mnt-disk`; the folder is inside it.
+        let below = lab.root.join("mnt-disk");
         FILESYSTEM_OVERRIDE.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move |path| {
                 if !path.starts_with(&below) {
@@ -3869,7 +3986,7 @@ mod mount_identity_tests {
         };
 
         // Mounted: chosen (which records the disk), saved, used.
-        set_folder_at(&setting, Some(&chosen), &[]).unwrap();
+        set_folder_at(&setting, Some(&chosen), &[], Some(&disk_of(&chosen))).unwrap();
         assert_eq!(recorded_filesystem_at(&setting, &chosen), Ok(disk.id));
         let first = disc(&lab, "FIRST");
         let second = disc(&lab, "SECOND");
@@ -3909,13 +4026,22 @@ mod mount_identity_tests {
         std::fs::write(
             setting.with_file_name("prepared_media_folder_filesystems.json"),
             format!(
-                "{{\"format_version\":1,\"folders\":{{{:?}:{}}}}}",
+                "{{\"format_version\":2,\"folders\":{{{:?}:{:?}}}}}",
                 chosen.to_str().unwrap(),
-                other_disk.id.unwrap()
+                uuid_with_identity(other_disk.id.unwrap())
             ),
         )
         .unwrap();
-        assert!(open().is_err());
+        let refused = PreparedMediaStore::configured_recorded(
+            Some(chosen.clone()),
+            recorded_filesystem_at(&setting, &chosen).unwrap(),
+        );
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|detail| detail.contains("not on the disk it was on")),
+            "{refused:?}"
+        );
     }
 
     /// An earlier folder whose disk record is missing, unreadable or names
@@ -3927,7 +4053,7 @@ mod mount_identity_tests {
         let zip = lab.standard_zip();
         let setting = lab.root.join("config/prepared_media_folder.txt");
         let earlier = lab.root.join("earlier");
-        set_folder_at(&setting, Some(&earlier), &[]).unwrap();
+        set_folder_at(&setting, Some(&earlier), &[], Some(&disk_of(&earlier))).unwrap();
         let store = PreparedMediaStore::configured_recorded(
             Some(earlier.clone()),
             recorded_filesystem_at(&setting, &earlier).unwrap(),
@@ -3945,17 +4071,22 @@ mod mount_identity_tests {
             ("unreadable", b"{ not json".to_vec()),
             (
                 "from a later build",
-                b"{\"format_version\":2,\"folders\":{}}".to_vec(),
+                b"{\"format_version\":3,\"folders\":{}}".to_vec(),
+            ),
+            (
+                "from the build that did not verify the disk",
+                b"{\"format_version\":1,\"folders\":{}}".to_vec(),
             ),
             (
                 "no entry",
-                b"{\"format_version\":1,\"folders\":{}}".to_vec(),
+                b"{\"format_version\":2,\"folders\":{}}".to_vec(),
             ),
             (
                 "another disk",
                 format!(
-                    "{{\"format_version\":1,\"folders\":{{{:?}:{other}}}}}",
-                    earlier.to_str().unwrap()
+                    "{{\"format_version\":2,\"folders\":{{{:?}:{:?}}}}}",
+                    earlier.to_str().unwrap(),
+                    uuid_with_identity(other)
                 )
                 .into_bytes(),
             ),
@@ -3990,13 +4121,30 @@ mod mount_identity_tests {
         );
     }
 
+    /// Each kind of refusal a named folder can meet, through both routes.
+    fn named_is_refused(folder: &Path, uuid: Option<&str>, reason: &str) {
+        use crate::recovery::prepared_media::PREPARED_MEDIA_DIR_ENV;
+        let os = folder.to_path_buf().into_os_string();
+        for attempt in [
+            PreparedMediaStore::named(folder, uuid, "--store"),
+            PreparedMediaStore::named(folder, uuid, PREPARED_MEDIA_DIR_ENV),
+            PreparedMediaStore::for_profile_given(Some(os), uuid.map(std::ffi::OsString::from)),
+        ] {
+            assert!(
+                attempt
+                    .as_ref()
+                    .is_err_and(|detail| detail.contains(reason)),
+                "expected {reason:?}: {attempt:?}"
+            );
+        }
+    }
+
     /// A folder named for one run (`--store`, `EMUWIZ_PREPARED_MEDIA_DIR`)
-    /// has no record from an earlier run, so it must already be there and
-    /// pass the checks a chosen folder passes. A missing one is never
-    /// created: it may be a folder inside a disk that is not connected.
+    /// must already be there and pass the checks a chosen folder passes. A
+    /// missing one is never created: it may be a folder inside a disk that is
+    /// not connected.
     #[test]
     fn a_named_folder_must_already_exist_and_is_never_created() {
-        use crate::recovery::prepared_media::PREPARED_MEDIA_DIR_ENV;
         let lab = Lab::new();
         let zip = lab.standard_zip();
         // The empty mount point of a disk that is not connected, and the
@@ -4004,23 +4152,11 @@ mod mount_identity_tests {
         let mount_point = lab.root.join("mnt-absent");
         private_folder(&mount_point);
         let inside = mount_point.join("prepared");
-        for how in ["--store", PREPARED_MEDIA_DIR_ENV] {
-            let refused = PreparedMediaStore::named(&inside, how);
-            assert!(
-                refused.as_ref().is_err_and(
-                    |detail| detail.starts_with(how) && detail.contains("is not there")
-                ),
-                "{refused:?}"
-            );
-        }
-        let by_environment =
-            PreparedMediaStore::for_profile_given(Some(inside.clone().into_os_string()));
-        assert!(
-            by_environment
-                .as_ref()
-                .is_err_and(|detail| detail.contains("is not there")),
-            "{by_environment:?}"
-        );
+        let some_disk = uuid_with_identity(0x1111_2222_3333_4444);
+        assume_ext4();
+        named_is_refused(&inside, Some(&some_disk), "is not there");
+        // Even the UUID of the disk underneath does not get it created.
+        named_is_refused(&inside, Some(&disk_of(&mount_point)), "is not there");
         assert!(
             everything_under(&mount_point).is_empty(),
             "the missing folder was created under the absent disk: {:?}",
@@ -4028,92 +4164,131 @@ mod mount_identity_tests {
         );
 
         // Not a relative path, a file, a link, or a folder others can change.
-        assert!(PreparedMediaStore::named("prepared", "--store").is_err());
         let file = lab.root.join("a-file");
         std::fs::write(&file, b"x").unwrap();
-        assert!(PreparedMediaStore::named(&file, "--store").is_err());
         let real = lab.root.join("real-folder");
         private_folder(&real);
+        let here = disk_of(&real);
         let link = lab.root.join("a-link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        assert!(PreparedMediaStore::named(&link, "--store").is_err());
         let open = lab.root.join("open-folder");
         std::fs::create_dir(&open).unwrap();
         std::fs::set_permissions(&open, std::os::unix::fs::PermissionsExt::from_mode(0o777))
             .unwrap();
-        assert!(PreparedMediaStore::named(&open, "--store").is_err());
+        for unusable in [Path::new("prepared"), &file, &link, &open] {
+            assert!(PreparedMediaStore::named(unusable, Some(&here), "--store").is_err());
+        }
+        // Not a mount point itself, even on the named disk.
+        {
+            let _mount = pretend_mount_root(&real);
+            named_is_refused(&real, Some(&here), "top folder of a disk");
+        }
         for folder in [&real, &open] {
             assert!(everything_under(folder).is_empty());
         }
 
-        // Not a mount point itself.
-        {
-            let _mount = pretend_mount_root(&real);
-            let refused = PreparedMediaStore::named(&real, "--store");
-            assert!(
-                refused
-                    .as_ref()
-                    .is_err_and(|detail| detail.contains("top folder of a disk")),
-                "{refused:?}"
-            );
-        }
-        // Not a filesystem that cannot be recognised later.
-        let genuine = real_filesystem(&real);
-        for (unusable, reason) in [
-            (
-                Filesystem {
-                    device: genuine.device,
-                    id: None,
-                },
-                "cannot tell which disk",
-            ),
-            (
-                Filesystem {
-                    device: 0x0811,
-                    id: Some(0x0811),
-                },
-                "no identity of its own",
-            ),
-        ] {
-            let _pretend = pretend_below(&real, unusable, Rc::new(Cell::new(true)));
-            let refused = PreparedMediaStore::named(&real, "--store");
-            assert!(
-                refused
-                    .as_ref()
-                    .is_err_and(|detail| detail.contains(reason)),
-                "{refused:?}"
-            );
-        }
-        assert!(everything_under(&real).is_empty());
-
-        // An existing, plain, private folder on a recognisable filesystem is
-        // accepted and works as before, through either route.
-        let store = PreparedMediaStore::named(&real, "--store").unwrap();
+        // An existing, plain, private folder on the named disk is accepted
+        // and works as before, through either route.
+        let store = PreparedMediaStore::named(&real, Some(&here), "--store").unwrap();
         prepare_in(&store, &lab, &zip).unwrap();
         assert_eq!(store.list().len(), 1);
-        let again =
-            PreparedMediaStore::for_profile_given(Some(real.clone().into_os_string())).unwrap();
+        let again = PreparedMediaStore::for_profile_given(
+            Some(real.clone().into_os_string()),
+            Some(here.clone().into()),
+        )
+        .unwrap();
         assert_eq!(again.list().len(), 1);
     }
 
-    /// A named folder is tied to the filesystem it was on when the command
-    /// started: if another filesystem is at that path afterwards, or the
-    /// folder is gone, nothing is written and nothing is created.
+    /// A named folder being there proves nothing about which disk is. It is
+    /// used only on the disk named with it: a folder of the same name on the
+    /// disk underneath an absent one (with whatever is in it), another disk
+    /// at the same path, no UUID, a UUID that is not one, or an identity two
+    /// connected disks share are all refused, and nothing is written.
     #[test]
-    fn a_named_folder_is_tied_to_the_filesystem_it_started_on() {
+    fn a_named_folder_is_used_only_on_the_disk_named_with_it() {
+        use crate::recovery::disk_identity::SAME_IDENTITY_OVERRIDE;
+        use crate::recovery::prepared_media::PREPARED_MEDIA_FILESYSTEM_ENV;
         let lab = Lab::new();
         let zip = lab.standard_zip();
-        let mount_point = lab.root.join("mnt-named");
+        assume_ext4();
+
+        // The intended disk is absent. A folder of the same name really
+        // exists on the disk underneath: plain, private, holding a store's
+        // folders and a binding file left by an earlier build, which names
+        // the very filesystem it is on.
+        let mount_point = lab.root.join("mnt-absent");
         private_folder(&mount_point);
-        let named = mount_point.join("prepared");
-        private_folder(&named);
-        let underneath = real_filesystem(&named);
-        let disk = another(underneath);
+        let same_name = mount_point.join("prepared");
+        private_folder(&same_name);
+        for inner in ["v1", "v1/sets", "v1/staging", "v1/sources"] {
+            private_folder(&same_name.join(inner));
+        }
+        let underneath = real_filesystem(&same_name);
+        std::fs::write(
+            same_name.join("emuwiz-storage-binding.json"),
+            format!(
+                "{{\"format_version\":1,\"filesystem_id\":\"{:016x}\"}}\n",
+                underneath.id.unwrap()
+            ),
+        )
+        .unwrap();
+        let intended = uuid_with_identity(another(underneath).id.unwrap());
+        let before = everything_under(&mount_point);
+        named_is_refused(
+            &same_name,
+            Some(&intended),
+            "is not on the disk with filesystem UUID",
+        );
+        named_is_refused(&same_name, None, "say which disk");
+        for not_a_uuid in [
+            "",
+            "prepared",
+            "0123",
+            "01234567-89ab-cdef-0123-456789abcdeg",
+            "01234567x89ab-cdef-0123-456789abcdef",
+            "00000000-0000-0000-0000-000000000000",
+        ] {
+            assert!(
+                PreparedMediaStore::named(&same_name, Some(not_a_uuid), "--store").is_err(),
+                "{not_a_uuid:?}"
+            );
+        }
+        // The second variable alone names no folder: refused, not ignored.
+        let alone = PreparedMediaStore::for_profile_given(None, Some(intended.clone().into()));
+        assert!(
+            alone
+                .as_ref()
+                .is_err_and(|detail| detail.contains(PREPARED_MEDIA_FILESYSTEM_ENV)),
+            "{alone:?}"
+        );
+        assert_eq!(
+            everything_under(&mount_point),
+            before,
+            "something was written"
+        );
+
+        // The disk is there when the command starts, then goes; later
+        // another disk is at the same path.
+        let external = lab.root.join("mnt-external");
+        private_folder(&external);
+        let prepared = external.join("prepared");
+        private_folder(&prepared);
+        let disk = another(real_filesystem(&prepared));
         let active = Rc::new(Cell::new(true));
-        let _pretend = pretend_below(&mount_point, disk, active.clone());
-        let store = PreparedMediaStore::named(&named, "--store").unwrap();
-        // The disk goes: the same path is now a folder on the disk underneath.
-        active.set(false);
+        let pretend = pretend_below(&external, disk, active.clone());
+        let named = disk_of(&prepared);
+        assert_eq!(named, uuid_with_identity(disk.id.unwrap()));
+        let store = PreparedMediaStore::named(&prepared, Some(&named), "--store").unwrap();
+        active.set(false); // the disk goes; the same-named folder is underneath
+        let before = everything_under(&external);
+        named_is_refused(
+            &prepared,
+            Some(&named),
+            "is not on the disk with filesystem UUID",
+        );
+        // A store value made while the disk was there refuses at its next
+        // write boundary too.
         let attempt = prepare_in(&store, &lab, &zip);
         assert!(
             matches!(&attempt, Err(PrepareError::Store(detail)) if detail.contains("not on the disk it was on")),
@@ -4121,16 +4296,656 @@ mod mount_identity_tests {
         );
         assert!(store.ready().is_err());
         assert!(store.resolved().is_none());
-        assert!(
-            everything_under(&named).is_empty(),
-            "something was written under the absent disk: {:?}",
-            everything_under(&named)
-        );
-        // The folder itself gone (as after a real unmount): not recreated.
-        std::fs::remove_dir(&named).unwrap();
+        assert_eq!(everything_under(&external), before, "something was written");
+        // The disk is back: usable again.
         active.set(true);
+        let store = PreparedMediaStore::named(&prepared, Some(&named), "--store").unwrap();
+        prepare_in(&store, &lab, &zip).unwrap();
+        // Another disk at the same path, holding the same folder and files.
+        drop(pretend);
+        let _other = pretend_below(&external, another(disk), Rc::new(Cell::new(true)));
+        named_is_refused(
+            &prepared,
+            Some(&named),
+            "is not on the disk with filesystem UUID",
+        );
+        drop(_other);
+
+        // Two connected disks report the identity (a copied disk), none
+        // does, or the list of disks cannot be read: refused each time.
+        let plain = lab.root.join("plain");
+        private_folder(&plain);
+        let here = disk_of(&plain);
+        for (connected, reason) in [
+            (Ok(2), "more than one connected disk"),
+            (Ok(0), "is not among the mounted ext4 disks"),
+            (
+                Err("the list of mounted disks could not be read".to_string()),
+                "could not be read",
+            ),
+        ] {
+            SAME_IDENTITY_OVERRIDE.with(|hook| {
+                let connected = connected.clone();
+                *hook.borrow_mut() = Some(Box::new(move |_| Some(connected.clone())));
+            });
+            named_is_refused(&plain, Some(&here), reason);
+        }
+        assert!(everything_under(&plain).is_empty());
+    }
+
+    /// A named folder is tied to the filesystem it was on when the command
+    /// started: if the folder is gone afterwards (as after a real unmount),
+    /// it is not created again and nothing is written.
+    #[test]
+    fn a_named_folder_that_goes_away_is_not_created_again() {
+        let lab = Lab::new();
+        let zip = lab.standard_zip();
+        let mount_point = lab.root.join("mnt-named");
+        private_folder(&mount_point);
+        let named = mount_point.join("prepared");
+        private_folder(&named);
+        let here = disk_of(&named);
+        let store = PreparedMediaStore::named(&named, Some(&here), "--store").unwrap();
+        std::fs::remove_dir(&named).unwrap();
+        assert!(store.ready().is_err());
+        assert!(prepare_in(&store, &lab, &zip).is_err());
+        assert!(PreparedMediaStore::named(&named, Some(&here), "--store").is_err());
+        assert!(everything_under(&mount_point).is_empty());
+    }
+
+    /// The first time a folder is chosen (Blue's storage card and
+    /// `storage --set` both end here), the disk is never taken from where
+    /// the folder happens to be. With the intended disk absent, nothing is
+    /// created underneath, nothing is probed, and nothing is saved, whether
+    /// or not a folder of the same name exists there.
+    #[test]
+    fn choosing_a_folder_never_trusts_the_disk_that_happens_to_be_there() {
+        let lab = Lab::new();
+        let setting = lab.root.join("config/prepared_media_folder.txt");
+        let record = setting.with_file_name("prepared_media_folder_filesystems.json");
+        assume_ext4();
+        let mount_point = lab.root.join("mnt-disk");
+        private_folder(&mount_point);
+        let folder = mount_point.join("prepared");
+        let underneath = real_filesystem(&mount_point);
+        let disk = another(underneath);
+        let intended = uuid_with_identity(disk.id.unwrap());
+        let nothing_saved = || {
+            assert_eq!(configured_folder_at(&setting), Ok(None));
+            assert!(!record.exists(), "a record was written");
+        };
+        let refused = |uuid: Option<&str>, reason: &str| {
+            let check = check_folder(&folder, &[], uuid);
+            assert!(
+                !check.usable()
+                    && check.filesystem_uuid.is_none()
+                    && check
+                        .problems
+                        .iter()
+                        .any(|problem| problem.contains(reason)),
+                "expected {reason:?}: {check:?}"
+            );
+            let set = set_folder_at(&setting, Some(&folder), &[], uuid);
+            assert!(
+                set.as_ref().is_err_and(|detail| detail.contains(reason)),
+                "expected {reason:?}: {set:?}"
+            );
+        };
+
+        // The disk is absent and the folder does not exist underneath.
+        refused(Some(&intended), "is not on the disk with filesystem UUID");
+        refused(None, "Say which disk this folder is on");
+        refused(Some("not-a-uuid"), "is not a filesystem UUID");
+        assert!(
+            everything_under(&mount_point).is_empty(),
+            "created underneath"
+        );
+        nothing_saved();
+
+        // The disk is absent and a folder of the same name exists
+        // underneath, private and ready to be written to.
+        private_folder(&folder);
+        std::fs::write(folder.join("emuwiz-storage-binding.json"), b"{}").unwrap();
+        let before = everything_under(&mount_point);
+        refused(Some(&intended), "is not on the disk with filesystem UUID");
+        refused(None, "Say which disk this folder is on");
+        assert_eq!(everything_under(&mount_point), before, "written underneath");
+        nothing_saved();
+        std::fs::remove_file(folder.join("emuwiz-storage-binding.json")).unwrap();
+        std::fs::remove_dir(&folder).unwrap();
+
+        // Another disk is mounted at the path.
+        {
+            let _wrong = pretend_below(&mount_point, another(disk), Rc::new(Cell::new(true)));
+            refused(Some(&intended), "is not on the disk with filesystem UUID");
+        }
+        // The identity is shared by two connected disks.
+        {
+            use crate::recovery::disk_identity::SAME_IDENTITY_OVERRIDE;
+            let _there = pretend_below(&mount_point, disk, Rc::new(Cell::new(true)));
+            SAME_IDENTITY_OVERRIDE
+                .with(|hook| *hook.borrow_mut() = Some(Box::new(|_| Some(Ok(2)))));
+            refused(Some(&intended), "more than one connected disk");
+            SAME_IDENTITY_OVERRIDE.with(|hook| *hook.borrow_mut() = None);
+            assume_ext4();
+        }
+        assert!(
+            everything_under(&mount_point).is_empty(),
+            "created on the wrong disk"
+        );
+        nothing_saved();
+
+        // A path that leads somewhere else through a link: the folder above
+        // is resolved first and must itself be on the named disk.
+        let elsewhere = lab.root.join("elsewhere");
+        private_folder(&elsewhere);
+        let through = lab.root.join("looks-like-the-disk");
+        std::os::unix::fs::symlink(&elsewhere, &through).unwrap();
+        let set = set_folder_at(
+            &setting,
+            Some(&through.join("prepared")),
+            &[],
+            Some(&intended),
+        );
+        assert!(set.is_err(), "{set:?}");
+        let set = set_folder_at(&setting, Some(&through), &[], Some(&disk_of(&elsewhere)));
+        assert!(
+            set.as_ref().is_err_and(|detail| detail.contains("link")),
+            "{set:?}"
+        );
+        assert!(everything_under(&elsewhere).is_empty());
+        nothing_saved();
+
+        // The mount changes between the checks and the creation: wherever
+        // the change lands, either the choice is refused and nothing is left
+        // underneath, or everything was verified on the disk.
+        for lands_after in 0..8_usize {
+            let seen = Rc::new(Cell::new(0_usize));
+            let below = mount_point.clone();
+            let count = seen.clone();
+            FILESYSTEM_OVERRIDE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |path| {
+                    if !path.starts_with(&below) {
+                        return None;
+                    }
+                    count.set(count.get() + 1);
+                    (count.get() <= lands_after).then_some(disk)
+                }));
+            });
+            let set = set_folder_at(&setting, Some(&folder), &[], Some(&intended));
+            FILESYSTEM_OVERRIDE.with(|hook| *hook.borrow_mut() = None);
+            match set {
+                Err(_) => {
+                    assert!(
+                        everything_under(&mount_point).is_empty(),
+                        "change after {lands_after} checks left {:?}",
+                        everything_under(&mount_point)
+                    );
+                    nothing_saved();
+                }
+                Ok(_) => {
+                    assert!(
+                        seen.get() <= lands_after,
+                        "accepted after the disk had gone"
+                    );
+                    std::fs::remove_dir(&folder).unwrap();
+                    std::fs::remove_file(&setting).unwrap();
+                    std::fs::remove_file(&record).unwrap();
+                }
+            }
+        }
+
+        // The disk is there: the folder is created on it, the named UUID is
+        // saved, and the choice works while the disk stays.
+        let active = Rc::new(Cell::new(true));
+        let _there = pretend_below(&mount_point, disk, active.clone());
+        let check = set_folder_at(&setting, Some(&folder), &[], Some(&intended.to_uppercase()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(check.filesystem_uuid.as_deref(), Some(intended.as_str()));
+        assert!(folder.is_dir());
+        assert_eq!(recorded_filesystem_at(&setting, &folder), Ok(disk.id));
+        let recorded = recorded_filesystem_at(&setting, &folder).unwrap();
+        assert!(
+            PreparedMediaStore::configured_recorded(Some(folder.clone()), recorded)
+                .unwrap()
+                .is_some()
+        );
+        // And is refused, as before, once the disk is gone.
+        active.set(false);
+        assert!(PreparedMediaStore::configured_recorded(Some(folder.clone()), recorded).is_err());
+    }
+
+    /// Creating the chosen folder is itself guarded, apart from the checks
+    /// made before and after it. The folder above is verified before
+    /// anything is created in it: on the wrong disk, no folder is made and
+    /// removed again (the folder above keeps its modification time).
+    #[test]
+    fn a_folder_is_not_created_even_briefly_under_the_wrong_disk() {
+        let lab = Lab::new();
+        assume_ext4();
+        let mount_point = lab.root.join("mnt-disk");
+        private_folder(&mount_point);
+        let folder = mount_point.join("prepared");
+        let intended = uuid_with_identity(another(real_filesystem(&mount_point)).id.unwrap());
+        let modified = |path: &Path| {
+            let facts = std::fs::metadata(path).unwrap();
+            (facts.mtime(), facts.mtime_nsec())
+        };
+        let before = modified(&mount_point);
+        // Longer than the clock step a folder's timestamps are taken with.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(create_on_verified_disk(&folder, &[], Some(&intended)).is_err());
+        assert!(everything_under(&mount_point).is_empty());
+        assert_eq!(
+            modified(&mount_point),
+            before,
+            "a folder was created underneath and removed again"
+        );
+    }
+
+    /// The folder just created is not taken to be on the disk because the
+    /// folder above was: if the first look at it finds another filesystem,
+    /// it is refused and removed. (Two checks look at the new folder, one
+    /// through the handle it was created by and one by its path; this test
+    /// cannot tell them apart, so it does not prove the first on its own.)
+    #[test]
+    fn a_created_folder_first_seen_on_another_disk_is_refused_and_removed() {
+        let lab = Lab::new();
+        assume_ext4();
+        let mount_point = lab.root.join("mnt-disk");
+        private_folder(&mount_point);
+        let folder = mount_point.join("prepared");
+        let disk = another(real_filesystem(&mount_point));
+        let elsewhere = another(disk);
+        let intended = uuid_with_identity(disk.id.unwrap());
+        let looks = Rc::new(Cell::new(0_usize));
+        let (count, new_folder) = (looks.clone(), folder.clone());
+        FILESYSTEM_OVERRIDE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path| {
+                if path != new_folder {
+                    return Some(disk);
+                }
+                count.set(count.get() + 1);
+                Some(if count.get() == 1 { elsewhere } else { disk })
+            }));
+        });
+        let _clear = Pretend;
+        let made = create_on_verified_disk(&folder, &[], Some(&intended));
+        assert!(looks.get() >= 1, "the new folder was never looked at");
+        assert!(
+            made.is_err(),
+            "accepted a folder first seen on another disk"
+        );
+        assert!(everything_under(&mount_point).is_empty());
+    }
+
+    /// A saved choice is held, each time it is used, to the same proof as
+    /// when it was chosen: not only the recorded identity, but an ext4
+    /// filesystem and no second connected disk reporting that identity (a
+    /// copied disk mounted in its place).
+    #[test]
+    fn a_saved_choice_is_held_to_the_full_proof_each_time_it_is_used() {
+        use crate::recovery::disk_identity::{EXT4_OVERRIDE, SAME_IDENTITY_OVERRIDE};
+        let lab = Lab::new();
+        let zip = lab.standard_zip();
+        let chosen = lab.root.join("chosen");
+        private_folder(&chosen);
+        let real = real_filesystem(&chosen);
+        let store = PreparedMediaStore::configured_recorded(Some(chosen.clone()), real.id)
+            .unwrap()
+            .unwrap();
+        let refused_with = |reason: &str| {
+            let attempt = prepare_in(&store, &lab, &zip);
+            assert!(
+                matches!(&attempt, Err(PrepareError::Store(detail)) if detail.contains(reason)),
+                "expected {reason:?}: {attempt:?}"
+            );
+            assert!(store.ready().is_err());
+            assert!(everything_under(&chosen).is_empty());
+        };
+
+        SAME_IDENTITY_OVERRIDE.with(|hook| *hook.borrow_mut() = Some(Box::new(|_| Some(Ok(2)))));
+        refused_with("more than one connected disk");
+        SAME_IDENTITY_OVERRIDE.with(|hook| *hook.borrow_mut() = Some(Box::new(|_| Some(Ok(0)))));
+        refused_with("not among the mounted ext4 disks");
+        SAME_IDENTITY_OVERRIDE.with(|hook| *hook.borrow_mut() = Some(Box::new(|_| Some(Ok(1)))));
+
+        EXT4_OVERRIDE.with(|hook| *hook.borrow_mut() = Some(Box::new(|_| Some(false))));
+        refused_with("is not on an ext4 filesystem");
+        EXT4_OVERRIDE.with(|hook| *hook.borrow_mut() = Some(Box::new(|_| Some(true))));
+
+        // With the proof whole again the same store prepares.
+        assert!(prepare_in(&store, &lab, &zip).is_ok());
+    }
+
+    /// A folder tied to a disk is never created, whichever way the store
+    /// was made: an earlier folder that is gone (its disk is absent) is
+    /// refused, and nothing appears where its disk would be mounted.
+    #[test]
+    fn a_folder_tied_to_a_disk_is_never_created() {
+        let lab = Lab::new();
+        let zip = lab.standard_zip();
+        let mount_point = lab.root.join("mnt-gone");
+        private_folder(&mount_point);
+        let folder = mount_point.join("prepared");
+        let recorded = real_filesystem(&mount_point).id.unwrap();
+        let store = PreparedMediaStore::earlier(folder, recorded);
         assert!(store.ready().is_err());
         assert!(prepare_in(&store, &lab, &zip).is_err());
         assert!(everything_under(&mount_point).is_empty());
+    }
+
+    /// Removing a prepared copy deletes its link records by path. If the
+    /// disk goes while the copy is being removed, those deletions are not
+    /// made: what is at the path now is not the store the removal began in.
+    #[test]
+    fn link_records_are_not_removed_by_path_once_the_disk_has_gone() {
+        let lab = Lab::new();
+        let zip = lab.standard_zip();
+        let chosen = lab.root.join("chosen");
+        private_folder(&chosen);
+        let real = real_filesystem(&chosen);
+        let store = PreparedMediaStore::configured_recorded(Some(chosen.clone()), real.id)
+            .unwrap()
+            .unwrap();
+        let set_id = prepare_in(&store, &lab, &zip).unwrap().summary.set_id;
+        let records = || {
+            std::fs::read_dir(chosen.join("v1/sources"))
+                .unwrap()
+                .count()
+        };
+        let before = records();
+        assert!(before >= 1);
+        let gone = Rc::new(Cell::new(false));
+        let _pretend = pretend_below(&chosen, another(real), gone.clone());
+        let flag = gone.clone();
+        let _ = with_hook(
+            move |reached| {
+                if reached == Point::AfterRemovalParked {
+                    flag.set(true);
+                }
+            },
+            || store.remove(&set_id),
+        );
+        assert!(
+            gone.get(),
+            "the removal never reached the point of the change"
+        );
+        assert_eq!(records(), before, "link records were removed by path");
+    }
+
+    /// A record written by the build that remembered whatever filesystem a
+    /// folder was on (format 1) is not trusted: the folder is refused until
+    /// it is chosen again with its disk named, and the launch check refuses
+    /// the files inside it meanwhile.
+    #[test]
+    fn a_record_that_never_verified_the_disk_is_not_trusted() {
+        let lab = Lab::new();
+        let setting = lab.root.join("config/prepared_media_folder.txt");
+        let record = setting.with_file_name("prepared_media_folder_filesystems.json");
+        let folder = lab.root.join("chosen-earlier");
+        private_folder(&folder);
+        std::fs::create_dir_all(setting.parent().unwrap()).unwrap();
+        std::fs::write(&setting, format!("{}\n", folder.display())).unwrap();
+        std::fs::write(
+            &record,
+            format!(
+                "{{\"format_version\":1,\"folders\":{{\"{}\":{}}}}}",
+                folder.display(),
+                filesystem_id(&folder).unwrap()
+            ),
+        )
+        .unwrap();
+        let old = recorded_filesystem_at(&setting, &folder);
+        assert!(
+            old.as_ref()
+                .is_err_and(|detail| detail.contains("did not verify which disk")),
+            "{old:?}"
+        );
+        assert!(earlier_folder_distrust_at(&setting, &folder).is_err());
+        // A damaged UUID in a current record is an error too.
+        std::fs::write(
+            &record,
+            format!(
+                "{{\"format_version\":2,\"folders\":{{\"{}\":\"not-a-uuid\"}}}}",
+                folder.display()
+            ),
+        )
+        .unwrap();
+        assert!(recorded_filesystem_at(&setting, &folder).is_err());
+        // Chosen again with its disk named: a current record replaces it.
+        set_folder_at(&setting, Some(&folder), &[], Some(&disk_of(&folder))).unwrap();
+        assert_eq!(
+            recorded_filesystem_at(&setting, &folder),
+            Ok(filesystem_id(&folder))
+        );
+        assert_eq!(earlier_folder_distrust_at(&setting, &folder), Ok(()));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// From a filesystem UUID to the identity the kernel reports
+// ---------------------------------------------------------------------------
+
+/// Unlike the tests above, nothing here is built backwards: the expected
+/// identities are fixed values worked out separately from this code, from
+/// the kernel's rule for ext4 (`ext4_statfs`: the UUID's 16 bytes as two
+/// little-endian 64-bit halves, XORed).
+mod disk_identity_tests {
+    use super::*;
+    use crate::recovery::disk_identity::*;
+
+    /// (UUID, identity) pairs computed outside this code. The third tells
+    /// little-endian halves from big-endian ones; the last has no dashes.
+    const VECTORS: [(&str, u64); 4] = [
+        (
+            "00112233-4455-6677-8899-aabbccddeeff",
+            0x8888_8888_8888_8888,
+        ),
+        (
+            "6f1d2c3b-4a59-4e68-9778-a6b5c4d3e2f1",
+            0x99ac_8a8e_8e8a_65f8,
+        ),
+        (
+            "ffffffff-ffff-ffff-0000-000000000001",
+            0xfeff_ffff_ffff_ffff,
+        ),
+        ("0123456789abcdef0011223344556677", 0x98ab_fecd_5467_3201),
+    ];
+
+    #[test]
+    fn known_uuids_give_their_known_identities() {
+        for (uuid, identity) in VECTORS {
+            let parsed = ExpectedFilesystem::parse(uuid).unwrap();
+            assert_eq!(parsed.id(), identity, "{uuid}");
+            // The same disk however it is written.
+            let upper = ExpectedFilesystem::parse(&format!("  {}\n", uuid.to_uppercase())).unwrap();
+            assert_eq!(upper, parsed);
+            assert_eq!(parsed.uuid().len(), 36);
+            assert_eq!(parsed.uuid().replace('-', ""), uuid.replace('-', ""));
+            assert_eq!(ExpectedFilesystem::parse(parsed.uuid()).unwrap(), parsed);
+        }
+        // Not the big-endian reading, and not the halves swapped into
+        // another value.
+        assert_ne!(
+            ExpectedFilesystem::parse(VECTORS[2].0).unwrap().id(),
+            0xffff_ffff_ffff_fffe
+        );
+    }
+
+    #[test]
+    fn anything_that_is_not_a_uuid_is_refused() {
+        for text in [
+            "",
+            " ",
+            "0",
+            "00112233-4455-6677-8899-aabbccddeef",
+            "00112233-4455-6677-8899-aabbccddeeff0",
+            "00112233-4455-6677-8899-aabbccddeefg",
+            "00112233_4455_6677_8899_aabbccddeeff",
+            "0011-22334455-6677-8899-aabbccddeeff",
+            "00112233-4455-6677-8899aabbccddeeff",
+            "-00112233445566778899aabbccddeeff---",
+            "{00112233-4455-6677-8899-aabbccddeeff}",
+            "UUID=00112233-4455-6677-8899-aabbccddeeff",
+            "/dev/sda1",
+            "ｆfffffff-ffff-ffff-0000-00000000001",
+        ] {
+            assert!(ExpectedFilesystem::parse(text).is_err(), "{text:?}");
+        }
+        // The empty identity: the all-zero UUID, and halves that cancel.
+        for empty in [
+            "00000000-0000-0000-0000-000000000000",
+            "01234567-89ab-cdef-0123-456789abcdef",
+        ] {
+            let refused = ExpectedFilesystem::parse(empty);
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|detail| detail.contains("does not identify")),
+                "{refused:?}"
+            );
+        }
+    }
+
+    const TABLE: &str = "\
+24 1 252:0 / / rw,relatime shared:1 - ext4 /dev/mapper/vg-root rw\n\
+30 24 8:33 / /mnt/My\\040Disk rw shared:5 - ext4 /dev/sdc1 rw\n\
+31 24 8:33 /sub /mnt/again rw shared:5 - ext4 /dev/sdc1 rw\n\
+32 24 8:49 / /mnt/copy rw shared:6 - ext4 /dev/sdd1 rw\n\
+33 24 0:40 / /mnt/tmp rw - tmpfs tmpfs rw\n\
+34 24 8:65 / /mnt/xfs rw - xfs /dev/sde1 rw\n";
+
+    fn identities(_device: &str, mount_point: &Path) -> Option<u64> {
+        match mount_point.to_str()? {
+            "/" => Some(VECTORS[0].1),
+            "/mnt/My Disk" | "/mnt/again" | "/mnt/copy" => Some(VECTORS[1].1),
+            // Never asked for: not ext4.
+            "/mnt/tmp" | "/mnt/xfs" => Some(VECTORS[0].1),
+            _ => None,
+        }
+    }
+
+    /// A mount is asked for its identity only if its path still leads to
+    /// that device: a mount hidden under another one must not be given the
+    /// identity of what covers it. Read-only, on this machine's own "/".
+    #[test]
+    fn a_mount_that_is_covered_by_another_reports_nothing() {
+        assert_eq!(device_name(libc::makedev(8, 33)), "8:33");
+        assert_eq!(device_name(libc::makedev(252, 0)), "252:0");
+        let root = Path::new("/");
+        let device = std::fs::metadata(root).unwrap().dev();
+        let real = crate::recovery::prepared_media::filesystem_id(root);
+        assert_eq!(visible_identity(&device_name(device), root), real);
+        // The table says another device is mounted here: it is covered.
+        let other = device_name(device.wrapping_add(1));
+        assert_eq!(visible_identity(&other, root), None);
+    }
+
+    #[test]
+    fn a_shared_identity_is_noticed_and_other_filesystems_do_not_count() {
+        // One disk, mounted once.
+        assert_eq!(
+            devices_reporting(TABLE, VECTORS[0].1, &identities)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["252:0"]
+        );
+        // One disk mounted twice is one disk; a second device is another.
+        assert_eq!(
+            devices_reporting(TABLE, VECTORS[1].1, &identities)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["8:33", "8:49"]
+        );
+        assert!(devices_reporting(TABLE, VECTORS[2].1, &identities).is_empty());
+    }
+
+    #[test]
+    fn only_consistently_identified_ext4_disks_are_offered() {
+        let facts = |device: &str| match device {
+            "252:0" => Some((VECTORS[0].0.to_string(), Some("system".to_string()))),
+            // The device database names this UUID for both devices.
+            "8:33" | "8:49" => Some((VECTORS[1].0.to_string(), None)),
+            "8:65" => Some((VECTORS[2].0.to_string(), None)),
+            _ => None,
+        };
+        let offered = mounted_ext4_disks_in(TABLE, &facts, &identities);
+        assert_eq!(offered.len(), 1, "{offered:?}");
+        assert_eq!(offered[0].uuid, VECTORS[0].0);
+        assert_eq!(offered[0].label.as_deref(), Some("system"));
+        assert_eq!(offered[0].mount_point, Path::new("/"));
+
+        // Without the copy, the disk is offered once, at its shortest mount.
+        let single: String =
+            TABLE
+                .lines()
+                .filter(|l| !l.contains("8:49"))
+                .fold(String::new(), |mut table, line| {
+                    table.push_str(line);
+                    table.push('\n');
+                    table
+                });
+        let offered = mounted_ext4_disks_in(&single, &facts, &identities);
+        assert_eq!(offered.len(), 2, "{offered:?}");
+        assert_eq!(offered[1].mount_point, Path::new("/mnt/again"));
+        // A device database that names another UUID than the mounted
+        // filesystem reports: not offered.
+        let stale = |device: &str| match device {
+            "252:0" => Some((VECTORS[2].0.to_string(), None)),
+            _ => None,
+        };
+        assert!(mounted_ext4_disks_in(&single, &stale, &identities).is_empty());
+
+        assert_eq!(
+            device_facts_in("S:disk/by-uuid/x\nE:ID_FS_LABEL=Games\nE:ID_FS_UUID=abc\n"),
+            Some(("abc".to_string(), Some("Games".to_string())))
+        );
+        assert_eq!(device_facts_in("E:ID_FS_TYPE=ext4\n"), None);
+    }
+
+    /// Read-only, on whatever machine runs the tests: every mounted ext4
+    /// filesystem whose UUID the system's device database knows must report
+    /// exactly the identity this code derives from that UUID. Real UUIDs,
+    /// real identities; none is printed. On a machine where none is visible
+    /// (a container), this checks nothing and says so.
+    #[test]
+    fn this_machines_own_ext4_filesystems_agree_with_the_rule() {
+        let table = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        let mut checked = 0;
+        for line in table.lines() {
+            let Some((before, after)) = line.split_once(" - ") else {
+                continue;
+            };
+            if !after.starts_with("ext4 ") {
+                continue;
+            }
+            let fields: Vec<&str> = before.split(' ').collect();
+            let (Some(device), Some(mount_point)) = (fields.get(2), fields.get(4)) else {
+                continue;
+            };
+            if mount_point.contains('\\') {
+                continue;
+            }
+            let Ok(record) = std::fs::read_to_string(format!("/run/udev/data/b{device}")) else {
+                continue;
+            };
+            let Some((uuid, _)) = device_facts_in(&record) else {
+                continue;
+            };
+            let Some(reported) =
+                crate::recovery::prepared_media::filesystem_id(Path::new(mount_point))
+            else {
+                continue;
+            };
+            assert_eq!(
+                ExpectedFilesystem::parse(&uuid).unwrap().id(),
+                reported,
+                "the ext4 filesystem mounted at {mount_point} does not report the identity of its UUID"
+            );
+            checked += 1;
+        }
+        println!("real ext4 filesystems checked against their UUIDs: {checked}");
     }
 }

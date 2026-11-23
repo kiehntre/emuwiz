@@ -28,12 +28,17 @@ emuwiz-cli recovery <command>
   queue                                      the saved batch and what is left of it (read-only)
   resume                                     continue an unfinished batch
   forget-queue                               forget the saved batch (prepared copies are kept)
-  storage [--set <folder> | --reset]         where prepared copies are kept; choose another folder
+  storage                                    where prepared copies are kept, and the connected ext4 disks
+  storage --set <folder> --filesystem <UUID> keep them in this folder, on the disk with that filesystem UUID
+  storage --reset                            keep them in EmuWiz's own data folder again
 
 Options:
   --system <system>     the system the library records for the file, for example AmigaCD32
   --system-source <s>   how it was recorded (folder_alias, manual); a folder is never proof
-  --store <folder>      use this existing prepared-media folder (absolute path; never created) instead of the profile's
+  --store <folder> --store-filesystem <UUID>
+                        use this existing prepared-media folder instead of the profile's (never created),
+                        only while it is on the ext4 filesystem with that UUID
+  --filesystem <UUID>   with storage --set: the disk the folder must be on (`lsblk -f` shows each disk's UUID)
   --json                machine-readable output for diagnose and list
   --yes                 with prepare-all: start the reviewed batch (without it, only the review is shown)
 
@@ -50,6 +55,8 @@ pub fn run(args: Vec<String>) -> Outcome {
     let mut yes = false;
     let mut set_folder = None;
     let mut reset_folder = false;
+    let mut set_filesystem = None;
+    let mut store_filesystem = None;
     let mut positional = Vec::new();
     let mut args = args.into_iter();
     let mut only_files = false;
@@ -70,6 +77,12 @@ pub fn run(args: Vec<String>) -> Outcome {
             "--yes" => yes = true,
             "--set" => set_folder = Some(args.next().ok_or("--set needs a folder")?),
             "--reset" => reset_folder = true,
+            "--filesystem" => {
+                set_filesystem = Some(args.next().ok_or("--filesystem needs a UUID")?);
+            }
+            "--store-filesystem" => {
+                store_filesystem = Some(args.next().ok_or("--store-filesystem needs a UUID")?);
+            }
             "--system" => system = Some(args.next().ok_or("--system needs a system name")?),
             "--system-source" => {
                 system_source = Some(args.next().ok_or("--system-source needs a value")?);
@@ -90,15 +103,27 @@ pub fn run(args: Vec<String>) -> Outcome {
     if set_folder.is_some() && reset_folder {
         return Err("give either --set <folder> or --reset, not both".into());
     }
+    // Each UUID belongs to exactly one folder option; alone it means
+    // nothing and is refused rather than ignored.
+    if set_filesystem.is_some() && set_folder.is_none() {
+        return Err("--filesystem is used with `storage --set <folder>`".into());
+    }
+    if store_filesystem.is_some() && store_override.is_none() {
+        return Err("--store-filesystem is used with --store <folder>".into());
+    }
     // Commands that do not use the store must work even when the saved
     // folder for prepared copies can no longer be used.
     if matches!(command.as_str(), "capabilities" | "storage") {
-        return run_without_store(&command, set_folder, reset_folder);
+        return run_without_store(&command, set_folder, set_filesystem, reset_folder);
     }
     let store = match store_override {
-        // A named folder must already exist: it is never created here (it
-        // may be inside a disk that is not connected).
-        Some(folder) => PreparedMediaStore::named(PathBuf::from(folder), "--store")?,
+        // A named folder must already exist on the disk named with it: it
+        // is never created here, and never accepted for merely being there.
+        Some(folder) => PreparedMediaStore::named(
+            PathBuf::from(folder),
+            store_filesystem.as_deref(),
+            "--store",
+        )?,
         None => PreparedMediaStore::for_profile()?,
     };
     let game = |what: &str| -> Result<(PathBuf, String), String> {
@@ -334,13 +359,18 @@ pub fn run(args: Vec<String>) -> Outcome {
     Ok(())
 }
 
-fn run_without_store(command: &str, set_folder: Option<String>, reset_folder: bool) -> Outcome {
+fn run_without_store(
+    command: &str,
+    set_folder: Option<String>,
+    set_filesystem: Option<String>,
+    reset_folder: bool,
+) -> Outcome {
     if command == "capabilities" {
         print!("{}", recovery::capability_matrix_markdown());
         return Ok(());
     }
     if reset_folder {
-        recovery::storage::set_folder(None, &[])?;
+        recovery::storage::set_folder(None, &[], None)?;
         println!(
             "New prepared copies will be kept in EmuWiz's own data folder again. Games already prepared keep working from the folder their copies are in."
         );
@@ -348,8 +378,12 @@ fn run_without_store(command: &str, set_folder: Option<String>, reset_folder: bo
         // Without the list of game folders the check cannot be made.
         let library = recovery::storage::library_folders()
             .map_err(|detail| format!("The folder was not changed: {detail}"))?;
-        let check = recovery::storage::set_folder(Some(Path::new(&folder)), &library)
-            .map_err(|detail| format!("The folder was not changed: {detail}"))?;
+        let check = recovery::storage::set_folder(
+            Some(Path::new(&folder)),
+            &library,
+            set_filesystem.as_deref(),
+        )
+        .map_err(|detail| format!("The folder was not changed: {detail}"))?;
         println!(
             "New prepared copies will be kept in {folder}.{} Games already prepared keep working from the folder their copies are in.",
             check
@@ -374,8 +408,23 @@ fn run_without_store(command: &str, set_folder: Option<String>, reset_folder: bo
                 ))
         ),
         Err(detail) => println!(
-            "The folder chosen for prepared copies cannot be used: {detail}. Choose another with `storage --set <folder>` or go back to the default with `storage --reset`."
+            "The folder chosen for prepared copies cannot be used: {detail}. Choose another with `storage --set <folder> --filesystem <UUID>` or go back to the default with `storage --reset`."
         ),
+    }
+    // The disks a folder can be on, named by what they are (read-only).
+    let disks = recovery::disk_identity::mounted_ext4_disks();
+    if !disks.is_empty() {
+        println!("Connected ext4 disks (for `storage --set <folder> --filesystem <UUID>`):");
+    }
+    for disk in disks {
+        println!(
+            "  {}  mounted at {}{}",
+            disk.uuid,
+            disk.mount_point.display(),
+            disk.label
+                .map(|label| format!("  (\"{label}\")"))
+                .unwrap_or_default()
+        );
     }
     Ok(())
 }
@@ -523,8 +572,66 @@ mod tests {
     use super::*;
     use archivefs_core::synthetic_media::{cd_disc_set, stored_zip};
 
-    fn strings(args: &[&str]) -> Vec<String> {
+    /// Exactly these arguments.
+    fn exact(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    /// TEST SUPPORT THAT WORKS BACKWARDS. A test cannot format or mount a
+    /// disk, so it has no real ext4 UUID to give. This reads the identity of
+    /// the filesystem the folder (or the nearest existing folder above it)
+    /// is on and builds a UUID that has that identity: the very thing the
+    /// application must never do. It only gets the tests past the check.
+    /// They show that refusals work and that nothing is written when one
+    /// applies; they do not show that a real disk's real UUID is accepted
+    /// (see the acceptance run in docs/GAME_RECOVERY_ENGINE.md). The temp
+    /// folder must be on ext4 for the accepting tests to pass.
+    fn disk_of(path: &Path) -> String {
+        use std::os::unix::ffi::OsStrExt;
+        let mut probe = path;
+        while std::fs::symlink_metadata(probe).is_err() {
+            match probe.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => probe = parent,
+                // Not a path at all (a test of malformed arguments): some
+                // UUID, of no disk in particular.
+                _ => return "6f1d2c3b-4a59-4e68-9778-a6b5c4d3e2f1".to_string(),
+            }
+        }
+        let name = std::ffi::CString::new(probe.as_os_str().as_bytes()).unwrap();
+        // SAFETY: zeroed is a valid initial value for this plain C struct.
+        let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `name` is NUL-terminated and `stats` is writable and sized.
+        assert_eq!(unsafe { libc::statvfs(name.as_ptr(), &mut stats) }, 0);
+        let hex: String = (stats.f_fsid as u64)
+            .to_le_bytes()
+            .iter()
+            .chain([0_u8; 8].iter())
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        )
+    }
+
+    /// The arguments, with `--store-filesystem <UUID>` added after every
+    /// `--store <folder>` that has none: the UUID is the one [`disk_of`]
+    /// builds backwards for that folder. Tests about the UUID itself use
+    /// [`exact`].
+    fn strings(args: &[&str]) -> Vec<String> {
+        let mut out = exact(args);
+        if !args.contains(&"--store-filesystem")
+            && let Some(at) = args.iter().position(|arg| *arg == "--store")
+            && let Some(folder) = args.get(at + 1)
+        {
+            out.push("--store-filesystem".to_string());
+            out.push(disk_of(Path::new(folder)));
+        }
+        out
     }
 
     /// A synthetic zipped disc and an empty store folder, both in `dir`.
@@ -553,6 +660,23 @@ mod tests {
     /// Nothing at all was created in the (existing) store folder.
     fn untouched(store: &Path) -> bool {
         std::fs::read_dir(store).unwrap().next().is_none()
+    }
+
+    /// Everything inside a folder, for "nothing was written" checks.
+    fn contents(folder: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = Vec::new();
+        let mut todo = vec![folder.to_path_buf()];
+        while let Some(folder) = todo.pop() {
+            for entry in std::fs::read_dir(&folder).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    todo.push(path.clone());
+                }
+                found.push(path);
+            }
+        }
+        found.sort();
+        found
     }
 
     /// A `--store` folder that is not there is refused by every command and
@@ -597,11 +721,102 @@ mod tests {
                 "{command:?}: {detail}"
             );
         }
-        assert!(error(&["list", "--store", "relative/folder"]).contains("absolute path"));
+        assert!(
+            error(&[
+                "list",
+                "--store",
+                "relative/folder",
+                "--store-filesystem",
+                "x"
+            ])
+            .contains("absolute path")
+        );
         assert!(
             std::fs::read_dir(&mount_point).unwrap().next().is_none(),
             "the missing --store folder was created"
         );
+    }
+
+    /// A `--store` folder being there proves nothing about which disk is: a
+    /// folder of the same name underneath an absent disk looks exactly like
+    /// this one (plain, private 0700, holding a store's folders and a
+    /// binding file left by an earlier build). Without the disk's UUID, or
+    /// with the UUID of the disk that was meant, every command refuses it
+    /// and nothing is written into it.
+    #[test]
+    fn a_store_folder_is_refused_without_its_disk_or_on_another_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(dir.path()).unwrap();
+        let (zip, _existing) = lab(&dir);
+        let zip = zip.to_str().unwrap();
+        let underneath = dir.join("mnt").join("prepared");
+        for inner in ["v1/sets", "v1/staging", "v1/sources"] {
+            std::fs::create_dir_all(underneath.join(inner)).unwrap();
+        }
+        std::fs::set_permissions(
+            &underneath,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::write(underneath.join("emuwiz-storage-binding.json"), b"{}").unwrap();
+        let store = underneath.to_str().unwrap();
+        let before = contents(&underneath);
+        assert_eq!(before.len(), 5);
+        // The disk that was meant: any UUID but the one of the disk this
+        // folder is really on.
+        let intended = "6f1d2c3b-4a59-4e68-9778-a6b5c4d3e2f1";
+        assert_ne!(disk_of(&underneath), intended);
+        let commands = [
+            vec!["prepare", zip, "--system", "AmigaCD32", "--store", store],
+            vec![
+                "prepare-all",
+                zip,
+                "--system",
+                "AmigaCD32",
+                "--yes",
+                "--store",
+                store,
+            ],
+            vec!["list", "--store", store],
+            vec!["clean", "--store", store],
+            vec!["queue", "--store", store],
+            vec!["resume", "--store", store],
+            vec!["forget-queue", "--store", store],
+        ];
+        for command in &commands {
+            let detail = run(exact(command)).unwrap_err().to_string();
+            assert!(detail.contains("say which disk"), "{command:?}: {detail}");
+            assert_eq!(contents(&underneath), before, "{command:?} wrote");
+
+            let mut named = command.clone();
+            named.extend(["--store-filesystem", intended]);
+            let detail = run(exact(&named)).unwrap_err().to_string();
+            assert!(
+                detail.contains("is not on the disk with filesystem UUID"),
+                "{named:?}: {detail}"
+            );
+            assert_eq!(contents(&underneath), before, "{named:?} wrote");
+
+            let mut garbled = command.clone();
+            garbled.extend(["--store-filesystem", "not-a-uuid"]);
+            let detail = run(exact(&garbled)).unwrap_err().to_string();
+            assert!(
+                detail.contains("is not a filesystem UUID"),
+                "{garbled:?}: {detail}"
+            );
+            assert_eq!(contents(&underneath), before, "{garbled:?} wrote");
+        }
+        // A UUID belongs to exactly one folder option; alone it is refused,
+        // not ignored. The rejected binding command no longer exists.
+        for odd in [
+            vec!["list", "--store-filesystem", intended],
+            vec!["list", "--filesystem", intended],
+            vec!["storage", "--filesystem", intended],
+            vec!["storage", "--bind", store],
+        ] {
+            assert!(run(exact(&odd)).is_err(), "{odd:?}");
+        }
+        assert_eq!(contents(&underneath), before);
     }
 
     #[test]
