@@ -193,7 +193,7 @@ fn a_folder_is_chosen_on_the_disk_named_by_its_real_uuid_and_reset_again() {
     // The record names the disk by the UUID that was given, in its usual form.
     assert!(
         fs::read_to_string(&record).unwrap().contains(&uuid),
-        "{uuid}"
+        "the record does not name the disk that was given"
     );
 
     let shown = fixture.run(&["recovery", "storage"]);
