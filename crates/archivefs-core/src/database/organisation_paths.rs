@@ -15,6 +15,19 @@ pub(crate) const CATALOGUE_BINDING_KEY: &str = KEY;
 /// Marks a set member (CUE/GDI track, M3U disc) that moves with its lead in
 /// the same transaction: `{"lead": "<lead source path>"}`.
 pub const COMPANION_KEY: &str = "organisation_companion_v1";
+/// Every file of a disc set (bound or not) names its set's lead here, so
+/// Apply and Undo can keep the set whole: `{"lead": "<lead source path>"}`.
+pub const DISC_SET_KEY: &str = "organisation_disc_set_v1";
+
+/// The disc set `entry` belongs to (its lead's source path), if any.
+pub(crate) fn disc_set_of(entry: &TransactionEntry) -> Option<String> {
+    entry
+        .unknown
+        .get(DISC_SET_KEY)?
+        .get("lead")?
+        .as_str()
+        .map(str::to_string)
+}
 /// Marks a game the person picked that the library has no row for (for
 /// example a disc set outside a PlayStation folder): it moves with no
 /// catalogue path to change.

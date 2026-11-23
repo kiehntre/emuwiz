@@ -974,3 +974,348 @@ mod linked {
         assert!(plan.suggested().next().is_none());
     }
 }
+
+/// Release review 2026-11-23: a disc set is never left split by Apply or
+/// Undo. Failures are injected after a file has moved (cancel, a set file
+/// changed, a destination taken); Undo keeps a set whole per set, so other
+/// games still go back.
+mod never_split {
+    use super::*;
+    use crate::dat::rename_apply::executor::test_hook;
+
+    struct Setup {
+        lib: Lib,
+        set: [PathBuf; 3],
+        other: PathBuf,
+        plan: OrganisationPlan,
+    }
+
+    /// The set first, then one other game (or the other game first).
+    fn setup(other_first: bool) -> Setup {
+        let mut lib = Lib::new();
+        let (cue, one, two) = cue_set(&mut lib);
+        let other = lib.game(
+            if other_first { "Aaa.iso" } else { "Zed.iso" },
+            "another game",
+            "PSX",
+        );
+        let order: Vec<&Path> = if other_first {
+            vec![&other, &cue, &one, &two]
+        } else {
+            vec![&cue, &one, &two, &other]
+        };
+        let plan = lib.preview(OrganisationMode::MoveRealFile, &order);
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| entry.status == OrganisationStatus::Suggested),
+            "{plan:?}"
+        );
+        Setup {
+            lib,
+            set: [cue, one, two],
+            other,
+            plan,
+        }
+    }
+
+    fn moved(plan: &OrganisationPlan, source: &Path) -> PathBuf {
+        plan.entries
+            .iter()
+            .find(|entry| entry.source_path == source)
+            .unwrap()
+            .destination_path
+            .clone()
+    }
+
+    fn apply_with(s: &Setup, hook: impl FnMut(usize, &AtomicBool) + 'static) -> RenameTransaction {
+        test_hook::after_applied(hook);
+        let result = s.lib.apply(&s.plan, &all_of(&s.plan));
+        test_hook::clear();
+        result.unwrap()
+    }
+
+    fn set_at_source(s: &Setup) {
+        for path in &s.set {
+            assert!(path.exists(), "{path:?} not back");
+            assert!(
+                !moved(&s.plan, path).exists(),
+                "{path:?} left at the new place"
+            );
+        }
+    }
+
+    fn set_moved(s: &Setup) {
+        for path in &s.set {
+            assert!(!path.exists(), "{path:?} stayed behind");
+            assert!(moved(&s.plan, path).exists());
+        }
+    }
+
+    #[test]
+    fn cancel_finishes_the_started_set_and_starts_nothing_else() {
+        let s = setup(false);
+        let mut tx = apply_with(&s, |count, cancel| {
+            if count == 1 {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        assert_eq!(tx.state, TransactionState::ApplyFailed);
+        set_moved(&s);
+        assert!(s.other.exists(), "nothing new starts after Cancel");
+        assert_eq!(s.lib.undo(&mut tx), RollbackResult::FullyRolledBack);
+        set_at_source(&s);
+    }
+
+    /// The not-yet-moved files of the set, in `count`'s hook.
+    fn waiting(set: &[PathBuf; 3]) -> Vec<PathBuf> {
+        set.iter().filter(|path| path.exists()).cloned().collect()
+    }
+
+    #[test]
+    fn a_set_file_changed_mid_apply_puts_the_whole_set_back() {
+        let s = setup(false);
+        let set = s.set.clone();
+        let mut tx = apply_with(&s, move |count, _| {
+            if count == 1 {
+                let file = &waiting(&set)[0];
+                std::fs::write(file, "changed during Apply").unwrap();
+            }
+        });
+        assert_eq!(tx.state, TransactionState::ApplyFailed);
+        set_at_source(&s);
+        assert!(s.other.exists());
+        // Nothing is left for Undo to split; a later Undo is harmless.
+        assert!(matches!(
+            s.lib.undo(&mut tx),
+            RollbackResult::FullyRolledBack
+        ));
+        set_at_source(&s);
+    }
+
+    #[test]
+    fn a_destination_taken_mid_apply_is_never_overwritten_and_the_set_goes_back() {
+        let s = setup(false);
+        let set = s.set.clone();
+        let plan = s.plan.clone();
+        let taken = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let record = taken.clone();
+        let mut tx = apply_with(&s, move |count, _| {
+            if count == 1 {
+                let target = moved(&plan, &waiting(&set)[0]);
+                std::fs::write(&target, "someone else's file").unwrap();
+                *record.borrow_mut() = Some(target);
+            }
+        });
+        assert_eq!(tx.state, TransactionState::ApplyFailed);
+        let taken = taken.borrow().clone().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&taken).unwrap(),
+            "someone else's file"
+        );
+        for path in &s.set {
+            assert!(path.exists(), "{path:?} not back");
+        }
+        assert!(s.other.exists());
+        std::fs::remove_file(&taken).unwrap();
+        assert_eq!(s.lib.undo(&mut tx), RollbackResult::FullyRolledBack);
+        set_at_source(&s);
+    }
+
+    #[test]
+    fn a_set_that_cannot_move_whole_does_not_start() {
+        let s = setup(true);
+        let two = s.set[2].clone();
+        let mut tx = apply_with(&s, move |count, _| {
+            if count == 1 {
+                std::fs::write(&two, "changed before the set started").unwrap();
+            }
+        });
+        assert_eq!(tx.state, TransactionState::ApplyFailed);
+        set_at_source(&s);
+        assert!(!s.other.exists(), "the game before the set moved");
+        let failed = tx
+            .entries
+            .iter()
+            .find(|entry| entry.state == crate::dat::rename_apply::EntryState::ApplyFailed)
+            .unwrap();
+        assert!(
+            failed
+                .failure_reason
+                .as_deref()
+                .unwrap()
+                .contains("nothing of the disc set"),
+            "{failed:?}"
+        );
+        assert_eq!(s.lib.undo(&mut tx), RollbackResult::FullyRolledBack);
+        assert!(s.other.exists());
+    }
+
+    fn undo_keeps_the_set_whole(s: &Setup, tx: &mut RenameTransaction, why: &str) {
+        match s.lib.undo(tx) {
+            RollbackResult::PartiallyRolledBack {
+                rolled_back,
+                failed,
+            } => {
+                assert_eq!(rolled_back, vec![s.other.clone()], "only the other game");
+                assert!(
+                    failed
+                        .iter()
+                        .all(|(_, reason)| reason.contains("kept with its disc set")
+                            && reason.contains(why)),
+                    "{failed:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        for path in &s.set {
+            assert!(moved(&s.plan, path).exists(), "{path:?} left its set");
+        }
+        assert!(s.other.exists(), "an unaffected game is still restored");
+    }
+
+    #[test]
+    fn undo_keeps_a_changed_set_whole_and_restores_the_other_games() {
+        let s = setup(false);
+        let mut tx = s.lib.apply(&s.plan, &all_of(&s.plan)).unwrap();
+        assert_eq!(tx.state, TransactionState::Applied);
+        std::fs::write(moved(&s.plan, &s.set[1]), "edited after the move").unwrap();
+        undo_keeps_the_set_whole(&s, &mut tx, "has changed since it was moved");
+        assert_eq!(
+            std::fs::read_to_string(moved(&s.plan, &s.set[1])).unwrap(),
+            "edited after the move",
+            "modified data is never overwritten"
+        );
+    }
+
+    #[test]
+    fn undo_keeps_a_set_whose_old_place_is_taken_and_finishes_once_it_is_free() {
+        let s = setup(false);
+        let mut tx = s.lib.apply(&s.plan, &all_of(&s.plan)).unwrap();
+        std::fs::write(&s.set[2], "someone else's file").unwrap();
+        undo_keeps_the_set_whole(&s, &mut tx, "something now occupies");
+        assert_eq!(
+            std::fs::read_to_string(&s.set[2]).unwrap(),
+            "someone else's file"
+        );
+        std::fs::remove_file(&s.set[2]).unwrap();
+        assert_eq!(s.lib.undo(&mut tx), RollbackResult::FullyRolledBack);
+        set_at_source(&s);
+    }
+
+    #[test]
+    fn a_set_file_that_cannot_go_back_mid_undo_keeps_the_set_whole_at_its_new_place() {
+        let s = setup(false);
+        let mut tx = s.lib.apply(&s.plan, &all_of(&s.plan)).unwrap();
+        assert_eq!(tx.state, TransactionState::Applied);
+        // Undo puts the other game back first, then the set; after the first
+        // set file is back, another set file's old place is taken.
+        let set = s.set.clone();
+        let taken = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let record = taken.clone();
+        crate::dat::rename_apply::rollback::set_after_reversal_hook(Some(Box::new(move |count| {
+            if count == 2 {
+                let target = set.iter().find(|path| !path.exists()).unwrap().clone();
+                std::fs::write(&target, "someone else's file").unwrap();
+                *record.borrow_mut() = Some(target);
+            }
+        })));
+        let result = s.lib.undo(&mut tx);
+        crate::dat::rename_apply::rollback::set_after_reversal_hook(None);
+        match result {
+            RollbackResult::PartiallyRolledBack {
+                rolled_back,
+                failed,
+            } => {
+                assert_eq!(rolled_back, vec![s.other.clone()], "{failed:?}");
+                assert!(
+                    failed
+                        .iter()
+                        .any(|(_, reason)| reason.contains("moved forward again")),
+                    "{failed:?}"
+                );
+                assert!(
+                    !failed
+                        .iter()
+                        .any(|(_, reason)| reason.contains("DISC SET NOT WHOLE")),
+                    "{failed:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        let taken = taken.borrow().clone().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&taken).unwrap(),
+            "someone else's file"
+        );
+        for path in &s.set {
+            assert!(moved(&s.plan, path).exists(), "{path:?} not with its set");
+        }
+        assert!(s.other.exists());
+        // Undo again while the old place is still taken: still nothing of
+        // the set moves, and the occupant is untouched (review 2026-11-23).
+        for _ in 0..2 {
+            let again = s.lib.undo(&mut tx);
+            assert!(
+                !matches!(again, RollbackResult::FullyRolledBack),
+                "{again:?}"
+            );
+            for path in &s.set {
+                assert!(moved(&s.plan, path).exists(), "{path:?} split on retry");
+            }
+            assert_eq!(
+                std::fs::read_to_string(&taken).unwrap(),
+                "someone else's file"
+            );
+        }
+        std::fs::remove_file(&taken).unwrap();
+        assert_eq!(s.lib.undo(&mut tx), RollbackResult::FullyRolledBack);
+        set_at_source(&s);
+    }
+
+    #[test]
+    fn a_failed_apply_whose_set_cannot_be_put_back_says_where_every_file_is() {
+        let s = setup(false);
+        let set = s.set.clone();
+        let occupied = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let record = occupied.clone();
+        test_hook::after_applied(move |count, _| {
+            if count == 1 {
+                // One set file moved: change a waiting one (Apply stops) and
+                // take the moved one's old place (the repair cannot go back).
+                let moved_one = set.iter().find(|path| !path.exists()).unwrap().clone();
+                let waiting_one = waiting(&set)[0].clone();
+                std::fs::write(&waiting_one, "changed during Apply").unwrap();
+                std::fs::write(&moved_one, "someone else's file").unwrap();
+                record.borrow_mut().push(moved_one);
+            }
+        });
+        let result = s.lib.apply(&s.plan, &all_of(&s.plan));
+        test_hook::clear();
+        let error = result.unwrap_err();
+        assert!(error.contains("DISC SET NOT WHOLE"), "{error}");
+        assert!(
+            error.contains("(new place)") && error.contains("(old place)"),
+            "{error}"
+        );
+        let occupant = occupied.borrow()[0].clone();
+        assert_eq!(
+            std::fs::read_to_string(&occupant).unwrap(),
+            "someone else's file"
+        );
+        assert!(
+            moved(&s.plan, &occupant).exists(),
+            "never overwritten, never lost"
+        );
+        // The reported recovery: free the old place, Undo again.
+        std::fs::remove_file(&occupant).unwrap();
+        let journal = std::fs::read_dir(s.lib.journal())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .unwrap();
+        let mut tx = crate::dat::rename_apply::read_journal(&journal).unwrap();
+        assert_eq!(s.lib.undo(&mut tx), RollbackResult::FullyRolledBack);
+        set_at_source(&s);
+    }
+}

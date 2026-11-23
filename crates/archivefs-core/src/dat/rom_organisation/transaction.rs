@@ -212,7 +212,7 @@ pub fn build_organisation_transaction(
             failure_reason: None,
             applied_at_unix: None,
             rolled_back_at_unix: None,
-            unknown: match &entry.catalogue_binding {
+            unknown: with_disc_set(entry, match &entry.catalogue_binding {
                 Some(binding) => std::collections::BTreeMap::from([(
                     "organisation_catalogue_v1".into(),
                     binding.clone(),
@@ -237,7 +237,7 @@ pub fn build_organisation_transaction(
                     )])
                 }
                 None => Default::default(),
-            },
+            }),
         });
     }
     if entries.is_empty() {
@@ -371,6 +371,42 @@ pub fn apply_organisation_transaction(
         mode,
         master_root,
     )?;
+    // An Apply that stopped part-way through a disc set (a file changed or a
+    // destination appeared between the checks and the move) puts that set
+    // back whole at once, with Undo's own checks; other games are untouched.
+    let split = split_disc_sets(transaction);
+    let outcome = if split.is_empty() {
+        outcome
+    } else {
+        let repair = crate::dat::rename_apply::rollback_disc_sets(transaction, journal_dir, &split)
+            .map_err(ApplyError::Journal)?;
+        *transaction = repair.transaction;
+        // The repair could not put a set back whole: say so, with where its
+        // files are (never reported as a finished Apply).
+        let reports = crate::dat::rename_apply::split_disc_set_reports(transaction);
+        if !reports.is_empty() {
+            // Games that did move keep their prepared copies.
+            let moved = transaction.clone();
+            crate::recovery::moves::after(prepared, |old, new| {
+                moved.entries.iter().any(|entry| {
+                    entry.state == crate::dat::rename_apply::model::EntryState::Applied
+                        && entry.source_path == old
+                        && entry.destination_path == new
+                })
+            });
+            return Err(ApplyError::Journal(
+                reports
+                    .into_iter()
+                    .map(|(_, report)| report)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ));
+        }
+        crate::dat::rename_apply::ApplyOutcome {
+            summary: crate::dat::rename_apply::TransactionSummary::from_transaction(transaction),
+            transaction: transaction.clone(),
+        }
+    };
     crate::recovery::moves::after(prepared, |old, new| {
         outcome.transaction.entries.iter().any(|entry| {
             entry.state == crate::dat::rename_apply::model::EntryState::Applied
@@ -955,6 +991,38 @@ pub fn rollback_organisation_transaction(
         directories_remaining,
         tombstones,
     })
+}
+
+/// Disc sets an Apply left part-way: some files moved, others did not.
+fn split_disc_sets(transaction: &RenameTransaction) -> BTreeSet<String> {
+    use crate::dat::rename_apply::model::EntryState;
+    let mut moved = BTreeSet::new();
+    let mut not_moved = BTreeSet::new();
+    for entry in &transaction.entries {
+        if let Some(lead) = crate::database::organisation_paths::disc_set_of(entry) {
+            if entry.state == EntryState::Applied {
+                moved.insert(lead);
+            } else {
+                not_moved.insert(lead);
+            }
+        }
+    }
+    moved.intersection(&not_moved).cloned().collect()
+}
+
+/// Adds the disc-set marker to an entry's journal fields when it is part of
+/// a set (see [`crate::database::organisation_paths::DISC_SET_KEY`]).
+fn with_disc_set(
+    entry: &super::model::OrganisationPlanEntry,
+    mut unknown: std::collections::BTreeMap<String, serde_json::Value>,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    if let Some(lead) = &entry.disc_set {
+        unknown.insert(
+            crate::database::organisation_paths::DISC_SET_KEY.into(),
+            serde_json::json!({"lead": lead.to_string_lossy()}),
+        );
+    }
+    unknown
 }
 
 /// A game renamed with its RetroArch saves is undone as one group. The shared
