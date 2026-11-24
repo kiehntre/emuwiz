@@ -713,6 +713,10 @@ store_symlink_slot() {
 # mix, and never infer completeness from merely reaching EOF.
 load_manifest() {
     manifest_loaded=0
+    # Set only for a manifest that is complete and valid but was written for a
+    # different prefix or data directory than this run: it is another
+    # installation's ownership record, not "no manifest".
+    manifest_other_install=""
     [ "$manifest_dir_kind" = dir ] || return 0
     [ -f "$manifest_file" ] || return 0
     [ ! -L "$manifest_file" ] || return 0
@@ -810,10 +814,231 @@ EOF
     validate_size "$manifest_declared_count" || return 0
     [ "$manifest_declared_count" = "$records_seen" ] || return 0
     [ -n "$manifest_saved_bin_dir" ] || return 0
-    [ "$manifest_saved_bin_dir" = "$bin_dir" ] || return 0
     [ -n "$manifest_saved_data_home" ] || return 0
-    [ "$manifest_saved_data_home" = "$data_home" ] || return 0
+    if [ "$manifest_saved_bin_dir" != "$bin_dir" ] || [ "$manifest_saved_data_home" != "$data_home" ]; then
+        manifest_other_install="prefix $manifest_saved_bin_dir, data directory $manifest_saved_data_home"
+        return 0
+    fi
     manifest_loaded=1
+}
+
+# sweep_stale_staging - removes staging files an interrupted earlier run of
+# this installer left behind (D5-04). Called only while the bookkeeping lock is
+# held. Only regular files owned by the current user whose names match the
+# installer's own mktemp patterns exactly (a fixed prefix plus six characters)
+# are removed, in the directories this installer stages in; symlinks, other
+# owners, other names and directories are never touched, and the removal acts
+# on the directory entry itself, never on a link target. Concurrent installs
+# that share a prefix but not a data directory are not supported.
+sweep_stale_staging() {
+    sweep_uid=$(id -u) || return 0
+    sweep_one() {
+        sweep_dir=$1
+        sweep_pattern=$2
+        if [ ! -d "$sweep_dir" ]; then return 0; fi
+        find "$sweep_dir/" -maxdepth 1 -type f -user "$sweep_uid" -name "$sweep_pattern" \
+            -print -delete 2>/dev/null | while IFS= read -r sweep_removed; do
+            printf 'Removed a leftover temporary file from an interrupted earlier run: %s\n' "$sweep_removed"
+        done || true
+    }
+    sweep_one "$manifest_dir" '.manifest-records.??????'
+    sweep_one "$manifest_dir" '.manifest.??????'
+    sweep_one "$manifest_dir" '.install-intent.??????'
+    sweep_one "$bin_dir" '.emuwiz-binary.??????'
+    sweep_one "$data_home/applications" ".$desktop_id.??????.desktop"
+    for sweep_icon_dir in "$data_home"/icons/hicolor/*/apps; do
+        sweep_one "$sweep_icon_dir" ".$desktop_id.??????.png"
+    done
+}
+
+# --------------------------------------------------------------------------
+# INSTALL INTENT (interrupted first installs)
+#
+# The ownership manifest is only written once every asset is published, so an
+# install killed part-way leaves binaries on disk with no record. A binary has
+# no byte pattern that proves it is ours, so (by design) an unrecorded binary
+# is foreign. To let a re-run take back exactly what an interrupted run of
+# this installer published, and nothing else, each install first writes a small
+# intent file in the bookkeeping directory, before the first publication: the
+# prefix, the data directory and the SHA-256 of each verified binary whose
+# destination is absent or already EmuWiz-owned. A foreign destination is never
+# recorded up front, even with --replace-foreign; it is added (by an atomic
+# rewrite that keeps the other entry) only after the foreign file has been moved
+# aside, just before the release binary is published in its place, together
+# with the name of the backup directory holding the moved file. A later run
+# adopts a binary only if no manifest was loaded,
+# the intent parses strictly, it names this prefix and data directory, and the
+# binary's current bytes equal the recorded digest and, for a replaced binary,
+# the moved-aside original is still in its recorded backup directory (if the
+# user took it back, the file in place may be theirs). Anything else - a modified
+# file, a different prefix, a file of another origin - stays foreign. The intent
+# is removed once the manifest is written; it is never trusted over a manifest.
+#
+# Known limits: ownership here rests on bytes (a SHA-256), not file identity.
+#  - A binary recorded while its destination was empty is adopted if, before
+#    the retry, anyone puts a byte-identical file there.
+#  - If the user COPIES a moved-aside original back and leaves the backup in
+#    place, the copy is indistinguishable from the published release binary:
+#    a retry adopts it and --uninstall removes it. The backup still holds the
+#    bytes. If the user then deletes that backup before --uninstall, the copy
+#    removed was their only one (its bytes equal the release binary's, so
+#    they can be had again from the release bundle).
+#  - The backup-location check (replaced_original_still_aside) verifies only
+#    that a regular file of the recorded name exists in the recorded backup
+#    directory. It does not verify that it is the original that was moved
+#    aside, nor its bytes: if the original is moved back and any other regular
+#    file is put at the backup path, the file at the destination is adopted.
+# Closing these needs the published file's identity (device and inode)
+# recorded after publication; that is a separate design change.
+# --------------------------------------------------------------------------
+intent_cli_fp=""
+intent_gui_fp=""
+intent_cli_backup=""
+intent_gui_backup=""
+intent_other_install=""
+load_install_intent() {
+    intent_cli_fp=""
+    intent_gui_fp=""
+    intent_cli_backup=""
+    intent_gui_backup=""
+    intent_other_install=""
+    if [ "$manifest_loaded" -eq 1 ] || [ "$manifest_dir_kind" != dir ]; then return 0; fi
+    intent_path=/proc/self/fd/8/install-intent
+    if [ ! -f "$intent_path" ] || [ -L "$intent_path" ]; then return 0; fi
+    if ! LC_ALL=C tr -d '\000' <"$intent_path" | cmp -s - "$intent_path"; then return 0; fi
+    i_ok=1; i_version=0; i_bin=""; i_data=""; i_cli=""; i_gui=""; i_cli_bk=""; i_gui_bk=""; i_end=0
+    while [ "$i_ok" -eq 1 ] && { IFS= read -r i_line || [ -n "$i_line" ]; }; do
+        if [ "$i_end" -eq 1 ]; then i_ok=0; continue; fi
+        i_key=""; i_rest=""
+        IFS=' ' read -r i_key i_rest <<EOF
+$i_line
+EOF
+        case "$i_key" in
+            '#'*) ;;
+            intent_version)
+                if [ "$i_version" -eq 0 ] && [ "$i_rest" = 1 ]; then i_version=1; else i_ok=0; fi ;;
+            bin_dir)
+                if [ -z "$i_bin" ] && [ -n "$i_rest" ]; then i_bin=$i_rest; else i_ok=0; fi ;;
+            data_home)
+                if [ -z "$i_data" ] && [ -n "$i_rest" ]; then i_data=$i_rest; else i_ok=0; fi ;;
+            bin-emuwiz-cli)
+                if [ -z "$i_cli" ] && validate_file_digest "$i_rest"; then i_cli=$i_rest; else i_ok=0; fi ;;
+            bin-emuwiz)
+                if [ -z "$i_gui" ] && validate_file_digest "$i_rest"; then i_gui=$i_rest; else i_ok=0; fi ;;
+            replaced-bin-emuwiz-cli)
+                if [ -z "$i_cli_bk" ] && valid_backup_dir_name "$i_rest"; then i_cli_bk=$i_rest; else i_ok=0; fi ;;
+            replaced-bin-emuwiz)
+                if [ -z "$i_gui_bk" ] && valid_backup_dir_name "$i_rest"; then i_gui_bk=$i_rest; else i_ok=0; fi ;;
+            end)
+                if [ -z "$i_rest" ]; then i_end=1; else i_ok=0; fi ;;
+            *) i_ok=0 ;;
+        esac
+    done <"$intent_path"
+    if [ "$i_ok" -ne 1 ] || [ "$i_version" -ne 1 ] || [ "$i_end" -ne 1 ]; then return 0; fi
+    # A backup entry belongs to a recorded binary; one without it is not ours.
+    if { [ -n "$i_cli_bk" ] && [ -z "$i_cli" ]; } || { [ -n "$i_gui_bk" ] && [ -z "$i_gui" ]; }; then return 0; fi
+    # The prefix comparison comes first: an intent with no slot lines still
+    # records an interrupted installation elsewhere (its launcher and icons),
+    # which --uninstall for this prefix must refuse to touch.
+    if [ "$i_bin" != "$bin_dir" ] || [ "$i_data" != "$data_home" ]; then
+        # A complete intent for another prefix or data directory is another
+        # installation's record (an interrupted install there): never adopted
+        # here, and never removed by --uninstall (which refuses). An install
+        # for this prefix replaces it, as it replaces that installation's
+        # manifest: one bookkeeping record per data directory.
+        intent_other_install="prefix $i_bin, data directory $i_data"
+        return 0
+    fi
+    # A slot line is written only for a binary that run found absent or
+    # EmuWiz-owned, so either may be missing; with neither, nothing is adopted.
+    intent_cli_fp=$i_cli
+    intent_gui_fp=$i_gui
+    intent_cli_backup=$i_cli_bk
+    intent_gui_backup=$i_gui_bk
+    # A replaced binary whose moved-aside original is gone keeps no record at
+    # all: neither its digest (a file in place may be the user's original,
+    # taken back) nor its stale backup entry (which would otherwise be carried
+    # into this run's intent and refuse its own binary after another crash).
+    # An empty destination is then simply installed again.
+    for lii_slot in bin-emuwiz-cli bin-emuwiz; do
+        if ! replaced_original_still_aside "$lii_slot"; then
+            lii_name=$(slot_binary_name "$lii_slot")
+            lii_gone="the original moved aside for $lii_name by an interrupted --replace-foreign run is no longer in $bin_dir/$(slot_backup_name "$lii_slot")"
+            if [ -e "$bin_dir/$lii_name" ] || [ -L "$bin_dir/$lii_name" ]; then
+                warn "$lii_gone; the file now at $bin_dir/$lii_name may be that original, so it is not treated as EmuWiz-owned"
+            else
+                if [ "$do_uninstall" -eq 1 ]; then
+                    warn "$lii_gone; $bin_dir/$lii_name is absent, so there is nothing to remove there"
+                else
+                    warn "$lii_gone; $bin_dir/$lii_name is empty and will be installed as new"
+                fi
+            fi
+            case "$lii_slot" in
+                bin-emuwiz-cli) intent_cli_fp=""; intent_cli_backup="" ;;
+                bin-emuwiz) intent_gui_fp=""; intent_gui_backup="" ;;
+            esac
+        fi
+    done
+}
+
+# valid_backup_dir_name NAME - exactly a name backup_foreign_path creates.
+valid_backup_dir_name() {
+    case "$1" in
+        .emuwiz-foreign-backup.????????) ;;
+        *) return 1 ;;
+    esac
+    case "${1#.emuwiz-foreign-backup.}" in
+        *[!A-Za-z0-9]*) return 1 ;;
+    esac
+    return 0
+}
+slot_binary_name() {
+    case "$1" in bin-emuwiz-cli) printf 'emuwiz-cli\n' ;; bin-emuwiz) printf 'emuwiz\n' ;; esac
+}
+slot_backup_name() {
+    case "$1" in bin-emuwiz-cli) printf '%s\n' "$intent_cli_backup" ;; bin-emuwiz) printf '%s\n' "$intent_gui_backup" ;; esac
+}
+
+# replaced_original_still_aside SLOT - true unless the intent records that
+# SLOT's foreign original was moved aside and that original is no longer a
+# regular file (not a symlink) in a real directory of that name in the prefix.
+# It checks only that such a file exists there, not that it is the original or
+# has its bytes (see the known limits under INSTALL INTENT).
+# Fails closed: anything it cannot confirm counts as gone.
+replaced_original_still_aside() {
+    roa_dir=$(slot_backup_name "$1")
+    [ -n "$roa_dir" ] || return 0
+    roa_path="$bin_dir/$roa_dir"
+    [ -d "$roa_path" ] && [ ! -L "$roa_path" ] || return 1
+    roa_file="$roa_path/$(slot_binary_name "$1")"
+    [ -f "$roa_file" ] && [ ! -L "$roa_file" ] || return 1
+    return 0
+}
+
+# write_install_intent CLI_FP GUI_FP - records the intent through the pinned
+# bookkeeping directory (fd 8) with a complete write and an atomic rename. An
+# empty digest omits that slot: this run will not publish that binary. A
+# slot's backup entry (intent_cli_backup / intent_gui_backup, carried over from
+# a loaded intent or set when this run moves a foreign file aside) is written
+# with it, so a retry of a retry keeps checking the moved-aside original.
+write_install_intent() {
+    intent_tmp=$(mktemp -- "/proc/self/fd/8/.install-intent.XXXXXX") ||
+        fail "could not create a temporary file for the install intent"
+    {
+        printf '# EmuWiz installer intent - machine-generated, do not hand-edit.\n'
+        printf '# Lets a re-run recognise binaries published by an interrupted install.\n'
+        printf 'intent_version 1\n'
+        printf 'bin_dir %s\n' "$bin_dir"
+        printf 'data_home %s\n' "$data_home"
+        if [ -n "$1" ]; then printf 'bin-emuwiz-cli %s\n' "$1"; fi
+        if [ -n "$1" ] && [ -n "$intent_cli_backup" ]; then printf 'replaced-bin-emuwiz-cli %s\n' "$intent_cli_backup"; fi
+        if [ -n "$2" ]; then printf 'bin-emuwiz %s\n' "$2"; fi
+        if [ -n "$2" ] && [ -n "$intent_gui_backup" ]; then printf 'replaced-bin-emuwiz %s\n' "$intent_gui_backup"; fi
+        printf 'end\n'
+    } >"$intent_tmp" || fail "could not write the install intent"
+    chmod 0600 "$intent_tmp"
+    mv -f -- "$intent_tmp" /proc/self/fd/8/install-intent ||
+        fail "could not record the install intent"
 }
 
 # manifest_get_slot SLOT - sets slot_kind/slot_fp to the manifest's record
@@ -911,6 +1136,23 @@ gate_binary() {
         if [ -n "$current_fp" ] && [ "$current_fp" = "$slot_fp" ]; then
             printf 'owned\n'
             return 0
+        fi
+    elif [ -z "$slot_kind" ]; then
+        # No manifest record for this slot: the only other proof of ownership
+        # is the install intent of an interrupted run (see INSTALL INTENT).
+        case "$slot" in
+            bin-emuwiz-cli) intent_fp=$intent_cli_fp ;;
+            bin-emuwiz) intent_fp=$intent_gui_fp ;;
+            *) intent_fp="" ;;
+        esac
+        # A replaced binary's record holds only while the user's original is
+        # still where it was moved; if it was taken back, this may be it.
+        if [ -n "$intent_fp" ] && replaced_original_still_aside "$slot"; then
+            current_fp=$(file_digest "$path") || current_fp=""
+            if [ -n "$current_fp" ] && [ "$current_fp" = "$intent_fp" ]; then
+                printf 'owned\n'
+                return 0
+            fi
         fi
     fi
     printf 'foreign\n'
@@ -1130,13 +1372,15 @@ preflight_install_manifest() {
         fi
     fi
     assert_manifest_binding
+    sweep_stale_staging
+    load_install_intent
 }
 
 # The Python stdlib supplies openat/linkat/symlinkat and O_NOFOLLOW; sh cannot
 # safely open a validated asset without following a substituted symlink.
 # Keep the helper embedded so old and current bundle layouts remain self-contained.
 asset_io() {
-    python3 - "$@" <<'EMUWIZ_ASSET_PY'
+    python3 -I - "$@" <<'EMUWIZ_ASSET_PY'
 import errno
 import hashlib
 import os
@@ -1803,6 +2047,16 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$bin_dir" ] || fail "--prefix was given an empty PATH"
+# Refuse an unusable prefix before anything is created or published: this check
+# used to run only after the binaries and aliases were already in place.
+case "$bin_dir" in
+    *'
+'*) fail "the install prefix cannot contain a line break; nothing was installed or changed" ;;
+esac
+case "$data_home" in
+    *'
+'*) fail "the data directory (XDG_DATA_HOME) cannot contain a line break; nothing was installed or changed" ;;
+esac
 
 # Directory containing this script, resolved to an absolute path. Used to
 # find the binaries (and config.toml.example) it was shipped alongside.
@@ -1943,6 +2197,22 @@ if [ "$do_uninstall" -eq 1 ]; then
         fail "an earlier upgrade did not finish ($manifest_dir/upgrade-pending); nothing was removed. Run the installer (without --uninstall) to see the restore steps, then uninstall."
     fi
     load_manifest
+    # D5-01: a valid ownership manifest that belongs to another prefix means a
+    # real installation exists elsewhere. Falling back to the no-manifest
+    # recognition rules here would remove that installation's launcher and
+    # icons (they are byte-identical to what every install writes) and then
+    # delete its manifest, orphaning its binaries. Refuse and name the
+    # recorded installation; nothing is removed or changed.
+    if [ -n "$manifest_other_install" ]; then
+        fail "the ownership manifest at $manifest_file belongs to a different installation ($manifest_other_install), not this run's prefix $bin_dir. Nothing was removed or changed. Run --uninstall again with --prefix and XDG_DATA_HOME set to the recorded values."
+    fi
+    if [ "$manifest_dir_kind" = dir ]; then
+        load_install_intent
+        if [ -n "$intent_other_install" ]; then
+            fail "an interrupted installation recorded at $manifest_dir/install-intent belongs to a different installation ($intent_other_install), not this run's prefix $bin_dir. Nothing was removed or changed. Run --uninstall again with --prefix and XDG_DATA_HOME set to the recorded values."
+        fi
+        sweep_stale_staging
+    fi
 
     removed_any=0
     left_foreign=0
@@ -2015,6 +2285,13 @@ if [ "$do_uninstall" -eq 1 ]; then
         rm -f -- "$manifest_file"
         rmdir -- "$manifest_dir" 2>/dev/null || true
     fi
+    # An intent left by an interrupted install belongs to this installer too;
+    # once everything it covered is gone it has nothing left to record.
+    if [ "$left_foreign" -eq 0 ] && [ "$manifest_dir_kind" = dir ] \
+        && [ -f /proc/self/fd/8/install-intent ] && [ ! -L /proc/self/fd/8/install-intent ]; then
+        rm -f -- /proc/self/fd/8/install-intent
+        rmdir -- "$manifest_dir" 2>/dev/null || true
+    fi
     if [ -n "$config_root" ]; then
         printf 'Your configuration at %s was left untouched.\n' "$config_file"
     else
@@ -2079,7 +2356,7 @@ publish_starter_config() {
     # Request 0700 for EVERY missing component. A default ACL replaces umask,
     # but the explicit mode clears its access mask, including named users/groups.
     # Existing components are only inspected, never chmod-ed or re-owned.
-    if ! python3 - "$psc_dir" <<'PSC_MKDIR_PY'
+    if ! python3 -I - "$psc_dir" <<'PSC_MKDIR_PY'
 import os
 import stat
 import sys
@@ -2119,7 +2396,7 @@ PSC_MKDIR_PY
         printf 'install.sh: installation interrupted before starter-config acquisition; no starter config was written; already installed assets remain.\n' >&2
         exit 130
     fi
-    python3 - "$psc_src" "$psc_dir" "$psc_dest" 6>&- <<'PSC_PY' &
+    python3 -I - "$psc_src" "$psc_dir" "$psc_dest" 6>&- <<'PSC_PY' &
 import errno
 import os
 import signal
@@ -2557,7 +2834,7 @@ done
 # or modified packages; it is not a signature check (install.sh itself comes
 # from the same tree).
 release_check() {
-    python3 - "$@" <<'EMUWIZ_RELEASE_PY'
+    python3 -I - "$@" <<'EMUWIZ_RELEASE_PY'
 import hashlib
 import os
 import re
@@ -2567,6 +2844,7 @@ import sys
 import errno
 
 root, snapshot, cli, gui, mode = sys.argv[1:6]
+assets = sys.argv[6:]
 
 
 def refuse(message):
@@ -2639,6 +2917,13 @@ for line in text.splitlines():
 for required in ("install.sh", cli, gui):
     if required not in records:
         refuse(f"SHA256SUMS does not cover {required}")
+# Every other file this installer would publish (launcher template, icons,
+# starter config) must be covered as well: a SHA256SUMS that omits one would
+# let an unverified file be installed under a "Verified" banner. A symlink or
+# any other entry that exists under the name counts as present.
+for asset in assets:
+    if asset not in records and os.path.lexists(os.path.join(root, asset)):
+        refuse(f"SHA256SUMS does not cover {asset}, which this installer would install")
 
 for relative, expected in sorted(records.items()):
     fd = open_relative(base, relative)
@@ -2678,7 +2963,14 @@ release_snapshot=$(mktemp -d -- "${TMPDIR:-/tmp}/emuwiz-verified.XXXXXXXX") ||
     fail "could not create a private directory for the binaries to install"
 trap 'rm -rf -- "$release_snapshot"' EXIT
 verified_count=$(release_check "$script_dir" "$release_snapshot" \
-    "${src_cli#"$script_dir"/}" "${src_gui#"$script_dir"/}" "$release_mode") || exit 1
+    "${src_cli#"$script_dir"/}" "${src_gui#"$script_dir"/}" "$release_mode" \
+    "${desktop_template#"$script_dir"/}" \
+    "${branding_dir#"$script_dir"/}/emuwiz-logo-32.png" \
+    "${branding_dir#"$script_dir"/}/emuwiz-logo-64.png" \
+    "${branding_dir#"$script_dir"/}/emuwiz-logo-128.png" \
+    "${branding_dir#"$script_dir"/}/emuwiz-logo-256.png" \
+    "${branding_dir#"$script_dir"/}/emuwiz-logo-512.png" \
+    config.toml.example) || exit 1
 src_cli="$release_snapshot/emuwiz-cli"
 src_gui="$release_snapshot/emuwiz"
 if [ "$release_mode" = verified ]; then
@@ -2692,7 +2984,18 @@ fi
 # Before anything is created or published (see ORGANISE RECOVERY GATE).
 organise_recovery_gate
 mkdir -p -- "$bin_dir"
-bin_dir=$(CDPATH= cd -- "$bin_dir" && pwd -P) || fail "could not resolve install prefix: $bin_dir"
+# The sentinel keeps a trailing line break in the resolved name, which command
+# substitution would otherwise strip silently (installing into a sibling).
+bin_dir_resolved=$(CDPATH= cd -- "$bin_dir" && { pwd -P; echo x; }) || fail "could not resolve install prefix: $bin_dir"
+bin_dir_resolved=${bin_dir_resolved%x}
+bin_dir=${bin_dir_resolved%"
+"}
+# The resolved physical path may differ from the one given (symlinks); check
+# it too before any managed file is touched.
+case "$bin_dir" in
+    *'
+'*) fail "the install prefix cannot contain a line break; nothing was installed or changed" ;;
+esac
 
 # This must happen before copying or publishing any managed destination.  The
 # prefix directory itself may be created above so its canonical path can be
@@ -2749,8 +3052,56 @@ preserve_binary_slot bin-emuwiz "$src_gui" "$bin_dir/emuwiz"
 
 manifest_records_tmp=$(mktemp -- "/proc/self/fd/8/.manifest-records.XXXXXX") ||
     fail "could not create a temporary file for the install manifest"
+# Record what is about to be published, before the first publication, so a run
+# killed part-way can be recognised and completed by the next one. Only a
+# binary whose destination is absent or already EmuWiz-owned is recorded here. A
+# foreign file is not: it is moved aside only later, so a run killed or failing
+# before that would otherwise let the next run adopt (and --uninstall delete)
+# the user's own file because its bytes equal the release's. With
+# --replace-foreign, install_binary_slot adds the binary to the intent only once
+# the foreign file is safely aside (record_replaced_slot_in_intent), so a retry
+# can take back the release binary published there. A retry never inherits an
+# earlier run's --replace-foreign: a foreign file not yet moved aside stays
+# foreign until a run that is itself given the flag.
+intent_digest_for_slot() {
+    assert_manifest_binding
+    prepare_asset "$3"
+    idfs_gate=$(gate_binary "$1" "$asset_bound")
+    exec 7<&-
+    case "$idfs_gate" in
+        absent|owned) ;;
+        *) return 0 ;;
+    esac
+    file_digest "$2" || fail "cannot fingerprint the verified $(basename -- "$3")"
+}
+intent_cli_digest=$(intent_digest_for_slot bin-emuwiz-cli "$src_cli" "$bin_dir/emuwiz-cli") || exit 1
+intent_gui_digest=$(intent_digest_for_slot bin-emuwiz "$src_gui" "$bin_dir/emuwiz") || exit 1
+write_install_intent "$intent_cli_digest" "$intent_gui_digest"
 
 skipped_any=0
+
+# record_replaced_slot_in_intent SLOT SRC - after --replace-foreign has moved a
+# foreign binary aside, adds SLOT's verified digest to the install intent,
+# with the name of the backup directory now holding the moved file, keeping the
+# other slot's entry, by the same complete write and atomic rename.
+# A crash before the rename leaves the previous intent (and a staging file the
+# next run sweeps); either way the destination is then absent, which a retry
+# fills on its own. The user's file stays in its backup directory.
+record_replaced_slot_in_intent() {
+    rrs_slot=$1
+    rrs_fp=$(file_digest "$2") || fail "cannot fingerprint the verified $rrs_slot"
+    # BACKUP_PATH is <prefix>/.emuwiz-foreign-backup.XXXXXXXX/<name>.
+    rrs_backup=$(basename -- "$(dirname -- "$BACKUP_PATH")")
+    valid_backup_dir_name "$rrs_backup" ||
+        fail "internal error: unexpected backup location $BACKUP_PATH"
+    case "$rrs_slot" in
+        bin-emuwiz-cli) intent_cli_digest=$rrs_fp; intent_cli_backup=$rrs_backup ;;
+        bin-emuwiz) intent_gui_digest=$rrs_fp; intent_gui_backup=$rrs_backup ;;
+        *) fail "internal error: no install-intent entry for $rrs_slot" ;;
+    esac
+    write_install_intent "$intent_cli_digest" "$intent_gui_digest"
+    rrs_slot=""
+}
 
 # install_binary_slot SLOT SRC DEST - copies SRC to DEST and marks it
 # executable, unless DEST is occupied by something foreign (in which case
@@ -2765,6 +3116,9 @@ install_binary_slot() {
     if [ "$gate" = foreign ]; then
         resolve_asset_collision || return 0
         gate=absent
+        # The foreign file is now aside: only from here may this binary be
+        # recorded as the one this run publishes (see INSTALL INTENT).
+        record_replaced_slot_in_intent "$slot" "$src"
     fi
     assert_manifest_binding
     binary_tmp=$(mktemp -- "/proc/self/fd/7/.emuwiz-binary.XXXXXX") || fail "could not stage binary"
@@ -2935,6 +3289,8 @@ binding_manifest=$(manifest_descriptor_state) || fail "cannot identify updated m
 binding_digest=$published_manifest_digest
 assert_manifest_binding
 rm -f -- "$manifest_tmp"
+# The manifest now records every published asset: the intent has done its job.
+rm -f -- /proc/self/fd/8/install-intent
 # The manifest now records the new digests, so the upgrade journal is done.
 # The preserved copies themselves are never deleted by this installer.
 if [ -e /proc/self/fd/8/upgrade-pending ] || [ -L /proc/self/fd/8/upgrade-pending ]; then
