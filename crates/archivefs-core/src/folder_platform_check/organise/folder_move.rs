@@ -366,6 +366,13 @@ pub fn apply(
     database_path: &Path,
     journal_dir: &Path,
 ) -> Result<FolderMoveRecord, String> {
+    // Nothing of a disc set an earlier operation left in two places moves
+    // with a folder, or is moved onto; unreadable History refuses.
+    crate::dat::rom_organisation::rename_guard::refuse_split_disc_sets_in_folders(
+        &plan.source,
+        &plan.destination,
+        journal_dir,
+    )?;
     let now = capture_folder_layout(&plan.source)?;
     if now != plan.layout {
         return Err(format!(

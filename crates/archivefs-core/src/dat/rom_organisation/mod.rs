@@ -38,6 +38,7 @@ pub mod model;
 pub mod plan;
 pub mod protected_catalogue;
 pub mod rename_guard;
+mod split_disc_lock;
 pub mod tombstones;
 pub mod transaction;
 

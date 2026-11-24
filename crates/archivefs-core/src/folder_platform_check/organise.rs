@@ -552,6 +552,25 @@ pub fn apply(
     ),
 > {
     let plan = &root_plan.plan;
+    // A file of a disc set an earlier operation left in two places never
+    // moves, nor does anything move onto one of its places; History that
+    // cannot be read refuses (nothing has changed yet).
+    let mut touched: Vec<&Path> = Vec::new();
+    for entry in &plan.entries {
+        if approved.contains(&*entry.source_path.to_string_lossy()) {
+            touched.extend([
+                entry.source_path.as_path(),
+                entry.destination_path.as_path(),
+            ]);
+            if let Some(members) = root_plan.sets.get(&entry.source_path) {
+                for member in members {
+                    touched.extend([member.path.as_path(), member.destination.as_path()]);
+                }
+            }
+        }
+    }
+    crate::dat::rom_organisation::rename_guard::refuse_split_disc_set_paths(touched, journal_dir)
+        .map_err(|e| (ApplyError::Journal(e), None))?;
     let mut transaction = build_organisation_transaction(plan, approved, plan.generation)
         .map_err(|e| (ApplyError::Journal(e), None))?;
     for entry in &mut transaction.entries {

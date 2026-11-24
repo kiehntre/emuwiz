@@ -362,26 +362,60 @@ fn grouped_reverse_order(transaction: &RenameTransaction) -> Vec<usize> {
 fn split_disc_sets_on_disk(
     transaction: &RenameTransaction,
 ) -> Vec<(String, Vec<(&super::model::TransactionEntry, Option<bool>)>)> {
+    // A set's files carry the disc-set tag (Bulk Rename since #536) or only
+    // the companion tag on the files that travel with the main file
+    // (Folder platform check, the only writer of that layout). The
+    // companion tag names the main file's source path, so the main file
+    // joins its set by that path. The disc-set tag wins when both are
+    // present, so no set is counted twice.
+    let companion_lead = |entry: &super::model::TransactionEntry| {
+        entry
+            .unknown
+            .get(crate::database::organisation_paths::COMPANION_KEY)?
+            .get("lead")?
+            .as_str()
+            .map(str::to_string)
+    };
+    let moves: Vec<&super::model::TransactionEntry> = transaction
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.operation, TransactionOperation::RenameMove))
+        .collect();
+    let companion_leads: std::collections::BTreeSet<String> = moves
+        .iter()
+        .filter(|entry| crate::database::organisation_paths::disc_set_of(entry).is_none())
+        .filter_map(|entry| companion_lead(entry))
+        .collect();
     let mut sets =
         std::collections::BTreeMap::<String, Vec<&super::model::TransactionEntry>>::new();
-    for entry in &transaction.entries {
-        if matches!(entry.operation, TransactionOperation::RenameMove)
-            && let Some(lead) = crate::database::organisation_paths::disc_set_of(entry)
-        {
+    for entry in moves {
+        let lead = crate::database::organisation_paths::disc_set_of(entry)
+            .or_else(|| companion_lead(entry))
+            .or_else(|| {
+                let source = entry.source_path.to_string_lossy();
+                companion_leads
+                    .contains(source.as_ref())
+                    .then(|| source.into_owned())
+            });
+        if let Some(lead) = lead {
             sets.entry(lead).or_default().push(entry);
         }
     }
+    // Where a file is, from metadata only (device and inode): its content
+    // is never read to locate it, and a file that cannot be read is still
+    // where it is.
     let at = |path: &Path, entry: &super::model::TransactionEntry| {
-        capture_identity(path).is_ok_and(|current| {
-            #[cfg(unix)]
-            {
-                current.ino == entry.identity.ino && current.dev == entry.identity.dev
-            }
-            #[cfg(not(unix))]
-            {
-                identity_matches(&entry.identity, &current)
-            }
-        })
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::symlink_metadata(path).is_ok_and(|current| {
+                current.ino() == entry.identity.ino && current.dev() == entry.identity.dev
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            capture_identity(path).is_ok_and(|current| identity_matches(&entry.identity, &current))
+        }
     };
     let mut split = Vec::new();
     for (lead, members) in sets {
@@ -409,10 +443,15 @@ fn split_disc_sets_on_disk(
 
 /// Every path (old and new) of each disc set this transaction left not
 /// whole, so later operations can refuse them until the set is recovered.
+/// For these locks only, a set with nothing at any of its recorded paths
+/// (moved on by a later operation, deleted, or on a disk not attached now)
+/// has nothing here to protect; anything at a recorded path keeps it locked,
+/// even a copy with another inode. Every check reads the disk afresh.
+/// Apply and Undo report incompleteness strictly (`split_disc_set_reports`).
 pub fn split_disc_set_paths(
     transaction: &RenameTransaction,
 ) -> Vec<(String, Vec<std::path::PathBuf>)> {
-    split_disc_sets_on_disk(transaction)
+    split_disc_set_places(transaction)
         .into_iter()
         .map(|(lead, places)| {
             let paths = places
@@ -420,6 +459,42 @@ pub fn split_disc_set_paths(
                 .flat_map(|(entry, _)| [entry.source_path.clone(), entry.destination_path.clone()])
                 .collect();
             (lead, paths)
+        })
+        .collect()
+}
+
+/// Per split set: its lead and each file's entry with where it is.
+pub type SplitDiscSetPlaces<'a> = Vec<(
+    String,
+    Vec<(&'a super::model::TransactionEntry, Option<bool>)>,
+)>;
+
+/// The sets [`split_disc_set_paths`] locks, with each file's entry and where
+/// it is by device and inode (`Some(true)` new place, `Some(false)` old
+/// place, `None` neither), so a lock can follow later History moves.
+pub fn split_disc_set_places(transaction: &RenameTransaction) -> SplitDiscSetPlaces<'_> {
+    split_disc_sets_on_disk(transaction)
+        .into_iter()
+        .filter(|(_, places)| {
+            let occupied = |path: &Path| std::fs::symlink_metadata(path).is_ok();
+            let anything_here = places.iter().any(|(entry, _)| {
+                occupied(&entry.source_path) || occupied(&entry.destination_path)
+            });
+            // Whole by place (every new path occupied and every old path
+            // empty, or the reverse), whatever the inodes: a restored set
+            // is not locked. This says nothing about the files' contents;
+            // Apply and Undo keep their own checks.
+            let whole_by_place = |at_new: bool| {
+                places.iter().all(|(entry, _)| {
+                    let (here, there) = if at_new {
+                        (&entry.destination_path, &entry.source_path)
+                    } else {
+                        (&entry.source_path, &entry.destination_path)
+                    };
+                    occupied(here) && !occupied(there)
+                })
+            };
+            anything_here && !whole_by_place(true) && !whole_by_place(false)
         })
         .collect()
 }
@@ -446,7 +521,7 @@ pub fn split_disc_set_reports(transaction: &RenameTransaction) -> Vec<(String, S
         reports.push((
             lead.clone(),
             format!(
-                "DISC SET NOT WHOLE: the files of {lead} are not together. Where they are now: {}. Until the set is whole, every preview blocks these files and Apply refuses them, and nothing is overwritten. To recover: fix the problem reported for the file above, then Undo again from History; Undo puts the moved files back and then the set is whole at its old place. If a file is reported as not found, restore it from a backup before Undo.",
+                "DISC SET NOT WHOLE: the files of {lead} are not together. Where they are now: {}. Until the set is whole, Rename verified games and Quick Rename block these files in every preview and refuse them at Apply. Some other tools do not check for this: do not rename, move or link these files anywhere else until Undo has finished. Nothing is overwritten. To recover: fix the problem reported for the file above, then Undo again from History; Undo puts the moved files back and then the set is whole at its old place. If a file is reported as not found, restore it from a backup before Undo.",
                 lines.join("; ")
             ),
         ));

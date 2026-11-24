@@ -27,6 +27,7 @@ use super::game_rename::{
     folder_sidecars, owning_source_root_in, refuse_arcade_set_in,
 };
 use super::model::{OrganisationMode, OrganisationPlan, OrganisationStatus};
+use super::split_disc_lock::{SplitSetLock, split_set_locks};
 use super::transaction::live_resolution_for;
 use crate::platform::identity::{PlatformIdentityResolution, resolve_platform_identity};
 
@@ -365,26 +366,74 @@ impl SidecarCache {
 /// journals in `journal_dir`, located on disk), with the set they belong to.
 /// An unreadable journal folder yields nothing here; Apply cannot run
 /// without that folder anyway.
-fn split_disc_set_files(journal_dir: &Path) -> std::collections::BTreeMap<PathBuf, String> {
-    let mut files = std::collections::BTreeMap::new();
+fn split_disc_set_files(journal_dir: &Path) -> std::collections::BTreeMap<PathBuf, SplitSetLock> {
     if journal_dir.as_os_str().is_empty() {
-        return files;
+        return std::collections::BTreeMap::new();
     }
     let (journals, _unreadable) = crate::dat::rename_apply::journal::list_journals(journal_dir);
-    for journal in &journals {
-        for (lead, paths) in crate::dat::rename_apply::split_disc_set_paths(journal) {
-            for path in paths {
-                files.insert(path, lead.clone());
-            }
-        }
-    }
-    files
+    split_set_locks(&journals)
 }
 
-fn split_set_reason(lead: &str) -> String {
-    format!(
-        "this file belongs to the disc set of {lead}, which an earlier operation left with its files in two places. Nothing will change it until that set is whole again: finish it with Undo from History."
-    )
+/// As [`split_disc_set_files`], but fails closed: History that cannot be
+/// read completely refuses, because a split set in it cannot be ruled out.
+fn split_disc_set_files_or_refuse(
+    journal_dir: &Path,
+) -> Result<std::collections::BTreeMap<PathBuf, SplitSetLock>, String> {
+    let (journals, problems) = crate::dat::rename_apply::journal::list_journals(journal_dir);
+    if let Some(problem) = problems.first() {
+        let more = match problems.len() {
+            1 => String::new(),
+            n => format!(" (and {} more)", n - 1),
+        };
+        return Err(format!(
+            "A History record could not be read: {problem}{more}. It may record a disc set an earlier operation left in two places, so nothing is moved until every History record can be read. Open History to see which record is affected; the records are files in {}. Nothing was changed.",
+            journal_dir.display()
+        ));
+    }
+    Ok(split_set_locks(&journals))
+}
+
+/// For moves outside Bulk Rename (Folder platform check): refuses if any of
+/// `paths` (files to move, and where they would go) belongs to a disc set an
+/// earlier operation left not whole, or if History cannot be read.
+pub fn refuse_split_disc_set_paths<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+    journal_dir: &Path,
+) -> Result<(), String> {
+    let files = split_disc_set_files_or_refuse(journal_dir)?;
+    for path in paths {
+        if let Some(lock) = files.get(path) {
+            return Err(format!(
+                "{}: {} Nothing was changed.",
+                path.display(),
+                lock.reason()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// For whole-folder moves: refuses if a file of a disc set an earlier
+/// operation left not whole is inside `source` or `destination`, or if
+/// History cannot be read.
+pub fn refuse_split_disc_sets_in_folders(
+    source: &Path,
+    destination: &Path,
+    journal_dir: &Path,
+) -> Result<(), String> {
+    let files = split_disc_set_files_or_refuse(journal_dir)?;
+    if let Some((path, lock)) = files
+        .iter()
+        .find(|(path, _)| path.starts_with(source) || path.starts_with(destination))
+    {
+        return Err(format!(
+            "{} was not moved: {}: {} Nothing was changed.",
+            source.display(),
+            path.display(),
+            lock.reason()
+        ));
+    }
+    Ok(())
 }
 
 /// Blocks, in any mode, every file of a disc set an earlier operation left
@@ -396,11 +445,11 @@ pub fn block_split_disc_sets(plan: &mut OrganisationPlan, journal_dir: &Path) ->
     }
     let mut blocked = 0;
     for entry in &mut plan.entries {
-        if let Some(lead) = files.get(&entry.source_path)
+        if let Some(lock) = files.get(&entry.source_path)
             && entry.status != OrganisationStatus::Blocked
         {
             entry.status = OrganisationStatus::Blocked;
-            entry.reason = Some(split_set_reason(lead));
+            entry.reason = Some(lock.reason());
             blocked += 1;
         }
     }
@@ -417,12 +466,12 @@ pub fn refuse_split_disc_sets(
     let files = split_disc_set_files(journal_dir);
     for entry in &plan.entries {
         if approved.contains(entry.source_path.to_string_lossy().as_ref())
-            && let Some(lead) = files.get(&entry.source_path)
+            && let Some(lock) = files.get(&entry.source_path)
         {
             return Err(format!(
                 "{}: {} Nothing was changed.",
                 entry.source_path.display(),
-                split_set_reason(lead)
+                lock.reason()
             ));
         }
     }

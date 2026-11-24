@@ -1449,4 +1449,151 @@ mod never_split {
         assert_eq!(s.lib.undo(&mut tx), RollbackResult::FullyRolledBack);
         assert!(s.other.exists());
     }
+
+    fn inode(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).unwrap().ino()
+    }
+
+    /// Moves every file of the set, wherever it is now, out of the library
+    /// (as a disk that drops out would); returns where each went.
+    fn take_set_away(lib: &Lib, set: &[PathBuf], new_of: &[PathBuf]) -> Vec<PathBuf> {
+        let away = lib.temp.path().join("not attached");
+        std::fs::create_dir_all(&away).unwrap();
+        set.iter()
+            .zip(new_of)
+            .enumerate()
+            .map(|(i, (old, new))| {
+                let here = if new.exists() { new } else { old };
+                let held = away.join(i.to_string());
+                std::fs::rename(here, &held).unwrap();
+                held
+            })
+            .collect()
+    }
+
+    /// Review (final candidate): an Apply interrupted part-way through a
+    /// disc set, after which no file of the set is at either recorded place,
+    /// is never reported as a normal Apply.
+    #[test]
+    fn an_interrupted_set_with_every_file_gone_is_never_a_normal_apply() {
+        let s = setup(false);
+        let set = s.set.to_vec();
+        let new_of: Vec<PathBuf> = set.iter().map(|p| moved(&s.plan, p)).collect();
+        let before: Vec<u64> = set.iter().map(|p| inode(p)).collect();
+        let held = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let record = held.clone();
+        let (hook_set, hook_new) = (set.clone(), new_of.clone());
+        let hook_lib = s.lib.temp.path().to_path_buf();
+        test_hook::after_applied(move |count, _| {
+            if count == 1 {
+                let away = hook_lib.join("not attached");
+                std::fs::create_dir_all(&away).unwrap();
+                for (i, (old, new)) in hook_set.iter().zip(&hook_new).enumerate() {
+                    let here = if new.exists() { new } else { old };
+                    let to = away.join(i.to_string());
+                    std::fs::rename(here, &to).unwrap();
+                    record.borrow_mut().push(to);
+                }
+            }
+        });
+        let result = s.lib.apply(&s.plan, &all_of(&s.plan));
+        test_hook::clear();
+        let Err(error) = result else {
+            panic!(
+                "Apply reported a normal result although no file of the interrupted set was found"
+            );
+        };
+        assert!(error.contains("DISC SET NOT WHOLE"), "{error}");
+        assert!(error.contains("not found"), "{error}");
+        let held = held.borrow();
+        assert_eq!(held.iter().map(|p| inode(p)).collect::<Vec<_>>(), before);
+        assert!(
+            set.iter().chain(&new_of).all(|p| !p.exists()),
+            "nothing recreated"
+        );
+        let mut journals = crate::dat::rename_apply::journal::list_journals(&s.lib.journal()).0;
+        assert_eq!(journals.len(), 1);
+        assert_ne!(journals.remove(0).state, TransactionState::Applied);
+    }
+
+    /// The same for Undo: an applied set with no file at either recorded
+    /// place is never reported as undone, and the set is named.
+    #[test]
+    fn undo_of_a_set_with_every_file_gone_names_the_set() {
+        let s = setup(false);
+        let mut tx = s.lib.apply(&s.plan, &all_of(&s.plan)).unwrap();
+        assert_eq!(tx.state, TransactionState::Applied);
+        let set = s.set.to_vec();
+        let new_of: Vec<PathBuf> = set.iter().map(|p| moved(&s.plan, p)).collect();
+        let before: Vec<u64> = new_of.iter().map(|p| inode(p)).collect();
+        let held = take_set_away(&s.lib, &set, &new_of);
+        let result = s.lib.undo(&mut tx);
+        let failed = match &result {
+            RollbackResult::FullyRolledBack => panic!("Undo reported done with the set gone"),
+            RollbackResult::PartiallyRolledBack { failed, .. }
+            | RollbackResult::RollbackFailed { failed } => failed.clone(),
+        };
+        assert!(
+            failed
+                .iter()
+                .any(|(_, reason)| reason.contains("DISC SET NOT WHOLE")),
+            "{failed:?}"
+        );
+        assert_eq!(held.iter().map(|p| inode(p)).collect::<Vec<_>>(), before);
+        assert!(
+            set.iter().chain(&new_of).all(|p| !p.exists()),
+            "nothing recreated"
+        );
+    }
+
+    /// The defect through Bulk Rename's own journals (option B): a custom
+    /// rename of the cue after Bulk Rename moved the set does not lock it;
+    /// a fresh preview offers the whole renamed set again.
+    #[test]
+    fn a_custom_rename_after_bulk_rename_does_not_lock_the_set() {
+        use super::super::game_rename::{
+            RetroArchSaveLocations, apply_game_rename, preview_game_rename,
+        };
+        let s = setup(false);
+        let tx = s.lib.apply(&s.plan, &all_of(&s.plan)).unwrap();
+        assert_eq!(tx.state, TransactionState::Applied);
+        let cue = moved(&s.plan, &s.set[0]);
+        let none = RetroArchSaveLocations::default();
+        let preview = preview_game_rename(&s.lib.db, &cue, "My Custom Name", 1, &none).unwrap();
+        apply_game_rename(
+            &preview,
+            &s.lib.db,
+            &s.lib.journal(),
+            &AtomicBool::new(false),
+            &none,
+        )
+        .unwrap();
+        let renamed = cue.with_file_name("My Custom Name.cue");
+        assert!(renamed.exists() && !cue.exists());
+        let tracks = [moved(&s.plan, &s.set[1]), moved(&s.plan, &s.set[2])];
+        let fresh = s.lib.preview(
+            OrganisationMode::MoveRealFile,
+            &[renamed.as_path(), tracks[0].as_path(), tracks[1].as_path()],
+        );
+        assert_eq!(fresh.entries.len(), 3, "the whole renamed set is offered");
+        for entry in &fresh.entries {
+            assert_ne!(entry.status, OrganisationStatus::Blocked, "{entry:?}");
+            assert!(
+                !entry
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("in two places")),
+                "{entry:?}"
+            );
+        }
+        let approved: BTreeSet<String> = [&renamed, &tracks[0], &tracks[1]]
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            super::super::rename_guard::refuse_split_disc_sets(&fresh, &approved, &s.lib.journal())
+                .is_ok()
+        );
+    }
 }
