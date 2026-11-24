@@ -55,6 +55,12 @@ pub struct MameMachineFacts {
     pub sourcefile: String,
     pub control_types: Vec<String>,
     pub flagged_features: Vec<FlaggedFeature>,
+    /// ROM files this machine lists ONLY under a BIOS version other than the
+    /// one MAME starts by default (`<biosset default="yes">`, else the first).
+    /// MAME loads just the selected BIOS version's files, so these being
+    /// missing never stops a default start. A file name that also appears
+    /// under the default version, or with no `bios` attribute, is never here.
+    pub alternative_bios_files: Vec<String>,
 }
 
 fn attr_map(
@@ -76,6 +82,12 @@ pub fn parse_machine_facts(xml: &str, set: &str) -> Result<Option<MameMachineFac
     let mut reader = Reader::from_str(xml);
     let mut facts: Option<MameMachineFacts> = None;
     let mut depth_in_target = 0usize;
+    // (name, declared default) in document order; (rom file, bios version or None).
+    let mut bios_sets: Vec<(String, bool)> = Vec::new();
+    let mut rom_bios: Vec<(String, Option<String>)> = Vec::new();
+    // Set only on the target's own `</machine>`: a read error or EOF before
+    // it (truncated or killed output) leaves the BIOS data unproven.
+    let mut target_complete = false;
     loop {
         match reader.read_event() {
             Ok(Event::Eof) => break,
@@ -121,6 +133,17 @@ pub fn parse_machine_facts(xml: &str, set: &str) -> Result<Option<MameMachineFac
                             a.get("requiresartwork").map(String::as_str) == Some("yes");
                     }
                     "display" => f.has_display = true,
+                    "biosset" => {
+                        if let Some(name) = a.get("name") {
+                            let default = a.get("default").map(String::as_str) == Some("yes");
+                            bios_sets.push((name.clone(), default));
+                        }
+                    }
+                    "rom" => {
+                        if let Some(name) = a.get("name") {
+                            rom_bios.push((name.clone(), a.get("bios").cloned()));
+                        }
+                    }
                     "control" => {
                         if let Some(kind) = a.get("type")
                             && !f.control_types.contains(kind)
@@ -140,10 +163,65 @@ pub fn parse_machine_facts(xml: &str, set: &str) -> Result<Option<MameMachineFac
                     _ => {}
                 }
             }
+            Ok(Event::End(e)) => {
+                if facts.is_some() && e.name().as_ref() == b"machine" {
+                    target_complete = true;
+                    break;
+                }
+            }
             Ok(_) => {}
         }
     }
+    if let Some(f) = facts.as_mut()
+        && target_complete
+    {
+        f.alternative_bios_files = alternative_bios_files(&bios_sets, &rom_bios);
+    }
     Ok(facts)
+}
+
+/// Files listed only under non-default BIOS versions (see
+/// [`MameMachineFacts::alternative_bios_files`]). Nothing is optional when
+/// there are no BIOS versions, or when any file names a BIOS version the
+/// machine does not declare (the metadata cannot be trusted). With no
+/// `default="yes"`, MAME starts the first declared version: `-listxml` marks
+/// only an explicit default (2,740 of 3,446 BIOS machines in 0.264 have
+/// none), and Neo Geo / PlayChoice-10 sets with only other versions' files
+/// missing were demonstrated to start (Oracle A1-A start check).
+fn alternative_bios_files(
+    bios_sets: &[(String, bool)],
+    rom_bios: &[(String, Option<String>)],
+) -> Vec<String> {
+    let default = bios_sets
+        .iter()
+        .find(|(_, is_default)| *is_default)
+        .or_else(|| bios_sets.first())
+        .map(|(name, _)| name.as_str());
+    let Some(default) = default else {
+        return Vec::new();
+    };
+    let declared = |b: &str| bios_sets.iter().any(|(name, _)| name == b);
+    if rom_bios
+        .iter()
+        .any(|(_, bios)| bios.as_deref().is_some_and(|b| !declared(b)))
+    {
+        return Vec::new();
+    }
+    let needed_by_default = |file: &str| {
+        rom_bios
+            .iter()
+            .any(|(name, bios)| name == file && bios.as_deref().is_none_or(|b| b == default))
+    };
+    let mut out: Vec<String> = rom_bios
+        .iter()
+        .filter(|(name, bios)| {
+            bios.as_deref().is_some_and(|b| b != default) && !needed_by_default(name)
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -511,7 +589,7 @@ pub fn evaluate_arcade_set(
                 ),
             );
         }
-        VerifyState::Bad => match bad_verdict(set, verify) {
+        VerifyState::Bad => match bad_verdict(set, verify, &facts.alternative_bios_files) {
             Ok(warning) => wrong_dump_warning = Some(warning),
             Err(blocked) => return blocked,
         },
@@ -560,12 +638,26 @@ pub fn evaluate_arcade_set(
 /// (an experimental qualification); everything else is `Err(blocked)` naming
 /// the bad ROMs. The old "small file" size heuristic is deliberately gone: it
 /// was not proof of playability.
-fn bad_verdict(set: &str, verify: &VerifyReport) -> Result<String, ArcadeMameVerdict> {
+fn bad_verdict(
+    set: &str,
+    verify: &VerifyReport,
+    alternative_bios_files: &[String],
+) -> Result<String, ArcadeMameVerdict> {
     let mut deps: Vec<String> = Vec::new();
     let mut own_missing: Vec<String> = Vec::new();
     let mut wrong: Vec<String> = Vec::new();
     let mut wrong_files: Vec<&str> = Vec::new();
+    let mut optional_bios_missing: Vec<&str> = Vec::new();
     for problem in &verify.problems {
+        // A missing file that only another BIOS version uses does not stop
+        // MAME starting with its default BIOS (demonstrated: aof, kof98,
+        // pc_mman3, cbtime start with these reported NOT FOUND).
+        if matches!(problem.kind, VerifyProblemKind::NotFound { .. })
+            && alternative_bios_files.iter().any(|f| *f == problem.file)
+        {
+            optional_bios_missing.push(problem.file.as_str());
+            continue;
+        }
         let label = if problem.is_disk {
             format!("disk image {}", problem.file)
         } else {
@@ -607,6 +699,17 @@ fn bad_verdict(set: &str, verify: &VerifyReport) -> Result<String, ArcadeMameVer
         parts.push(format!(
             "wrong dump version: {} - MAME may refuse or run with a warning",
             list(&wrong)
+        ));
+    }
+    if parts.is_empty() && !optional_bios_missing.is_empty() {
+        return Ok(format!(
+            "{set}: only files for other BIOS versions are missing ({}); MAME starts with its default BIOS",
+            list(
+                &optional_bios_missing
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect::<Vec<_>>()
+            )
         ));
     }
     if parts.is_empty() {

@@ -776,3 +776,77 @@ fn wrong_dump_evidence_applies_only_to_the_evidenced_bad_file() {
     );
     assert_eq!(both.readiness, ArcadeReadiness::Blocked);
 }
+
+fn neogeo_style(set: &str) -> MameMachineFacts {
+    // Two BIOS versions; "euro" is the first and therefore the default.
+    let inner = r#"<biosset name="euro" description="Europe"/><biosset name="asia" description="Asia"/><rom name="sp-s2.sp1" bios="euro" size="131072"/><rom name="sp-s3.sp1" bios="asia" size="131072"/><rom name="000-lo.lo" size="131072"/><rom name="044-p1.p1" size="1048576"/>"#;
+    facts(
+        &machine(set, "good", "good", r#"romof="neogeo""#, inner, ""),
+        set,
+    )
+}
+
+#[test]
+fn files_for_other_bios_versions_only_never_block() {
+    let f = neogeo_style("aofx");
+    assert_eq!(f.alternative_bios_files, vec!["sp-s3.sp1".to_string()]);
+    let out = "aofx        : sp-s3.sp1 (131072 bytes) - NOT FOUND (neogeo)\nromset aofx [neogeo] is bad\n";
+    let v = evaluate_arcade_set("aofx", Some(&f), &verify_text(out, "aofx"), false);
+    assert_eq!(v.block_reason, None);
+    assert_ne!(v.readiness, ArcadeReadiness::Blocked);
+    assert!(
+        v.warnings
+            .iter()
+            .any(|w| w.contains("sp-s3.sp1") && w.contains("default BIOS"))
+    );
+}
+
+#[test]
+fn a_missing_default_bios_file_still_blocks() {
+    let f = neogeo_style("aofx");
+    let out = "aofx        : sp-s2.sp1 (131072 bytes) - NOT FOUND (neogeo)\naofx        : sp-s3.sp1 (131072 bytes) - NOT FOUND (neogeo)\nromset aofx [neogeo] is bad\n";
+    let v = evaluate_arcade_set("aofx", Some(&f), &verify_text(out, "aofx"), false);
+    assert_eq!(v.block_reason, Some(ArcadeBlockReason::BiosOrDeviceMissing));
+}
+
+#[test]
+fn other_missing_files_still_block_when_alternative_bios_files_are_also_missing() {
+    let f = neogeo_style("aofx");
+    let out = "aofx        : sp-s3.sp1 (131072 bytes) - NOT FOUND (neogeo)\naofx        : 044-p1.p1 (1048576 bytes) - NOT FOUND\nromset aofx [neogeo] is bad\n";
+    let v = evaluate_arcade_set("aofx", Some(&f), &verify_text(out, "aofx"), false);
+    assert_eq!(v.block_reason, Some(ArcadeBlockReason::RomsIncomplete));
+    assert!(v.blockers[0].contains("044-p1.p1"));
+}
+
+#[test]
+fn a_file_shared_with_the_default_bios_version_is_never_optional() {
+    let inner = r#"<biosset name="a" default="yes"/><biosset name="b"/><rom name="shared.bin" bios="a"/><rom name="shared.bin" bios="b"/><rom name="only_b.bin" bios="b"/>"#;
+    let f = facts(&machine("m", "good", "good", "", inner, ""), "m");
+    assert_eq!(f.alternative_bios_files, vec!["only_b.bin".to_string()]);
+}
+
+#[test]
+fn an_explicit_default_that_is_not_first_is_the_one_kept_required() {
+    let inner = r#"<biosset name="old"/><biosset name="new" default="yes"/><rom name="old.bin" bios="old"/><rom name="new.bin" bios="new"/>"#;
+    let f = facts(&machine("m", "good", "good", "", inner, ""), "m");
+    assert_eq!(f.alternative_bios_files, vec!["old.bin".to_string()]);
+}
+
+#[test]
+fn a_file_naming_an_undeclared_bios_version_makes_nothing_optional() {
+    let inner = r#"<biosset name="a" default="yes"/><biosset name="b"/><rom name="b.bin" bios="b"/><rom name="ghost.bin" bios="zz"/>"#;
+    let f = facts(&machine("m", "good", "good", "", inner, ""), "m");
+    assert!(f.alternative_bios_files.is_empty());
+}
+
+#[test]
+fn truncated_machine_data_makes_nothing_optional_and_still_blocks() {
+    // Output cut off after the alternative entry: the default entry for
+    // sp-s2.sp1 may simply be missing from what was read.
+    let xml = r#"<mame build="0.264"><machine name="aofx" romof="neogeo"><driver status="good" emulation="good"/><biosset name="euro"/><biosset name="asia"/><rom name="sp-s3.sp1" bios="asia" size="131072"/>"#;
+    let f = facts(xml, "aofx");
+    assert!(f.alternative_bios_files.is_empty());
+    let out = "aofx        : sp-s3.sp1 (131072 bytes) - NOT FOUND (neogeo)\nromset aofx [neogeo] is bad\n";
+    let v = evaluate_arcade_set("aofx", Some(&f), &verify_text(out, "aofx"), false);
+    assert_eq!(v.block_reason, Some(ArcadeBlockReason::BiosOrDeviceMissing));
+}
