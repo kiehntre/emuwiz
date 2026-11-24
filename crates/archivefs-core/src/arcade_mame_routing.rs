@@ -831,39 +831,82 @@ fn read_bounded(reader: impl Read) -> Vec<u8> {
     bytes
 }
 
-/// Runs the executable with a deadline and cancel flag; `None` on spawn
+/// Why one bounded MAME run gave no output to parse. Production only needs
+/// "it did not finish"; the detail is kept so a test failure can say whether
+/// the program could not start (with the raw OS error), timed out, was
+/// cancelled or could not be waited on.
+#[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "diagnostic detail, read only through Debug when a probe test fails (issue #479)"
+)]
+enum RunFailure {
+    /// `Command::spawn` failed; the `io::Error` carries the raw OS error.
+    Spawn(std::io::Error),
+    /// The child started without the piped stdout/stderr it was given.
+    PipeMissing,
+    /// `try_wait` failed while the child was running.
+    Wait(std::io::Error),
+    TimedOut {
+        after: Duration,
+    },
+    Cancelled {
+        after: Duration,
+    },
+}
+
+/// A run that finished on its own: exit status plus bounded stdout+stderr.
+#[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "diagnostic detail, read only through Debug when a probe test fails (issue #479)"
+)]
+struct RunOutput {
+    status: std::process::ExitStatus,
+    elapsed: Duration,
+    text: String,
+}
+
+/// Runs the executable with a deadline and cancel flag; an error on spawn
 /// failure, timeout or cancellation. Output (stdout+stderr) is bounded.
 fn run_bounded(
     executable: &Path,
     args: &[OsString],
     timeout: Duration,
     cancel: &AtomicBool,
-) -> Option<String> {
+) -> Result<RunOutput, RunFailure> {
+    let started = Instant::now();
     let mut child =
         std::os::unix::process::CommandExt::process_group(Command::new(executable).args(args), 0)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .ok()?;
-    let stdout = child.stdout.take()?;
-    let stderr = child.stderr.take()?;
+            .map_err(RunFailure::Spawn)?;
+    let stdout = child.stdout.take().ok_or(RunFailure::PipeMissing)?;
+    let stderr = child.stderr.take().ok_or(RunFailure::PipeMissing)?;
     let out = thread::spawn(|| read_bounded(stdout));
     let err = thread::spawn(|| read_bounded(stderr));
     let deadline = Instant::now() + timeout;
     let finished = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break true,
+            Ok(Some(status)) => break Ok(status),
             Ok(None) if Instant::now() >= deadline || cancel.load(Ordering::Relaxed) => {
+                let after = started.elapsed();
+                let why = if cancel.load(Ordering::Relaxed) {
+                    RunFailure::Cancelled { after }
+                } else {
+                    RunFailure::TimedOut { after }
+                };
                 // Kill the whole group while the child is still unreaped, so
                 // its pid (= group id) cannot have been reused yet.
                 // SAFETY: the group id is our own just-spawned child's pid.
                 unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
                 let _ = child.wait();
-                break false;
+                break Err(why);
             }
             Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(_) => break false,
+            Err(error) => break Err(RunFailure::Wait(error)),
         }
     };
     // After a normal exit the child is already reaped, so there is a tiny pid
@@ -873,7 +916,24 @@ fn run_bounded(
     unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
     let mut bytes = out.join().unwrap_or_default();
     bytes.extend(err.join().unwrap_or_default());
-    finished.then(|| String::from_utf8_lossy(&bytes).into_owned())
+    let status = finished?;
+    Ok(RunOutput {
+        status,
+        elapsed: started.elapsed(),
+        text: String::from_utf8_lossy(&bytes).into_owned(),
+    })
+}
+
+/// What each MAME run in one probe did. Not part of the verdict: production
+/// drops it; tests print it so a failure shows its cause.
+#[derive(Debug, Default)]
+#[allow(
+    dead_code,
+    reason = "diagnostic detail, read only through Debug when a probe test fails (issue #479)"
+)]
+struct ProbeTrace {
+    verify_run: Option<Result<RunOutput, RunFailure>>,
+    listxml_run: Option<Result<RunOutput, RunFailure>>,
 }
 
 /// A set name becomes one argv component and a folder name.
@@ -894,6 +954,20 @@ pub fn probe_arcade_set(
     timeout: Duration,
     cancel: &AtomicBool,
 ) -> ArcadeProbe {
+    probe_arcade_set_traced(executable, set, set_dir, extra_rompaths, timeout, cancel).0
+}
+
+/// [`probe_arcade_set`] plus what each MAME run did. The probe it returns is
+/// exactly the one `probe_arcade_set` returns.
+fn probe_arcade_set_traced(
+    executable: &Path,
+    set: &str,
+    set_dir: &Path,
+    extra_rompaths: &[PathBuf],
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> (ArcadeProbe, ProbeTrace) {
+    let mut trace = ProbeTrace::default();
     let failed = |detail: &str| ArcadeProbe {
         facts: None,
         verify: VerifyReport {
@@ -903,14 +977,23 @@ pub fn probe_arcade_set(
         verdict: block(ArcadeBlockReason::CheckFailed, detail.to_string()),
     };
     if !is_probe_safe_set_name(set) {
-        return failed("the set folder name is not a plain MAME set name");
+        return (
+            failed("the set folder name is not a plain MAME set name"),
+            trace,
+        );
     }
     let Some(parent) = set_dir.parent() else {
-        return failed("the set folder has no parent collection folder");
+        return (
+            failed("the set folder has no parent collection folder"),
+            trace,
+        );
     };
     if parent.to_string_lossy().contains(';') || !parent.is_absolute() {
-        return failed(
-            "the collection folder path contains ';' or is not absolute, so it cannot be a MAME ROM path",
+        return (
+            failed(
+                "the collection folder path contains ';' or is not absolute, so it cannot be a MAME ROM path",
+            ),
+            trace,
         );
     }
     let (extra, _rejected) = validate_extra_rompaths(extra_rompaths);
@@ -927,21 +1010,37 @@ pub fn probe_arcade_set(
     ]);
     let mut xml_args = base.to_vec();
     xml_args.extend([OsString::from("-listxml"), OsString::from(set)]);
-    let Some(verify_text) = run_bounded(executable, &verify_args, timeout, cancel) else {
-        return failed("MAME's ROM check did not finish (timed out or cancelled)");
+    let verify_run =
+        trace
+            .verify_run
+            .insert(run_bounded(executable, &verify_args, timeout, cancel));
+    let Ok(verify_output) = verify_run else {
+        return (
+            failed("MAME's ROM check did not finish (timed out or cancelled)"),
+            trace,
+        );
     };
-    let Some(xml_text) = run_bounded(executable, &xml_args, timeout, cancel) else {
-        return failed("MAME's machine data query did not finish (timed out or cancelled)");
+    let verify = parse_verify_output(&verify_output.text, set);
+    let xml_run = trace
+        .listxml_run
+        .insert(run_bounded(executable, &xml_args, timeout, cancel));
+    let Ok(xml_output) = xml_run else {
+        return (
+            failed("MAME's machine data query did not finish (timed out or cancelled)"),
+            trace,
+        );
     };
-    let verify = parse_verify_output(&verify_text, set);
-    let facts = parse_machine_facts(&xml_text, set).unwrap_or(None);
+    let facts = parse_machine_facts(&xml_output.text, set).unwrap_or(None);
     let artwork = artwork_located(set, set_dir, executable);
     let verdict = evaluate_arcade_set(set, facts.as_ref(), &verify, artwork);
-    ArcadeProbe {
-        facts,
-        verify,
-        verdict,
-    }
+    (
+        ArcadeProbe {
+            facts,
+            verify,
+            verdict,
+        },
+        trace,
+    )
 }
 
 #[cfg(test)]

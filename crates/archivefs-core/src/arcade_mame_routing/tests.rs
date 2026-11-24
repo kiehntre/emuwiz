@@ -499,12 +499,16 @@ fn probe_passes_the_extra_rompath_and_readiness_follows_the_verify_result() {
     let bios = dir.path().join("bios");
     std::fs::create_dir(&bios).unwrap();
     let cancel = AtomicBool::new(false);
-    let none = probe_arcade_set(&exe, "blk", &set_dir, &[], Duration::from_secs(10), &cancel);
+    // Each probe is traced so an intermittent failure (issue #479) reports
+    // why: spawn error with its raw OS error, timeout, or MAME's output.
+    let (none, trace) =
+        probe_arcade_set_traced(&exe, "blk", &set_dir, &[], Duration::from_secs(10), &cancel);
     assert_eq!(
         none.verdict.block_reason,
-        Some(ArcadeBlockReason::BiosOrDeviceMissing)
+        Some(ArcadeBlockReason::BiosOrDeviceMissing),
+        "probe without the extra rompath: {none:#?}\n{trace:#?}"
     );
-    let with = probe_arcade_set(
+    let (with, trace) = probe_arcade_set_traced(
         &exe,
         "blk",
         &set_dir,
@@ -512,9 +516,13 @@ fn probe_passes_the_extra_rompath_and_readiness_follows_the_verify_result() {
         Duration::from_secs(10),
         &cancel,
     );
-    assert_eq!(with.verdict.readiness, ArcadeReadiness::Ready);
+    assert_eq!(
+        with.verdict.readiness,
+        ArcadeReadiness::Ready,
+        "probe with the extra rompath: {with:#?}\n{trace:#?}"
+    );
     // An invalid extra path is dropped, so it cannot unblock anything.
-    let bad = probe_arcade_set(
+    let (bad, trace) = probe_arcade_set_traced(
         &exe,
         "blk",
         &set_dir,
@@ -522,10 +530,115 @@ fn probe_passes_the_extra_rompath_and_readiness_follows_the_verify_result() {
         Duration::from_secs(10),
         &cancel,
     );
-    assert_eq!(bad.verdict.readiness, ArcadeReadiness::Blocked);
+    assert_eq!(
+        bad.verdict.readiness,
+        ArcadeReadiness::Blocked,
+        "probe with an invalid extra rompath: {bad:#?}\n{trace:#?}"
+    );
     // Nothing was written into the collection or the BIOS folder.
     assert_eq!(std::fs::read_dir(&bios).unwrap().count(), 0);
     assert_eq!(std::fs::read_dir(&set_dir).unwrap().count(), 0);
+}
+
+// The diagnostic tests below write no new scripts. A freshly written script
+// executed at once is the pattern of the intermittent failure in issue #479
+// (cause unconfirmed), so they use a missing path, /bin/false, or /bin/sh -c.
+
+#[test]
+fn the_traced_probe_returns_exactly_the_production_probe() {
+    let dir = tempfile::tempdir().unwrap();
+    let set_dir = dir.path().join("arcade").join("blk");
+    std::fs::create_dir_all(&set_dir).unwrap();
+    let cancel = AtomicBool::new(false);
+    let missing = dir.path().join("no-such-mame");
+    for exe in [Path::new("/bin/false"), missing.as_path()] {
+        let plain = probe_arcade_set(exe, "blk", &set_dir, &[], Duration::from_secs(10), &cancel);
+        let (traced, trace) =
+            probe_arcade_set_traced(exe, "blk", &set_dir, &[], Duration::from_secs(10), &cancel);
+        assert_eq!(plain, traced, "{exe:?}: {trace:#?}");
+    }
+}
+
+#[test]
+fn a_spawn_failure_keeps_the_raw_os_error_and_the_same_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let set_dir = dir.path().join("arcade").join("blk");
+    std::fs::create_dir_all(&set_dir).unwrap();
+    let (probe, trace) = probe_arcade_set_traced(
+        &dir.path().join("no-such-mame"),
+        "blk",
+        &set_dir,
+        &[],
+        Duration::from_secs(5),
+        &AtomicBool::new(false),
+    );
+    assert_eq!(
+        probe.verdict.block_reason,
+        Some(ArcadeBlockReason::CheckFailed)
+    );
+    assert_eq!(
+        probe.verdict.blockers,
+        vec!["MAME's ROM check did not finish (timed out or cancelled)".to_string()]
+    );
+    match &trace.verify_run {
+        Some(Err(RunFailure::Spawn(error))) => {
+            assert_eq!(error.raw_os_error(), Some(libc::ENOENT), "{error:?}");
+        }
+        other => panic!("expected a spawn failure, got {other:#?}"),
+    }
+    assert!(trace.listxml_run.is_none(), "{trace:#?}");
+}
+
+#[test]
+fn run_bounded_tells_timeout_and_cancel_apart() {
+    let sh = Path::new("/bin/sh");
+    let args = [OsString::from("-c"), OsString::from("sleep 30")];
+    let started = Instant::now();
+    match run_bounded(
+        sh,
+        &args,
+        Duration::from_millis(200),
+        &AtomicBool::new(false),
+    ) {
+        Err(RunFailure::TimedOut { after }) => assert!(after >= Duration::from_millis(200)),
+        other => panic!("expected a timeout, got {other:#?}"),
+    }
+    match run_bounded(sh, &args, Duration::from_secs(30), &AtomicBool::new(true)) {
+        Err(RunFailure::Cancelled { .. }) => {}
+        other => panic!("expected a cancellation, got {other:#?}"),
+    }
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn unrecognised_verify_output_is_captured_and_still_blocks_as_check_failed() {
+    let args = [
+        OsString::from("-c"),
+        OsString::from("echo 'not a verify answer'"),
+    ];
+    let output = match run_bounded(
+        Path::new("/bin/sh"),
+        &args,
+        Duration::from_secs(10),
+        &AtomicBool::new(false),
+    ) {
+        Ok(output) => output,
+        other => panic!("expected a finished run, got {other:#?}"),
+    };
+    assert!(output.status.success(), "{output:#?}");
+    assert_eq!(output.text, "not a verify answer\n");
+    let verify = parse_verify_output(&output.text, "x");
+    assert_eq!(verify.state, VerifyState::Unrecognised);
+    let facts = facts(
+        r#"<mame><machine name="x"><driver status="good" emulation="good"/></machine></mame>"#,
+        "x",
+    );
+    let verdict = evaluate_arcade_set("x", Some(&facts), &verify, false);
+    assert_eq!(verdict.block_reason, Some(ArcadeBlockReason::CheckFailed));
+    assert_eq!(
+        verdict.blockers,
+        vec!["MAME's ROM check for x gave no usable answer".to_string()]
+    );
 }
 
 #[test]
