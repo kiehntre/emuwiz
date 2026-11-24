@@ -93,7 +93,7 @@ pub use rollback::{
     JOURNAL_INTEGRITY_LOST, RollbackOutcome, abandon_unavailable_links, is_journal_integrity_loss,
     link_unavailable_now, reenter_recovery_reconciliation, rollback_disc_sets,
     rollback_transaction, rollback_transaction_confined, split_disc_set_paths,
-    split_disc_set_reports,
+    split_disc_set_places, split_disc_set_reports,
 };
 
 #[cfg(test)]
