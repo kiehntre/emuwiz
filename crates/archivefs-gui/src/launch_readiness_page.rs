@@ -5245,7 +5245,7 @@ fn mame_launch_request(
     let arcade_lookup = (platform_id == "Arcade")
         .then(|| crate::arcade_mame_probe::peek(&executable, &path))
         .flatten();
-    let (resolution, extra_rompaths) = if let Some(lookup) = arcade_lookup {
+    let (resolution, extra_rompaths, default_bios_evidence) = if let Some(lookup) = arcade_lookup {
         match lookup {
             crate::arcade_mame_probe::Lookup::Checking => {
                 return Err(crate::arcade_mame_probe::checking_blocker());
@@ -5256,7 +5256,11 @@ fn mame_launch_request(
                 {
                     return Err(crate::arcade_mame_probe::blocker_for(&probe));
                 }
-                (probe.resolution.clone(), probe.extra_rompaths.clone())
+                (
+                    probe.resolution.clone(),
+                    probe.extra_rompaths.clone(),
+                    probe.bios_evidence.clone(),
+                )
             }
         }
     } else {
@@ -5298,7 +5302,7 @@ fn mame_launch_request(
                         "the persisted MAME audit does not authorize this logical set",
                     )
                 })?;
-        (resolution, Vec::new())
+        (resolution, Vec::new(), None)
     };
     let rom_search_path = path.parent().map(Path::to_path_buf).ok_or_else(|| {
         mame_blocker(
@@ -5317,6 +5321,7 @@ fn mame_launch_request(
         expected_content_identity: None,
         rom_search_path,
         extra_rompaths,
+        default_bios_evidence,
     })
 }
 

@@ -66,6 +66,7 @@ impl Fx {
             )),
             rom_search_path: dir.path().to_path_buf(),
             extra_rompaths: Vec::new(),
+            default_bios_evidence: None,
             selected_content: content,
         };
         (Self { dir, exe }, request)

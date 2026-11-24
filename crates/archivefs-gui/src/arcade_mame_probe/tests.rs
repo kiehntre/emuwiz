@@ -361,6 +361,7 @@ fn invalid_extra_rompath_lines_become_visible_diagnostics() {
         ),
         extra_rompaths: Vec::new(),
         extra_diagnostics: diagnostics,
+        bios_evidence: None,
     };
     assert!(
         blocker_for(&probe)

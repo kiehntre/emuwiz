@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::launch::process_spawn::CapturedFileIdentity;
 use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
 
@@ -60,7 +61,28 @@ pub struct MameMachineFacts {
     /// MAME loads just the selected BIOS version's files, so these being
     /// missing never stops a default start. A file name that also appears
     /// under the default version, or with no `bios` attribute, is never here.
-    pub alternative_bios_files: Vec<String>,
+    pub alternative_bios_files: Vec<AlternativeBiosFile>,
+    /// Devices this machine uses (`<device_ref>`). MAME names the owning
+    /// device in parentheses when a file that device needs is missing.
+    pub device_refs: Vec<String>,
+    /// `cloneof` and `romof` from `-listxml` (MAME reads the parent's ini).
+    pub clone_of: Option<String>,
+    pub rom_of: Option<String>,
+    /// Declared BIOS version names in order, and the one MAME starts when no
+    /// setting chooses (`default="yes"`, else the first).
+    pub bios_versions: Vec<String>,
+    pub default_bios: Option<String>,
+    /// `<display>` (`type`, `rotate`) pairs, for the screen and orientation
+    /// ini files MAME reads.
+    pub displays: Vec<(String, String)>,
+}
+
+/// A ROM file used only by a non-default BIOS version, with its listed size.
+/// A verify line is exempted only when both name and size match.
+#[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct AlternativeBiosFile {
+    pub name: String,
+    pub size: Option<u64>,
 }
 
 fn attr_map(
@@ -84,7 +106,7 @@ pub fn parse_machine_facts(xml: &str, set: &str) -> Result<Option<MameMachineFac
     let mut depth_in_target = 0usize;
     // (name, declared default) in document order; (rom file, bios version or None).
     let mut bios_sets: Vec<(String, bool)> = Vec::new();
-    let mut rom_bios: Vec<(String, Option<String>)> = Vec::new();
+    let mut rom_bios: Vec<(String, Option<String>, Option<u64>)> = Vec::new();
     // Set only on the target's own `</machine>`: a read error or EOF before
     // it (truncated or killed output) leaves the BIOS data unproven.
     let mut target_complete = false;
@@ -115,6 +137,8 @@ pub fn parse_machine_facts(xml: &str, set: &str) -> Result<Option<MameMachineFac
                             // `runnable` defaults to yes.
                             runnable: a.get("runnable").map(String::as_str) != Some("no"),
                             sourcefile: a.get("sourcefile").cloned().unwrap_or_default(),
+                            clone_of: a.get("cloneof").cloned(),
+                            rom_of: a.get("romof").cloned(),
                             ..Default::default()
                         });
                         depth_in_target = 1;
@@ -132,7 +156,13 @@ pub fn parse_machine_facts(xml: &str, set: &str) -> Result<Option<MameMachineFac
                         f.requires_artwork =
                             a.get("requiresartwork").map(String::as_str) == Some("yes");
                     }
-                    "display" => f.has_display = true,
+                    "display" => {
+                        f.has_display = true;
+                        f.displays.push((
+                            a.get("type").cloned().unwrap_or_default(),
+                            a.get("rotate").cloned().unwrap_or_default(),
+                        ));
+                    }
                     "biosset" => {
                         if let Some(name) = a.get("name") {
                             let default = a.get("default").map(String::as_str) == Some("yes");
@@ -141,7 +171,18 @@ pub fn parse_machine_facts(xml: &str, set: &str) -> Result<Option<MameMachineFac
                     }
                     "rom" => {
                         if let Some(name) = a.get("name") {
-                            rom_bios.push((name.clone(), a.get("bios").cloned()));
+                            rom_bios.push((
+                                name.clone(),
+                                a.get("bios").cloned(),
+                                a.get("size").and_then(|n| n.parse::<u64>().ok()),
+                            ));
+                        }
+                    }
+                    "device_ref" => {
+                        if let Some(name) = a.get("name")
+                            && !f.device_refs.contains(name)
+                        {
+                            f.device_refs.push(name.clone());
                         }
                     }
                     "control" => {
@@ -176,6 +217,12 @@ pub fn parse_machine_facts(xml: &str, set: &str) -> Result<Option<MameMachineFac
         && target_complete
     {
         f.alternative_bios_files = alternative_bios_files(&bios_sets, &rom_bios);
+        f.bios_versions = bios_sets.iter().map(|(name, _)| name.clone()).collect();
+        f.default_bios = bios_sets
+            .iter()
+            .find(|(_, is_default)| *is_default)
+            .or_else(|| bios_sets.first())
+            .map(|(name, _)| name.clone());
     }
     Ok(facts)
 }
@@ -190,8 +237,8 @@ pub fn parse_machine_facts(xml: &str, set: &str) -> Result<Option<MameMachineFac
 /// missing were demonstrated to start (Oracle A1-A start check).
 fn alternative_bios_files(
     bios_sets: &[(String, bool)],
-    rom_bios: &[(String, Option<String>)],
-) -> Vec<String> {
+    rom_bios: &[(String, Option<String>, Option<u64>)],
+) -> Vec<AlternativeBiosFile> {
     let default = bios_sets
         .iter()
         .find(|(_, is_default)| *is_default)
@@ -203,21 +250,24 @@ fn alternative_bios_files(
     let declared = |b: &str| bios_sets.iter().any(|(name, _)| name == b);
     if rom_bios
         .iter()
-        .any(|(_, bios)| bios.as_deref().is_some_and(|b| !declared(b)))
+        .any(|(_, bios, _)| bios.as_deref().is_some_and(|b| !declared(b)))
     {
         return Vec::new();
     }
     let needed_by_default = |file: &str| {
         rom_bios
             .iter()
-            .any(|(name, bios)| name == file && bios.as_deref().is_none_or(|b| b == default))
+            .any(|(name, bios, _)| name == file && bios.as_deref().is_none_or(|b| b == default))
     };
-    let mut out: Vec<String> = rom_bios
+    let mut out: Vec<AlternativeBiosFile> = rom_bios
         .iter()
-        .filter(|(name, bios)| {
+        .filter(|(name, bios, _)| {
             bios.as_deref().is_some_and(|b| b != default) && !needed_by_default(name)
         })
-        .map(|(name, _)| name.clone())
+        .map(|(name, _, size)| AlternativeBiosFile {
+            name: name.clone(),
+            size: *size,
+        })
         .collect();
     out.sort();
     out.dedup();
@@ -589,7 +639,12 @@ pub fn evaluate_arcade_set(
                 ),
             );
         }
-        VerifyState::Bad => match bad_verdict(set, verify, &facts.alternative_bios_files) {
+        VerifyState::Bad => match bad_verdict(
+            set,
+            verify,
+            &facts.alternative_bios_files,
+            &facts.device_refs,
+        ) {
             Ok(warning) => wrong_dump_warning = Some(warning),
             Err(blocked) => return blocked,
         },
@@ -638,23 +693,506 @@ pub fn evaluate_arcade_set(
 /// (an experimental qualification); everything else is `Err(blocked)` naming
 /// the bad ROMs. The old "small file" size heuristic is deliberately gone: it
 /// was not proof of playability.
+fn is_alternative_bios_problem(
+    problem: &VerifyProblem,
+    alternative_bios_files: &[AlternativeBiosFile],
+    device_refs: &[String],
+) -> bool {
+    let owned_by_device = matches!(
+        &problem.kind,
+        VerifyProblemKind::NotFound { dependency: Some(dep) } if device_refs.contains(dep)
+    );
+    matches!(problem.kind, VerifyProblemKind::NotFound { .. })
+        && !owned_by_device
+        && !problem.is_disk
+        && problem.size.is_some()
+        && alternative_bios_files
+            .iter()
+            .any(|f| f.name == problem.file && f.size == problem.size)
+}
+
+/// The sets named in parentheses on the exempted lines (the BIOS root, for
+/// example `neogeo`), or `None` when the verdict does not use the exemption.
+fn exemption_providers(facts: &MameMachineFacts, verify: &VerifyReport) -> Option<Vec<String>> {
+    if verify.state != VerifyState::Bad {
+        return None;
+    }
+    let mut used = false;
+    let mut providers = Vec::new();
+    for problem in &verify.problems {
+        if is_alternative_bios_problem(problem, &facts.alternative_bios_files, &facts.device_refs) {
+            used = true;
+            if let VerifyProblemKind::NotFound {
+                dependency: Some(dep),
+            } = &problem.kind
+                && !providers.contains(dep)
+            {
+                providers.push(dep.clone());
+            }
+        }
+    }
+    used.then_some(providers)
+}
+
+/// The `bios` settings MAME's ini files hold, read once and shared by every
+/// set (see [`read_bios_settings`]).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BiosSettings {
+    /// The global value `-showconfig` reports (mame.ini); empty when unset.
+    pub global: String,
+    /// Ini name (`aof`, `source/neogeo`) -> (file, `bios` value). Only the
+    /// first file of each name on the `inipath` counts, as MAME opens only
+    /// that one; a file without a `bios` line is recorded with an empty value
+    /// because it still hides later files of the same name.
+    pub files: std::collections::BTreeMap<String, (PathBuf, String)>,
+    /// What these settings were read from, to see later whether they changed.
+    pub evidence: BiosSettingsEvidence,
+}
+
+/// What the BIOS settings were read from, recorded before they were parsed:
+/// for every ini folder (and its `source/` folder) its identity and the names
+/// of its `.ini` files, and for every `.ini` file its identity and a SHA-256
+/// of its contents. Identity is device, inode, size, modification and
+/// status-change time, of the path itself and of what it resolves to.
+///
+/// Timestamps alone are not enough: the kernel stamps them from a coarse
+/// clock, so a change within the same tick keeps them equal. The name list
+/// sees a file added or removed and the digest sees any edit, including one
+/// of the same size with the modification time put back; identity also sees
+/// an atomic replacement and a retargeted symlink. Checking lists only these
+/// few folders and reads only these small files.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BiosSettingsEvidence {
+    observed: Vec<(PathBuf, Observed)>,
+}
+
+type FileStamp = (CapturedFileIdentity, CapturedFileIdentity);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Observed {
+    Absent,
+    /// Never equal to a later observation: fails closed.
+    Unreadable,
+    Folder(FileStamp, Vec<String>),
+    File(FileStamp, Vec<u8>),
+}
+
+fn stamp_of(path: &Path) -> Option<FileStamp> {
+    let own = CapturedFileIdentity::capture(&std::fs::symlink_metadata(path).ok()?);
+    let resolved = CapturedFileIdentity::capture(&std::fs::metadata(path).ok()?);
+    Some((own, resolved))
+}
+
+fn absent_or_unreadable(path: &Path) -> Observed {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Observed::Absent,
+        _ => Observed::Unreadable,
+    }
+}
+
+/// The `.ini` file names directly in `dir`, sorted.
+fn ini_names(dir: &Path) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for item in std::fs::read_dir(dir).ok()? {
+        let name = item.ok()?.file_name();
+        if let Some(name) = name.to_str()
+            && name.ends_with(".ini")
+        {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    Some(names)
+}
+
+fn observe_folder(dir: &Path) -> Observed {
+    let Some(stamp) = stamp_of(dir) else {
+        return absent_or_unreadable(dir);
+    };
+    match ini_names(dir) {
+        Some(names) => Observed::Folder(stamp, names),
+        None => Observed::Unreadable,
+    }
+}
+
+fn observe_file(path: &Path) -> Observed {
+    use sha2::{Digest, Sha256};
+    if std::fs::metadata(path).is_ok_and(|meta| meta.is_dir()) {
+        return observe_folder(path);
+    }
+    let Some(stamp) = stamp_of(path) else {
+        return absent_or_unreadable(path);
+    };
+    if stamp.1.size > 1 << 20 {
+        return Observed::Unreadable;
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => Observed::File(stamp, Sha256::digest(&bytes).to_vec()),
+        Err(_) => Observed::Unreadable,
+    }
+}
+
+impl BiosSettingsEvidence {
+    /// Whether every recorded folder and file is unchanged (a recorded
+    /// absence must still be absent). Anything unreadable is a change.
+    pub fn is_current(&self) -> bool {
+        self.observed.iter().all(|(path, then)| {
+            let now = match then {
+                Observed::File(..) => observe_file(path),
+                _ => observe_folder(path),
+            };
+            now != Observed::Unreadable && now == *then
+        })
+    }
+}
+
+/// Reads the `bios` settings from MAME's own `-showconfig` output (global
+/// value and `inipath`) and the `.ini` files in each `inipath` folder and its
+/// `source/` folder. Only `bios` lines are read; nothing else is interpreted.
+/// Fails closed (`Err`) when the output lacks `bios` or `inipath`, when an
+/// `inipath` entry depends on the working directory or on a variable other
+/// than `$HOME`, or when a folder or file cannot be read or is implausibly
+/// large.
+fn read_bios_settings(showconfig: &str, home: Option<&Path>) -> Result<BiosSettings, String> {
+    let value = |key: &str| {
+        showconfig.lines().find_map(|line| {
+            let (k, v) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+            (k == key).then(|| v.trim().to_string())
+        })
+    };
+    let (Some(global), Some(inipath)) = (value("bios"), value("inipath")) else {
+        return Err("MAME did not report its settings".into());
+    };
+    let mut settings = BiosSettings {
+        global: ini_value(&global),
+        files: std::collections::BTreeMap::new(),
+        evidence: BiosSettingsEvidence::default(),
+    };
+    let mut checked = 0usize;
+    for entry in inipath
+        .trim_matches('"')
+        .split(';')
+        .filter(|entry| !entry.is_empty())
+    {
+        let folder = match entry.strip_prefix("$HOME") {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => match home {
+                Some(home) => home.join(rest.trim_start_matches('/')),
+                None => return Err("MAME's ini path uses $HOME, which is not set".into()),
+            },
+            _ => PathBuf::from(entry),
+        };
+        if !folder.is_absolute() || folder.to_string_lossy().contains('$') {
+            return Err(format!(
+                "MAME's ini path entry {entry} depends on the working directory or the environment"
+            ));
+        }
+        for (dir, prefix) in [(folder.clone(), ""), (folder.join("source"), "source/")] {
+            settings
+                .evidence
+                .observed
+                .push((dir.clone(), observe_folder(&dir)));
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    return Err(format!(
+                        "MAME's ini folder {} could not be read",
+                        dir.display()
+                    ));
+                }
+            };
+            let mut names = Vec::new();
+            for item in entries {
+                let unreadable = || format!("an ini file in {} could not be read", dir.display());
+                let path = item.map_err(|_| unreadable())?.path();
+                if let Some(stem) = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_suffix(".ini"))
+                {
+                    names.push((stem.to_string(), path));
+                }
+            }
+            names.sort();
+            for (stem, path) in names {
+                // Recorded before parsing: a change in between reads as stale.
+                settings
+                    .evidence
+                    .observed
+                    .push((path.clone(), observe_file(&path)));
+                checked += 1;
+                if checked > 4096 {
+                    return Err("MAME's ini folders hold too many files to check".into());
+                }
+                let key = format!("{prefix}{stem}");
+                if settings.files.contains_key(&key) {
+                    continue;
+                }
+                let meta = std::fs::metadata(&path)
+                    .map_err(|_| format!("{} could not be read", path.display()))?;
+                if meta.is_dir() {
+                    continue;
+                }
+                if meta.len() > 1 << 20 {
+                    return Err(format!("{} is too large to check", path.display()));
+                }
+                let text = std::fs::read(&path)
+                    .map_err(|_| format!("{} could not be read", path.display()))?;
+                let bios = String::from_utf8_lossy(&text)
+                    .lines()
+                    .filter_map(|line| {
+                        let line = line.trim();
+                        let (k, v) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+                        k.eq_ignore_ascii_case("bios").then(|| ini_value(v))
+                    })
+                    .next_back()
+                    .unwrap_or_default();
+                settings.files.insert(key, (path, bios));
+            }
+        }
+    }
+    Ok(settings)
+}
+
+/// The first token of an ini value without quotes (`"us" # note` -> `us`).
+fn ini_value(raw: &str) -> String {
+    raw.split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches('"')
+        .to_string()
+}
+
+/// `Ok(())` when MAME will start `facts.default_bios` for this set, given
+/// `settings`; otherwise why that is not confirmed.
+///
+/// Measured with MAME 0.264 (BIOS chosen with an empty rompath, no ROM read):
+/// the set's own ini, its parent's, its BIOS root's (`neogeo.ini` for `aof`
+/// and for the clone `kof98a`), `source/<driver>.ini`, `horizont.ini`,
+/// `raster.ini` and mame.ini change the version; an unrelated set's ini,
+/// another case of the name, `vertical.ini` for a horizontal set,
+/// `debug.ini`, `arcade.ini` and `console.ini` did not. A name the set does
+/// not declare makes MAME revert to the default; names match in any case, and
+/// a number selects by position.
+///
+/// Files are visited from the highest priority down. A setting that names
+/// another version, or a number, is unconfirmed. A file that certainly
+/// applies ends the walk, because it overrides everything below it. Files
+/// that only may apply (orientation, screen, system type, debug, the BIOS
+/// root) never end it, so a lower setting still counts.
+fn effective_bios_check(
+    facts: &MameMachineFacts,
+    providers: &[String],
+    settings: &BiosSettings,
+) -> Result<(), String> {
+    let Some(default) = facts.default_bios.as_deref() else {
+        return Err("the set declares no default BIOS version".into());
+    };
+    // MAME also reads the grandparent's ini. In 0.264 every BIOS machine has
+    // at most two generations above it, and the grandparent is always the
+    // BIOS root MAME names on the exempted lines. A clone whose lines name
+    // nothing beyond itself and its parent leaves the grandparent unknown.
+    if facts.clone_of.is_some()
+        && providers
+            .iter()
+            .all(|p| *p == facts.name || Some(p) == facts.clone_of.as_ref())
+    {
+        return Err("the grandparent set whose settings MAME also reads is not known".into());
+    }
+    let file = |name: &str| {
+        settings
+            .files
+            .get(name)
+            .map(|(path, bios)| (path.display().to_string(), bios.clone()))
+    };
+    let screens = |want: &[&str]| {
+        facts.displays.is_empty()
+            || facts
+                .displays
+                .iter()
+                .any(|(kind, _)| want.contains(&kind.as_str()))
+    };
+    let rotated = |want_vertical: bool| {
+        facts.displays.is_empty()
+            || facts
+                .displays
+                .iter()
+                .any(|(_, rotate)| (rotate == "90" || rotate == "270") == want_vertical)
+    };
+    let source = Path::new(&facts.sourcefile)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| format!("source/{stem}"));
+    // (where, value, certainly applies), highest priority first.
+    let mut layers: Vec<(String, String, bool)> = Vec::new();
+    let mut add = |name: Option<String>, certain: bool, applies: bool| {
+        if let Some(name) = name
+            && applies
+            && let Some((path, bios)) = file(&name)
+        {
+            layers.push((path, bios, certain));
+        }
+    };
+    add(Some(facts.name.clone()), true, true);
+    add(facts.clone_of.clone(), true, true);
+    let mut roots: Vec<String> = providers.to_vec();
+    if let Some(rom_of) = &facts.rom_of {
+        roots.push(rom_of.clone());
+    }
+    for root in roots {
+        if Some(&root) != facts.clone_of.as_ref() && root != facts.name {
+            add(Some(root), false, true);
+        }
+    }
+    add(source, true, true);
+    for (name, applies) in [
+        ("raster", screens(&["raster"])),
+        ("vector", screens(&["vector"])),
+        ("lcd", screens(&["lcd"])),
+        ("arcade", true),
+        ("console", true),
+        ("computer", true),
+        ("othersys", true),
+        ("horizont", rotated(false)),
+        ("vertical", rotated(true)),
+        ("debug", true),
+    ] {
+        add(Some(name.to_string()), false, applies);
+    }
+    layers.push((
+        "MAME's global settings".into(),
+        settings.global.clone(),
+        true,
+    ));
+    for (place, bios, certain) in layers {
+        if bios.is_empty() {
+            continue;
+        }
+        if bios.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!("{place} selects BIOS version number {bios}"));
+        }
+        if !bios.eq_ignore_ascii_case(default)
+            && facts
+                .bios_versions
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&bios))
+        {
+            return Err(format!("{place} selects BIOS version {bios}"));
+        }
+        if certain {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Withdraws the default-BIOS exemption when the BIOS version MAME will start
+/// for this set is not confirmed to be the default ([`effective_bios_check`]):
+/// the other versions' files then count as required, exactly as without the
+/// exemption. A user's BIOS choice is respected, never overridden, and no
+/// `-bios` is added anywhere. `settings` runs only when a verdict that is not
+/// blocked depends on the exemption.
+fn confirm_effective_bios(
+    set: &str,
+    facts: Option<&MameMachineFacts>,
+    verify: &VerifyReport,
+    artwork_present: bool,
+    verdict: ArcadeMameVerdict,
+    settings: impl FnOnce() -> Result<BiosSettings, String>,
+) -> (ArcadeMameVerdict, Option<BiosSettingsEvidence>) {
+    let Some(facts) = facts else {
+        return (verdict, None);
+    };
+    if verdict.readiness == ArcadeReadiness::Blocked {
+        return (verdict, None);
+    }
+    let Some(providers) = exemption_providers(facts, verify) else {
+        return (verdict, None);
+    };
+    let why = match settings() {
+        Ok(read) => match effective_bios_check(facts, &providers, &read) {
+            // Ready on the strength of these settings: the launch rechecks
+            // that they are unchanged (see `preflight_mame_launch`).
+            Ok(()) => return (verdict, Some(read.evidence)),
+            Err(why) => why,
+        },
+        Err(why) => why,
+    };
+    let strict = MameMachineFacts {
+        alternative_bios_files: Vec::new(),
+        ..facts.clone()
+    };
+    let mut strict_verdict = evaluate_arcade_set(set, Some(&strict), verify, artwork_present);
+    strict_verdict.notes.push(format!(
+        "files for other BIOS versions count as required because MAME may not start the default BIOS version: {why}"
+    ));
+    (strict_verdict, None)
+}
+
+/// One read of MAME's BIOS settings shared by all probes, so a library-wide
+/// check does not rescan the ini folders per set. It is reused only while its
+/// evidence is unchanged (stat only), so a changed setting is never served.
+type BiosSettingsCache = Option<(PathBuf, Option<std::ffi::OsString>, BiosSettings)>;
+static BIOS_SETTINGS_CACHE: std::sync::Mutex<BiosSettingsCache> = std::sync::Mutex::new(None);
+
+fn mame_bios_settings(
+    executable: &Path,
+    timeout: Duration,
+    cancel: &AtomicBool,
+    trace: &mut ProbeTrace,
+) -> Result<BiosSettings, String> {
+    let home = std::env::var_os("HOME");
+    if let Ok(cache) = BIOS_SETTINGS_CACHE.lock()
+        && let Some((exe, cached_home, settings)) = cache.as_ref()
+        && exe == executable
+        && *cached_home == home
+        && settings.evidence.is_current()
+    {
+        return Ok(settings.clone());
+    }
+    // Read with the launch's own settings: no -noreadconfig here.
+    let args = [
+        OsString::from("-nowriteconfig"),
+        OsString::from("-showconfig"),
+    ];
+    let output = match trace
+        .showconfig_run
+        .insert(run_bounded(executable, &args, timeout, cancel))
+    {
+        Ok(output) => output.text.clone(),
+        Err(_) => return Err("MAME's settings could not be read (timed out or cancelled)".into()),
+    };
+    let settings = read_bios_settings(&output, home.as_deref().map(Path::new))?;
+    if let Ok(mut cache) = BIOS_SETTINGS_CACHE.lock() {
+        *cache = Some((executable.to_path_buf(), home, settings.clone()));
+    }
+    Ok(settings)
+}
+
 fn bad_verdict(
     set: &str,
     verify: &VerifyReport,
-    alternative_bios_files: &[String],
+    alternative_bios_files: &[AlternativeBiosFile],
+    device_refs: &[String],
 ) -> Result<String, ArcadeMameVerdict> {
     let mut deps: Vec<String> = Vec::new();
     let mut own_missing: Vec<String> = Vec::new();
     let mut wrong: Vec<String> = Vec::new();
     let mut wrong_files: Vec<&str> = Vec::new();
     let mut optional_bios_missing: Vec<&str> = Vec::new();
+    // A problem this function does not classify (an unrecognised status, or
+    // anything other than MAME's own "no good dump known") must never be
+    // outweighed by the BIOS exemption.
+    let mut unexplained = false;
     for problem in &verify.problems {
         // A missing file that only another BIOS version uses does not stop
         // MAME starting with its default BIOS (demonstrated: aof, kof98,
         // pc_mman3, cbtime start with these reported NOT FOUND).
-        if matches!(problem.kind, VerifyProblemKind::NotFound { .. })
-            && alternative_bios_files.iter().any(|f| *f == problem.file)
-        {
+        // Name AND listed size must match, and never for a disk image: a
+        // device ROM or CHD that merely shares a name is not exempted. A line
+        // MAME attributes to one of this machine's devices belongs to that
+        // device, even when its name and size coincide.
+        if is_alternative_bios_problem(problem, alternative_bios_files, device_refs) {
             optional_bios_missing.push(problem.file.as_str());
             continue;
         }
@@ -681,7 +1219,8 @@ fn bad_verdict(
                 wrong.push(format!("{label} has {what}"));
                 wrong_files.push(problem.file.as_str());
             }
-            _ => {}
+            VerifyProblemKind::NotFoundNoGoodDump => {}
+            VerifyProblemKind::Other(_) => unexplained = true,
         }
     }
     // Every kind of problem is named; none hides another.
@@ -701,7 +1240,7 @@ fn bad_verdict(
             list(&wrong)
         ));
     }
-    if parts.is_empty() && !optional_bios_missing.is_empty() {
+    if parts.is_empty() && !unexplained && !optional_bios_missing.is_empty() {
         return Ok(format!(
             "{set}: only files for other BIOS versions are missing ({}); MAME starts with its default BIOS",
             list(
@@ -922,6 +1461,10 @@ pub struct ArcadeProbe {
     pub facts: Option<MameMachineFacts>,
     pub verify: VerifyReport,
     pub verdict: ArcadeMameVerdict,
+    /// Present when the verdict is not blocked only because of the
+    /// default-BIOS exemption: the BIOS settings it relied on. A launch must
+    /// confirm [`BiosSettingsEvidence::is_current`] first.
+    pub bios_evidence: Option<BiosSettingsEvidence>,
 }
 
 fn read_bounded(reader: impl Read) -> Vec<u8> {
@@ -1037,6 +1580,7 @@ fn run_bounded(
 struct ProbeTrace {
     verify_run: Option<Result<RunOutput, RunFailure>>,
     listxml_run: Option<Result<RunOutput, RunFailure>>,
+    showconfig_run: Option<Result<RunOutput, RunFailure>>,
 }
 
 /// A set name becomes one argv component and a folder name.
@@ -1049,6 +1593,9 @@ pub fn is_probe_safe_set_name(name: &str) -> bool {
 /// Asks the installed MAME about one set. Read-only: both commands are
 /// metadata queries run with `-noreadconfig -nowriteconfig`; the set folder's
 /// parent (and any validated extra paths) are the only ROM search paths.
+/// When readiness depends on the default-BIOS exemption, MAME's settings are
+/// read too (`-nowriteconfig -showconfig`, without `-noreadconfig`, plus the
+/// `bios` lines of its ini files; see [`confirm_effective_bios`]).
 pub fn probe_arcade_set(
     executable: &Path,
     set: &str,
@@ -1078,6 +1625,7 @@ fn probe_arcade_set_traced(
             problems: Vec::new(),
         },
         verdict: block(ArcadeBlockReason::CheckFailed, detail.to_string()),
+        bios_evidence: None,
     };
     if !is_probe_safe_set_name(set) {
         return (
@@ -1136,11 +1684,16 @@ fn probe_arcade_set_traced(
     let facts = parse_machine_facts(&xml_output.text, set).unwrap_or(None);
     let artwork = artwork_located(set, set_dir, executable);
     let verdict = evaluate_arcade_set(set, facts.as_ref(), &verify, artwork);
+    let (verdict, bios_evidence) =
+        confirm_effective_bios(set, facts.as_ref(), &verify, artwork, verdict, || {
+            mame_bios_settings(executable, timeout, cancel, &mut trace)
+        });
     (
         ArcadeProbe {
             facts,
             verify,
             verdict,
+            bios_evidence,
         },
         trace,
     )

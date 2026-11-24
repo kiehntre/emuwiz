@@ -318,6 +318,7 @@ pub(super) fn request(
         expected_content_identity,
         rom_search_path: report.inputs.root.clone(),
         extra_rompaths: Vec::new(),
+        default_bios_evidence: None,
     };
     preflight_mame_launch(&request).map_err(|e| {
         e.blockers
