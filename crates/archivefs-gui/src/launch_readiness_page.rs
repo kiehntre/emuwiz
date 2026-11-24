@@ -5384,10 +5384,16 @@ pub(crate) fn apply_mame_strict_preflight(plan: &mut LaunchPlan) {
             continue;
         }
         let blockers = match mame_launch_request(plan, &snapshot) {
-            Ok(request) => preflight_mame_launch(&request)
-                .err()
-                .map(|error| error.blockers)
-                .unwrap_or_default(),
+            // Readiness is rebuilt on every frame, so the BIOS-settings
+            // evidence is not re-read here: the probe cache revalidates it
+            // every REVALIDATE_EVERY and the launch itself checks it.
+            Ok(mut request) => {
+                request.default_bios_evidence = None;
+                preflight_mame_launch(&request)
+                    .err()
+                    .map(|error| error.blockers)
+                    .unwrap_or_default()
+            }
             Err(blocker) => vec![blocker],
         };
         if !blockers.is_empty() {

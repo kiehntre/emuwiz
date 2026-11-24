@@ -745,6 +745,10 @@ pub struct BiosSettings {
     /// that one; a file without a `bios` line is recorded with an empty value
     /// because it still hides later files of the same name.
     pub files: std::collections::BTreeMap<String, (PathBuf, String)>,
+    /// Ini names (as in `files`) whose file sets `readconfig` to anything but
+    /// `1`: MAME then reads no later ini file, so the layers above it are
+    /// unknown (measured with 0.264).
+    pub readconfig_off: std::collections::BTreeSet<String>,
     /// What these settings were read from, to see later whether they changed.
     pub evidence: BiosSettingsEvidence,
 }
@@ -863,9 +867,13 @@ fn read_bios_settings(showconfig: &str, home: Option<&Path>) -> Result<BiosSetti
     let (Some(global), Some(inipath)) = (value("bios"), value("inipath")) else {
         return Err("MAME did not report its settings".into());
     };
+    if value("readconfig").map(|v| ini_value(&v)).as_deref() != Some("1") {
+        return Err("MAME's global settings turn off reading per-set settings (readconfig)".into());
+    }
     let mut settings = BiosSettings {
         global: ini_value(&global),
         files: std::collections::BTreeMap::new(),
+        readconfig_off: std::collections::BTreeSet::new(),
         evidence: BiosSettingsEvidence::default(),
     };
     let mut checked = 0usize;
@@ -938,15 +946,22 @@ fn read_bios_settings(showconfig: &str, home: Option<&Path>) -> Result<BiosSetti
                 }
                 let text = std::fs::read(&path)
                     .map_err(|_| format!("{} could not be read", path.display()))?;
-                let bios = String::from_utf8_lossy(&text)
-                    .lines()
-                    .filter_map(|line| {
-                        let line = line.trim();
-                        let (k, v) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-                        k.eq_ignore_ascii_case("bios").then(|| ini_value(v))
-                    })
-                    .next_back()
-                    .unwrap_or_default();
+                let text = String::from_utf8_lossy(&text);
+                // Option names are matched exactly, as MAME does (`BIOS us`
+                // is ignored by MAME 0.264); the last line wins.
+                let last = |option: &str| {
+                    text.lines()
+                        .filter_map(|line| {
+                            let line = line.trim();
+                            let (k, v) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+                            (k == option).then(|| ini_value(v))
+                        })
+                        .next_back()
+                };
+                if last("readconfig").is_some_and(|v| v != "1") {
+                    settings.readconfig_off.insert(key.clone());
+                }
+                let bios = last("bios").unwrap_or_default();
                 settings.files.insert(key, (path, bios));
             }
         }
@@ -955,11 +970,22 @@ fn read_bios_settings(showconfig: &str, home: Option<&Path>) -> Result<BiosSetti
 }
 
 /// The first token of an ini value without quotes (`"us" # note` -> `us`).
+/// The value of an ini line: a quoted value up to its closing quote, else
+/// the text before an unquoted `#` (MAME 0.264 reads `bios us#x` as `us`),
+/// first word only. A word MAME would read differently can only be a name
+/// this check treats as another version or as undeclared; never the reverse
+/// for a declared name.
 fn ini_value(raw: &str) -> String {
-    raw.split_whitespace()
+    let raw = raw.trim();
+    if let Some(quoted) = raw.strip_prefix('"') {
+        return quoted.split('"').next().unwrap_or("").trim().to_string();
+    }
+    raw.split('#')
         .next()
         .unwrap_or("")
-        .trim_matches('"')
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
         .to_string()
 }
 
@@ -990,16 +1016,21 @@ fn effective_bios_check(
     };
     // MAME also reads the grandparent's ini. In 0.264 every BIOS machine has
     // at most two generations above it, and the grandparent is always the
-    // BIOS root MAME names on the exempted lines. A clone whose lines name
-    // nothing beyond itself and its parent leaves the grandparent unknown.
-    if facts.clone_of.is_some()
+    // BIOS root MAME names on the exempted lines. A set with a parent or
+    // `romof` whose lines name nothing beyond itself and its parent leaves
+    // the grandparent unknown.
+    if (facts.clone_of.is_some() || facts.rom_of.is_some())
         && providers
             .iter()
             .all(|p| *p == facts.name || Some(p) == facts.clone_of.as_ref())
     {
         return Err("the grandparent set whose settings MAME also reads is not known".into());
     }
-    let file = |name: &str| {
+    let mut stops_reading: Option<String> = None;
+    let mut file = |name: &str| {
+        if settings.readconfig_off.contains(name) && stops_reading.is_none() {
+            stops_reading = Some(name.to_string());
+        }
         settings
             .files
             .get(name)
@@ -1058,6 +1089,11 @@ fn effective_bios_check(
         ("debug", true),
     ] {
         add(Some(name.to_string()), false, applies);
+    }
+    if let Some(name) = stops_reading {
+        return Err(format!(
+            "{name}.ini turns off reading later settings (readconfig), so which BIOS version applies is not known"
+        ));
     }
     layers.push((
         "MAME's global settings".into(),
@@ -1131,7 +1167,8 @@ fn confirm_effective_bios(
 
 /// One read of MAME's BIOS settings shared by all probes, so a library-wide
 /// check does not rescan the ini folders per set. It is reused only while its
-/// evidence is unchanged (stat only), so a changed setting is never served.
+/// evidence is unchanged (re-listed and re-hashed), so a changed setting is
+/// never served.
 type BiosSettingsCache = Option<(PathBuf, Option<std::ffi::OsString>, BiosSettings)>;
 static BIOS_SETTINGS_CACHE: std::sync::Mutex<BiosSettingsCache> = std::sync::Mutex::new(None);
 

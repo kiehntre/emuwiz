@@ -949,6 +949,7 @@ fn settings(global: &str, files: &[(&str, &str)]) -> BiosSettings {
                 )
             })
             .collect(),
+        readconfig_off: Default::default(),
         evidence: BiosSettingsEvidence::default(),
     }
 }
@@ -1023,7 +1024,7 @@ fn bios_settings_are_read_once_from_the_first_file_of_each_name() {
     std::fs::write(mame.join("mame.ini"), "rompath /x\n#bios us\n").unwrap();
     std::fs::write(mame.join("aof.ini"), "bios \"us\" # note\n").unwrap();
     std::fs::write(mame.join("sf2.ini"), "skip_warnings 1\n").unwrap();
-    std::fs::write(mame.join("source").join("neogeo.ini"), "BIOS   euro\n").unwrap();
+    std::fs::write(mame.join("source").join("neogeo.ini"), "bios   euro\n").unwrap();
     std::fs::write(mame.join("notes.txt"), "bios us\n").unwrap();
     // Hidden behind ~/.mame/sf2.ini, which MAME opens first.
     std::fs::write(other.join("sf2.ini"), "bios us\n").unwrap();
@@ -1157,12 +1158,12 @@ fn a_clone_whose_grandparent_is_unknown_is_not_confirmed() {
 }
 
 #[test]
-fn changed_bios_settings_are_seen_without_reading_any_file_again() {
+fn changed_bios_settings_are_seen_by_the_recorded_evidence() {
     let home = tempfile::tempdir().unwrap();
     let mame = home.path().join(".mame");
     std::fs::create_dir_all(&mame).unwrap();
     std::fs::write(mame.join("mame.ini"), "rompath /x\n").unwrap();
-    let out = "inipath $HOME/.mame\nbios \n";
+    let out = "readconfig 1\ninipath $HOME/.mame\nbios \n";
     let read = || read_bios_settings(out, Some(home.path())).unwrap().evidence;
     let evidence = read();
     assert!(evidence.is_current());
@@ -1208,4 +1209,77 @@ fn changed_bios_settings_are_seen_without_reading_any_file_again() {
     std::fs::remove_file(mame.join("aof.ini")).unwrap();
     std::os::unix::fs::symlink(&b, mame.join("aof.ini")).unwrap();
     assert!(!evidence.is_current());
+}
+
+#[test]
+fn ini_values_are_read_as_mame_0_264_reads_them() {
+    // Measured: `bios us#x` and `bios us #x` select us; quotes are allowed.
+    assert_eq!(ini_value("us#x"), "us");
+    assert_eq!(ini_value("  us   # note"), "us");
+    assert_eq!(ini_value("\"us\" # note"), "us");
+    assert_eq!(ini_value("\"\""), "");
+    assert_eq!(ini_value(""), "");
+    let home = tempfile::tempdir().unwrap();
+    let mame = home.path().join(".mame");
+    std::fs::create_dir_all(&mame).unwrap();
+    // Measured: option names match exactly (`BIOS us` is ignored), the last
+    // `bios` line wins, and a bare `bios` line resets to the default.
+    std::fs::write(mame.join("aof.ini"), "bios us#x\n").unwrap();
+    std::fs::write(mame.join("kof98.ini"), "bios us\nBIOS euro\n").unwrap();
+    std::fs::write(mame.join("sf2.ini"), "BIOS us\n").unwrap();
+    std::fs::write(mame.join("pacman.ini"), "bios us\nbios\n").unwrap();
+    let out = "readconfig 1\ninipath $HOME/.mame\nbios \n";
+    let s = read_bios_settings(out, Some(home.path())).unwrap();
+    let bios = |name: &str| s.files.get(name).map(|(_, b)| b.as_str());
+    assert_eq!(bios("aof"), Some("us"));
+    assert_eq!(bios("kof98"), Some("us"));
+    assert_eq!(bios("sf2"), Some(""));
+    assert_eq!(bios("pacman"), Some(""));
+    let aof = bios_set("aof", r#"romof="neogeo""#);
+    let neo = ["neogeo".to_string()];
+    assert!(effective_bios_check(&aof, &neo, &s).is_err());
+}
+
+#[test]
+fn readconfig_off_makes_the_layers_above_it_unknown() {
+    let home = tempfile::tempdir().unwrap();
+    let mame = home.path().join(".mame");
+    std::fs::create_dir_all(&mame).unwrap();
+    // Measured: with `readconfig 0` in neogeo.ini (or mame.ini), MAME never
+    // reads aof.ini, so aof.ini's `bios euro` does not decide anything.
+    std::fs::write(mame.join("neogeo.ini"), "readconfig 0\nbios us\n").unwrap();
+    std::fs::write(mame.join("aof.ini"), "bios euro\n").unwrap();
+    std::fs::write(mame.join("sf2.ini"), "readconfig 0\n").unwrap();
+    let out = "readconfig 1\ninipath $HOME/.mame\nbios \n";
+    let s = read_bios_settings(out, Some(home.path())).unwrap();
+    assert!(s.readconfig_off.contains("neogeo"));
+    let aof = bios_set("aof", r#"romof="neogeo""#);
+    let neo = ["neogeo".to_string()];
+    let why = effective_bios_check(&aof, &neo, &s).unwrap_err();
+    assert!(why.contains("readconfig"), "{why}");
+    // Another set's `readconfig 0` does not reach aof.
+    std::fs::remove_file(mame.join("neogeo.ini")).unwrap();
+    let s = read_bios_settings(out, Some(home.path())).unwrap();
+    assert_eq!(effective_bios_check(&aof, &neo, &s), Ok(()));
+    // Global readconfig off, or not reported: nothing is confirmed.
+    for text in [
+        "readconfig 0\ninipath $HOME/.mame\nbios \n",
+        "inipath $HOME/.mame\nbios \n",
+    ] {
+        assert!(
+            read_bios_settings(text, Some(home.path())).is_err(),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn a_set_with_a_bios_parent_but_no_named_root_is_not_confirmed() {
+    let aof = bios_set("aof", r#"romof="neogeo""#);
+    for providers in [vec![], vec!["aof".to_string()]] {
+        assert!(
+            effective_bios_check(&aof, &providers, &settings("", &[])).is_err(),
+            "{providers:?}"
+        );
+    }
 }

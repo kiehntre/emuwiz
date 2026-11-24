@@ -259,8 +259,9 @@ fn lookup_inner(
                 return Some(Lookup::Done(entry.probe.clone()));
             }
             let now = fingerprint(set_dir, extras, &entry.probe_deps());
-            // Throttled to REVALIDATE_EVERY; stats only the recorded ini
-            // paths, and only for a verdict that relied on them.
+            // Throttled to REVALIDATE_EVERY; re-lists and re-hashes only the
+            // recorded ini folders and files, and only for a verdict that
+            // relied on them.
             let bios_current = entry
                 .probe
                 .bios_evidence
