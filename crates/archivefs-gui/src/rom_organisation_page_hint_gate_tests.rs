@@ -45,6 +45,7 @@ fn entry(source: &str, name: &str, mode: OrganisationMode) -> OrganisationPlanEn
         original_metadata: Default::default(),
         status: OrganisationStatus::Suggested,
         reason: None,
+        deferred_capture: None,
     }
 }
 

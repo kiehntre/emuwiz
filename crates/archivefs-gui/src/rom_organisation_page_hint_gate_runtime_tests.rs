@@ -324,6 +324,10 @@ fn child_both_apply_paths_refuse_a_stale_romm_row() {
     let mut state =
         RomOrganisationPageState::default().with_deferred_source_roots(vec![games.clone()]);
     state.configure_for_test(games.clone(), journal.clone());
+    // Standard Bulk Rename previews an explicit scope: here the whole folder.
+    state.set_scope(Some(super::scope::OrganisationScope::Folders(vec![
+        games.clone(),
+    ])));
     state.generate_plan();
     assert!(state.error.is_none(), "{:?}", state.error);
     let plan = state.plan.as_ref().expect("a preview");
@@ -370,8 +374,17 @@ fn child_both_apply_paths_refuse_a_stale_romm_row() {
         }
     }
     state.approved.insert(key(&hint));
-    // A preview built before the rule bound every Suggested row to the
-    // library catalogue; bind this one the same way (production call).
+    // A preview built before the rule (and before evidence-first previews)
+    // held a full-content proof for every row and bound every Suggested row
+    // to the library catalogue; rebuild that form, then bind it the same way
+    // (production call).
+    for entry in &mut state.plan.as_mut().unwrap().entries {
+        entry.deferred_capture = None;
+        entry.source_identity = Some(
+            archivefs_core::dat::rename_apply::identity::capture_identity(&entry.source_path)
+                .unwrap(),
+        );
+    }
     {
         let database = Database::open_read_only(default_database_path().unwrap()).unwrap();
         archivefs_core::dat::rom_organisation::prepare_organisation_catalogue(

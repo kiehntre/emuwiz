@@ -130,7 +130,25 @@ pub(crate) struct RomOrganisationPageState {
     /// Where each previewed file's proposed name came from, and why another
     /// source was not used. Display only: Apply re-derives every name.
     name_choices: std::collections::BTreeMap<PathBuf, NameChoice>,
+    /// Standard Bulk Rename: what the preview covers. `None`: nothing chosen
+    /// yet, so Preview is off. Session-only; never written to configuration.
+    scope: Option<scope::OrganisationScope>,
+    /// The "What to include" choices being edited on the page.
+    pub(crate) scope_picker: scope::ScopePicker,
+    /// Platform scope: Library games whose file is missing (never renamed).
+    not_on_disk: Vec<PathBuf>,
+    /// Files or folders skipped because they are on another filesystem.
+    other_filesystems: Vec<PathBuf>,
+    /// What the saved checks say about each previewed file (display only).
+    saved_checks: std::collections::HashMap<PathBuf, scope::SavedCheck>,
+    /// The result page shown ([`PLAN_PAGE_ROWS`] rows each).
+    plan_page: usize,
+    /// D2: the person ticked "also apply the changes the filter hides".
+    include_hidden_rows: bool,
 }
+
+/// Result rows drawn per page. The rest of a large preview is never laid out.
+pub(crate) const PLAN_PAGE_ROWS: usize = 200;
 
 /// Batches larger than this require typing the exact confirmation phrase
 /// before any mutation happens (the same philosophy as DAT rename apply).
@@ -266,6 +284,13 @@ impl RomOrganisationPageState {
             showing_playing_library: false,
             playing_library: crate::playing_library_page::PlayingLibraryPageState::load(),
             name_choices: Default::default(),
+            scope: None,
+            scope_picker: Default::default(),
+            not_on_disk: Vec::new(),
+            other_filesystems: Vec::new(),
+            saved_checks: Default::default(),
+            plan_page: 0,
+            include_hidden_rows: false,
         }
     }
 }
@@ -289,8 +314,12 @@ impl RomOrganisationPageState {
     }
     pub(crate) fn input_fingerprint(&self) -> String {
         format!(
-            "{:?}|{}|{}|{}|{}|{}|{}|{}",
+            "{:?}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.mode,
+            self.scope
+                .as_ref()
+                .map(scope::OrganisationScope::fingerprint)
+                .unwrap_or_default(),
             self.master_root_draft,
             self.library_root_draft,
             self.sources.len(),
@@ -450,6 +479,43 @@ impl RomOrganisationPageState {
             }
         }
         state
+    }
+
+    /// Chooses what a Standard Bulk Rename preview covers. The previous plan
+    /// and its approvals are discarded (a plan never outlives the scope it was
+    /// built for); the configured source folders are not touched.
+    pub(crate) fn set_scope(&mut self, scope: Option<scope::OrganisationScope>) {
+        if self.scope == scope {
+            return;
+        }
+        self.scope = scope;
+        self.sources.clear();
+        self.source_scan_incomplete.clear();
+        self.not_on_disk.clear();
+        self.other_filesystems.clear();
+        self.saved_checks.clear();
+        self.sources_scanned = false;
+        self.plan = None;
+        self.plan_page = 0;
+        self.include_hidden_rows = false;
+        self.pending_apply = None;
+        self.approved.clear();
+        self.persist_approved_set();
+    }
+
+    /// The configured source folders (read from configuration, never changed here).
+    pub(crate) fn source_roots(&self) -> &[PathBuf] {
+        &self.source_roots
+    }
+
+    pub(crate) fn scope(&self) -> Option<&scope::OrganisationScope> {
+        self.scope.as_ref()
+    }
+
+    /// Standard Bulk Rename uses an explicit scope and saved evidence; the
+    /// other modes keep the configured-source walk.
+    pub(crate) fn uses_scope(&self) -> bool {
+        self.mode == OrganisationMode::RenameInPlace
     }
 
     pub(crate) fn set_mode(&mut self, mode: OrganisationMode) {
@@ -619,6 +685,9 @@ impl RomOrganisationPageState {
             return false;
         }
         self.plan_generation += 1;
+        if self.uses_scope() {
+            return self.generate_scoped_rename_plan(cancel, progress);
+        }
         if !self.sources_scanned {
             progress.phase("Finding your game files", "folders", None);
             progress.flush();
@@ -694,7 +763,7 @@ impl RomOrganisationPageState {
         }
         // No RomM mapping is consulted: generic destinations derive from the
         // neutral EmuWiz platform layout identity.
-        let Some(mut plan) = build_organisation_plan_reporting(
+        let Some(plan) = build_organisation_plan_reporting(
             &OrganisationPlanRequest {
                 master_root: &master_root,
                 mode: self.mode,
@@ -710,6 +779,98 @@ impl RomOrganisationPageState {
         ) else {
             return false;
         };
+        self.finish_plan(plan, name_choices, cancel, progress)
+    }
+
+    /// Standard Bulk Rename preview: the chosen scope only, from saved
+    /// catalogue evidence, reading no file. Then exactly the same guards as
+    /// every other preview ([`Self::finish_plan`]).
+    fn generate_scoped_rename_plan(
+        &mut self,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        progress: &mut archivefs_core::job_progress::ProgressReporter<'_>,
+    ) -> bool {
+        let Some(chosen) = self.scope.clone() else {
+            self.error = Some("Choose what to include first. Nothing was read or changed.".into());
+            self.plan = None;
+            return true;
+        };
+        let Some(master_root) = self.effective_root() else {
+            self.error = Some("configure a master ROM root first".to_string());
+            self.plan = None;
+            return true;
+        };
+        // Always listed again: a preview describes the files as they are now.
+        let Some(found) = scope::enumerate_scope(&chosen, &self.source_roots, cancel, progress)
+        else {
+            return false;
+        };
+        let database = match default_database_path().and_then(Database::open_read_only) {
+            Ok(database) => database,
+            Err(_) => {
+                self.error = Some("could not read the platform identity database".to_string());
+                self.plan = None;
+                return true;
+            }
+        };
+        let romm = RommTitles::new(load_romm_cache().as_ref());
+        let evidence = match scope::evidence_candidates(
+            &database,
+            &found.files,
+            self.mode,
+            self.plan_generation,
+            &romm,
+            cancel,
+            progress,
+        ) {
+            None => return false,
+            Some(Err(reason)) => {
+                self.error = Some(reason);
+                self.plan = None;
+                return true;
+            }
+            Some(Ok(evidence)) => evidence,
+        };
+        let Some(plan) = build_rename_plan_from_evidence(
+            &OrganisationPlanRequest {
+                master_root: &master_root,
+                mode: self.mode,
+                content_policy:
+                    archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
+                candidates: &evidence.candidates,
+                generation: self.plan_generation,
+                unknown_folder: None,
+                link_target_roots: None,
+            },
+            &evidence.raw_sha1,
+            cancel,
+            progress,
+        ) else {
+            return false;
+        };
+        let mut plan = plan;
+        scope::explain_unverified_names(&mut plan, &evidence.choices);
+        self.sources = found.files.into_iter().map(|file| file.path).collect();
+        self.source_scan_incomplete = found.incomplete;
+        self.not_on_disk = found.not_on_disk;
+        self.other_filesystems = found.other_filesystems;
+        self.unavailable_source_roots.clear();
+        self.sources_scanned = true;
+        self.saved_checks = evidence.checks;
+        self.plan_page = 0;
+        self.include_hidden_rows = false;
+        self.finish_plan(plan, evidence.choices, cancel, progress)
+    }
+
+    /// The guards every preview passes through, then the plan is kept.
+    fn finish_plan(
+        &mut self,
+        mut plan: OrganisationPlan,
+        name_choices: std::collections::BTreeMap<PathBuf, NameChoice>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        progress: &mut archivefs_core::job_progress::ProgressReporter<'_>,
+    ) -> bool {
+        let stop = || cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
         // A bulk rename or move refuses what the one-game Rename refuses
         // (arcade sets, files a cue sheet or playlist names, games with
         // RetroArch saves): those rows become Blocked with the reason.
@@ -772,6 +933,36 @@ impl RomOrganisationPageState {
 
     /// Toggles one row. A disc-set file moves only with its whole set, so
     /// its row selects or clears every Suggested file of that set.
+    /// D2: approved changes the current filter does not show.
+    pub(crate) fn hidden_approved(&self) -> usize {
+        let Some(plan) = &self.plan else { return 0 };
+        plan.suggested()
+            .filter(|entry| {
+                self.approved
+                    .contains(entry.source_path.to_string_lossy().as_ref())
+                    && !self.filter.is_none_or(|f| entry.status == f)
+            })
+            .count()
+    }
+
+    /// D2: keeps only the approved changes the filter shows.
+    pub(crate) fn drop_hidden_approvals(&mut self) {
+        let Some(plan) = &self.plan else { return };
+        let hidden: Vec<String> = plan
+            .suggested()
+            .filter(|entry| !self.filter.is_none_or(|f| entry.status == f))
+            .map(|entry| entry.source_path.to_string_lossy().into_owned())
+            .collect();
+        for path in hidden {
+            self.approved.remove(&path);
+        }
+        self.include_hidden_rows = false;
+        if self.pending_apply.is_some() {
+            self.pending_apply = Some(self.approved.len());
+        }
+        self.persist_approved_set();
+    }
+
     pub(crate) fn toggle_approved(&mut self, source: &str) {
         let select = !self.approved.contains(source);
         let set: Vec<String> = self
@@ -826,9 +1017,24 @@ impl RomOrganisationPageState {
             return;
         }
         if let Some(reason) = self.source_scan_incomplete.first() {
-            self.error = Some(format!(
-                "The source scan was incomplete ({reason}), so this plan may not cover every game. Nothing was changed. Narrow the source folders or rescan, then preview again."
-            ));
+            self.error = Some(match &self.scope {
+                Some(scope) if self.uses_scope() => format!(
+                    "Not every file in {} could be checked ({reason}), so this plan may not cover them all. Nothing was changed. Preview again.",
+                    scope.label()
+                ),
+                _ => format!(
+                    "The source scan was incomplete ({reason}), so this plan may not cover every game. Nothing was changed. Narrow the source folders or rescan, then preview again."
+                ),
+            });
+            return;
+        }
+        if self.hidden_approved() > 0 && !self.include_hidden_rows {
+            self.error = Some("Some approved changes are hidden by the filter and were not confirmed. Nothing was changed. Review them, then confirm again.".into());
+            return;
+        }
+        if self.uses_scope() && self.scope.is_none() {
+            self.error =
+                Some("There is no chosen scope for this plan. Nothing was changed.".into());
             return;
         }
         if self.advanced_r2_selected {
@@ -885,14 +1091,40 @@ impl RomOrganisationPageState {
             return;
         }
         let approved = self.approved.clone();
-        let mut transaction = match build_organisation_transaction(plan, &approved, plan.generation)
+        // Apply reads each approved file (to check it against its catalogue
+        // check and journal it): at idle disk priority, and for a large batch
+        // at a capped rate, so other users of the disk (Plex) keep theirs.
+        let _idle = scope::IdleDiskPriority::enter();
+        let read_limit = (approved.len() > scope::THROTTLE_ABOVE_FILES)
+            .then_some(scope::THROTTLED_READ_BYTES_PER_SECOND);
+        let _limit = archivefs_core::dat::rename_apply::identity::ReadLimit::enter(read_limit);
+        let mut transaction =
+            match archivefs_core::dat::rom_organisation::build_organisation_transaction_cancellable(
+                plan,
+                &approved,
+                plan.generation,
+                cancel,
+            ) {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    self.stopped = error == archivefs_core::dat::rom_organisation::BUILD_CANCELLED;
+                    self.error = Some(error);
+                    return;
+                }
+            };
+        // An evidence-first preview left catalogue binding to now: bound
+        // from the content just read (and checked against the catalogue).
+        if plan
+            .suggested()
+            .any(|entry| entry.deferred_capture.is_some())
+            && let Err(error) = archivefs_core::dat::rom_organisation::bind_organisation_transaction(
+                &mut transaction,
+                &database,
+            )
         {
-            Ok(transaction) => transaction,
-            Err(error) => {
-                self.error = Some(error);
-                return;
-            }
-        };
+            self.error = Some(error);
+            return;
+        }
         let journal = self.applied_journal.clone();
         std::fs::create_dir_all(&journal).ok();
         let mut trusted_roots = vec![master_root.clone()];
@@ -1492,6 +1724,22 @@ fn unavailable_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Cover art, manuals, metadata and preservation-only recordings (RZX): never
+/// organisation candidates.
+pub(crate) fn is_supporting_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|extension| {
+            is_known_non_game_extension(&extension)
+                // Preservation-only recordings (RZX) are never
+                // organised or published as games; the Organise
+                // page states how many it leaves out.
+                || archivefs_core::media_registry::kind_for_extension(&extension)
+                    .is_some_and(archivefs_core::ArchiveKind::is_preservation_only)
+        })
+}
+
 pub(crate) struct SourceFileScan {
     pub files: Vec<PathBuf>,
     pub incomplete: Vec<String>,
@@ -1543,19 +1791,7 @@ pub(crate) fn collect_source_files_reported(
                 // operation being approved against it. Reuse discovery's
                 // conservative shared classification rather than guessing
                 // from directory names such as `boxart`.
-                if path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .map(str::to_ascii_lowercase)
-                    .is_some_and(|extension| {
-                        is_known_non_game_extension(&extension)
-                            // Preservation-only recordings (RZX) are never
-                            // organised or published as games; the Organise
-                            // page states how many it leaves out.
-                            || archivefs_core::media_registry::kind_for_extension(&extension)
-                                .is_some_and(archivefs_core::ArchiveKind::is_preservation_only)
-                    })
-                {
+                if is_supporting_file(&path) {
                     continue;
                 }
                 let file_type = metadata.file_type();
@@ -2625,16 +2861,18 @@ fn show_rom_organisation_page_with_options(
     widgets::card(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Games ready to organise").strong());
-            if widgets::action_button(
-                ui,
-                "Rescan sources",
-                widgets::ActionStyle::Secondary,
-                !async_busy,
-            )
-            .clicked()
+            if !state.uses_scope()
+                && widgets::action_button(
+                    ui,
+                    "Rescan sources",
+                    widgets::ActionStyle::Secondary,
+                    !async_busy,
+                )
+                .clicked()
             {
                 page_action = Some(RomOrganisationPageAction::Rescan);
             }
+            let scope_ready = !state.uses_scope() || state.scope.is_some();
             if widgets::action_button(
                 ui,
                 if async_busy {
@@ -2643,7 +2881,7 @@ fn show_rom_organisation_page_with_options(
                     preview_button_label(state.pending_preview)
                 },
                 widgets::ActionStyle::Primary,
-                !state.pending_preview && !async_busy,
+                !state.pending_preview && !async_busy && scope_ready,
             )
             .clicked()
             {
@@ -2658,7 +2896,15 @@ fn show_rom_organisation_page_with_options(
                 );
             });
         }
-        if state.sources_scanned {
+        if state.uses_scope() {
+            ui.label(
+                egui::RichText::new(match &state.scope {
+                    Some(scope) => format!("Preview covers {}.", scope.label()),
+                    None => "Choose what to include above, then preview.".to_string(),
+                })
+                .color(theme::muted(ui)),
+            );
+        } else if state.sources_scanned {
             ui.label(
                 egui::RichText::new(format!(
                     "{} game(s) ready to organise.",
@@ -3217,13 +3463,51 @@ fn show_plan(
         .iter()
         .filter(|entry| entry.status == OrganisationStatus::AlreadyOrganised)
         .count();
+    // A scoped rename preview groups rows by evidence (the Result card); the
+    // summary must give the same counts, never a status-only "already correct".
+    let groups = state.uses_scope().then(|| scope_group_counts(plan, state));
+    if state.uses_scope() {
+        show_scope_result_summary(ui, plan, state);
+    }
     widgets::card(ui, |ui| {
         ui.label(egui::RichText::new("Preview summary").strong());
         // At-a-glance grouping so a large result set can be scanned without
         // reading every row: already correct / will change / blocked or
         // needs attention, using only the plan's own existing statuses.
         ui.horizontal_wrapped(|ui| {
-            if quick_only {
+            if let Some(groups) = &groups {
+                let count = |group| groups.get(&group).copied().unwrap_or(0);
+                let unverified = count(scope::RenameGroup::NeedsVerification)
+                    + count(scope::RenameGroup::NoCatalogueMatch);
+                let blocked = count(scope::RenameGroup::Blocked);
+                widgets::status_badge(
+                    ui,
+                    format!(
+                        "{} already correct",
+                        count(scope::RenameGroup::AlreadyCorrect)
+                    ),
+                    widgets::StatusTone::Success,
+                );
+                widgets::status_badge(
+                    ui,
+                    format!("{} will change", count(scope::RenameGroup::Ready)),
+                    widgets::StatusTone::Info,
+                );
+                widgets::status_badge(
+                    ui,
+                    format!("{unverified} need verification or have no catalogue match"),
+                    widgets::StatusTone::Pending,
+                );
+                widgets::status_badge(
+                    ui,
+                    format!("{blocked} blocked"),
+                    if blocked == 0 {
+                        widgets::StatusTone::Success
+                    } else {
+                        widgets::StatusTone::Blocked
+                    },
+                );
+            } else if quick_only {
                 widgets::status_badge(
                     ui,
                     format!("Ready to rename: {suggested_count}"),
@@ -3277,7 +3561,15 @@ fn show_plan(
             }
         });
         ui.label(format!("{suggested_count} file(s) selected"));
-        ui.label(format!("{blocked_count} blocker(s)"));
+        ui.label(format!(
+            "{} blocker(s)",
+            groups.as_ref().map_or(blocked_count, |groups| {
+                groups
+                    .get(&scope::RenameGroup::Blocked)
+                    .copied()
+                    .unwrap_or(0)
+            })
+        ));
         ui.label(match plan.mode {
             OrganisationMode::RenameInPlace => "Original files moved? No — names change in place",
             OrganisationMode::MoveRealFile => "Original files moved? Yes — into platform folders",
@@ -3297,7 +3589,9 @@ fn show_plan(
         .filter(|entry| state.filter.is_none_or(|f| entry.status == f))
         .collect();
 
-    if !quick_only {
+    // Both pages show the filter (D2): rows it hides are never out of sight
+    // without saying so.
+    {
         ui.horizontal(|ui| {
             ui.label("Filter:");
             let all = state.filter.is_none();
@@ -3319,8 +3613,36 @@ fn show_plan(
         });
     }
     ui.add_space(4.0);
+    let pages = entries.len().div_ceil(PLAN_PAGE_ROWS).max(1);
+    state.plan_page = state.plan_page.min(pages - 1);
+    if pages > 1 {
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(state.plan_page > 0, egui::Button::new("‹ Previous"))
+                .clicked()
+            {
+                state.plan_page -= 1;
+            }
+            let first = state.plan_page * PLAN_PAGE_ROWS + 1;
+            let last = ((state.plan_page + 1) * PLAN_PAGE_ROWS).min(entries.len());
+            ui.label(format!("Rows {first}–{last} of {}", entries.len()));
+            if ui
+                .add_enabled(state.plan_page + 1 < pages, egui::Button::new("Next ›"))
+                .clicked()
+            {
+                state.plan_page += 1;
+            }
+        });
+    }
+    let page_start = state.plan_page * PLAN_PAGE_ROWS;
+    let page_rows: Vec<&OrganisationPlanEntry> = entries
+        .iter()
+        .skip(page_start)
+        .take(PLAN_PAGE_ROWS)
+        .copied()
+        .collect();
 
-    for entry in &entries {
+    for entry in &page_rows {
         ui.push_id(("quick-rename-entry", &entry.source_path), |ui| {
             ui.horizontal(|ui| {
                 match entry.status {
@@ -3580,6 +3902,48 @@ fn show_plan(
                 ))
                 .strong(),
             );
+            let changes = approved_changes(plan, &state.approved);
+            let hidden = changes
+                .iter()
+                .filter(|(entry, _)| !state.filter.is_none_or(|f| entry.status == f))
+                .count();
+            ui.label(match &state.scope {
+                Some(scope) if state.uses_scope() => format!("Scope: {}", scope.label()),
+                _ => "Scope: your configured source folders".to_string(),
+            });
+            ui.label(format!("Every change ({}):", changes.len()));
+            let row_height = ui.text_style_height(&egui::TextStyle::Body);
+            egui::ScrollArea::vertical()
+                .id_salt("apply-confirmation-changes")
+                .max_height(260.0)
+                .show_rows(ui, row_height, changes.len(), |ui, range| {
+                    for (entry, line) in &changes[range] {
+                        let shown = state.filter.is_none_or(|f| entry.status == f);
+                        ui.label(if shown {
+                            line.clone()
+                        } else {
+                            format!("{line}   (hidden by the filter)")
+                        });
+                    }
+                });
+            if hidden > 0 {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{hidden} of these changes are hidden by the current filter."
+                    ))
+                    .color(widgets::StatusTone::Pending.color(ui)),
+                );
+                ui.checkbox(
+                    &mut state.include_hidden_rows,
+                    format!("Also apply the {hidden} hidden change(s) listed above"),
+                );
+                if ui
+                    .button("Approve only the changes the filter shows")
+                    .clicked()
+                {
+                    state.drop_hidden_approvals();
+                }
+            }
             if count >= TYPED_CONFIRMATION_THRESHOLD {
                 let phrase = apply_confirmation_phrase(state.mode, count);
                 ui.label(
@@ -3595,7 +3959,10 @@ fn show_plan(
                     ui,
                     "Confirm apply",
                     widgets::ActionStyle::Primary,
-                    phrase_ok && older_writer_notice().is_none() && state.sources_complete(),
+                    phrase_ok
+                        && older_writer_notice().is_none()
+                        && state.sources_complete()
+                        && (hidden == 0 || state.include_hidden_rows),
                 )
                 .clicked()
                 {
@@ -3613,6 +3980,97 @@ fn show_plan(
         });
         reveal_from(ui, &mut state.reveal, top);
     }
+}
+
+/// Every approved change, as "old → new", in plan order (D2: the complete
+/// list the confirmation shows).
+pub(crate) fn approved_changes<'a>(
+    plan: &'a OrganisationPlan,
+    approved: &BTreeSet<String>,
+) -> Vec<(&'a OrganisationPlanEntry, String)> {
+    plan.suggested()
+        .filter(|entry| approved.contains(entry.source_path.to_string_lossy().as_ref()))
+        .map(|entry| {
+            let old = entry.source_path.display().to_string();
+            let new = match entry.destination_path.parent() == entry.source_path.parent() {
+                true => entry
+                    .destination_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                false => entry.destination_path.display().to_string(),
+            };
+            (entry, format!("{old}  →  {new}"))
+        })
+        .collect()
+}
+
+/// Standard Bulk Rename: the five result groups, and what the scope left out.
+/// Rows per result group, as the Result card shows them.
+fn scope_group_counts(
+    plan: &OrganisationPlan,
+    state: &RomOrganisationPageState,
+) -> std::collections::BTreeMap<scope::RenameGroup, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    for entry in &plan.entries {
+        let check = state
+            .saved_checks
+            .get(&entry.source_path)
+            .copied()
+            .unwrap_or(scope::SavedCheck::Missing);
+        let group = scope::rename_group(entry, state.name_choices.get(&entry.source_path), check);
+        *counts.entry(group).or_insert(0_usize) += 1;
+    }
+    counts
+}
+
+fn show_scope_result_summary(
+    ui: &mut egui::Ui,
+    plan: &OrganisationPlan,
+    state: &RomOrganisationPageState,
+) {
+    let counts = scope_group_counts(plan, state);
+    widgets::card(ui, |ui| {
+        ui.label(egui::RichText::new("Result").strong());
+        for group in scope::RenameGroup::ALL {
+            let count = counts.get(&group).copied().unwrap_or(0);
+            let tone = match group {
+                scope::RenameGroup::Ready => widgets::StatusTone::Info,
+                scope::RenameGroup::AlreadyCorrect => widgets::StatusTone::Success,
+                scope::RenameGroup::NeedsVerification | scope::RenameGroup::NoCatalogueMatch => {
+                    widgets::StatusTone::Pending
+                }
+                scope::RenameGroup::Blocked if count == 0 => widgets::StatusTone::Success,
+                scope::RenameGroup::Blocked => widgets::StatusTone::Blocked,
+            };
+            widgets::status_badge(ui, format!("{}: {count}", group.label()), tone);
+        }
+        if counts
+            .get(&scope::RenameGroup::NeedsVerification)
+            .copied()
+            .unwrap_or(0)
+            > 0
+        {
+            ui.label("Needs verification is not a failure: these games have no current catalogue check. Check them in DAT Management, then preview again.");
+        }
+        if !state.not_on_disk.is_empty() {
+            ui.label(format!(
+                "{} game(s) in the Library are not on disk and are left out.",
+                state.not_on_disk.len()
+            ));
+        }
+        if !state.other_filesystems.is_empty() {
+            ui.label(format!(
+                "{} item(s) on another filesystem (a mounted archive or another disk) were skipped.",
+                state.other_filesystems.len()
+            ));
+            widgets::technical_details(ui, "scope_other_filesystems", |ui| {
+                for path in state.other_filesystems.iter().take(50) {
+                    ui.label(path.display().to_string());
+                }
+            });
+        }
+    });
 }
 
 /// Plain-English result line for one linked-library preview entry. Pure:
@@ -4416,6 +4874,7 @@ mod tests {
                 original_metadata: Default::default(),
                 status: OrganisationStatus::Suggested,
                 reason: None,
+                deferred_capture: None,
             });
             choices.insert(source, choice);
         }
@@ -5025,6 +5484,7 @@ mod tests {
             original_metadata: Default::default(),
             status,
             reason: None,
+            deferred_capture: None,
         }
     }
 
@@ -5080,6 +5540,7 @@ mod tests {
                 original_metadata: Default::default(),
                 status: OrganisationStatus::Suggested,
                 reason: None,
+                deferred_capture: None,
             }],
         });
         state.approved.insert("/sources/Combat.bin".to_string());
@@ -5137,6 +5598,42 @@ mod tests {
             &output,
             "2 blocked or need attention"
         ));
+    }
+
+    /// In a scoped rename preview the summary card agrees with the five result
+    /// groups: a kept name that is not a verified catalogue name is never
+    /// counted as already correct.
+    #[test]
+    fn a_scoped_preview_summary_counts_the_same_groups_as_the_result_card() {
+        let mut state = RomOrganisationPageState::default();
+        state.ensure_mode(OrganisationMode::RenameInPlace);
+        let library_root = test_root("scoped-summary-groups").join("library");
+        state.plan_generation = 1;
+        state.plan = Some(OrganisationPlan {
+            master_root: library_root.clone(),
+            mode: OrganisationMode::RenameInPlace,
+            content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
+            classifier_version: archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
+            generation: 1,
+            entries: vec![
+                linked_library_plan_entry(OrganisationStatus::AlreadyOrganised),
+                linked_library_plan_entry(OrganisationStatus::AlreadyOrganised),
+            ],
+        });
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_rom_organisation_page(ui, &mut state);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Needs verification: 2"));
+        assert!(rendered_text_contains(&output, "0 already correct"));
+        assert!(rendered_text_contains(
+            &output,
+            "2 need verification or have no catalogue match"
+        ));
+        assert!(!rendered_text_contains(&output, "2 already correct"));
     }
 
     #[test]
@@ -5322,6 +5819,17 @@ mod tests {
 
 #[path = "rom_organisation_page_hint_gate.rs"]
 mod hint_gate;
+
+#[path = "rom_organisation_page_scope.rs"]
+pub(crate) mod scope;
+
+#[cfg(test)]
+#[path = "rom_organisation_page_d2_tests.rs"]
+mod d2_tests;
+
+#[cfg(test)]
+#[path = "rom_organisation_page_bench_tests.rs"]
+mod bench_tests;
 #[cfg(test)]
 #[path = "rom_organisation_page_preview_perf_tests.rs"]
 mod preview_perf_tests;

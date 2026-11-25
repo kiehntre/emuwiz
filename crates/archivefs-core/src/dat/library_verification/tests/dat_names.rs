@@ -214,3 +214,75 @@ fn reading_only_referenced_catalogues_gives_the_same_rows() {
         db.verified_dat_name_for_archive(1, &full).unwrap()
     );
 }
+
+fn sha1_hex(bytes: &[u8]) -> String {
+    use sha1::Digest;
+    sha1::Sha1::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn batched(
+    f: &Fixture,
+    ids: &[i64],
+) -> std::collections::HashMap<i64, crate::database::VerifiedDatEvidence> {
+    f.sized();
+    Database::open_read_only(&f.db)
+        .unwrap()
+        .verified_dat_names_for_archives(ids, &f.configured())
+        .unwrap()
+}
+
+#[test]
+fn the_batched_names_equal_the_one_item_names() {
+    let f = verified_fixture();
+    let all = batched(&f, &[1, 2, 3, 99]);
+    for id in [1, 2] {
+        assert_eq!(all[&id].name, name_of(&f, id), "item {id}");
+    }
+    // Never checked, or not in the library: no saved row, so absent.
+    assert!(!all.contains_key(&3) && !all.contains_key(&99));
+    // The usable name carries the raw SHA-1 of the very file it describes.
+    assert_eq!(
+        all[&1].raw_sha1.as_deref(),
+        Some(sha1_hex(MATCHING).as_str())
+    );
+    // No name, no SHA-1 to rename by.
+    assert_eq!(all[&2].raw_sha1, None);
+    // A file changed after its check: neither a name nor a SHA-1.
+    std::fs::write(f.root.join("a.tap"), b"rewritten after the check!!").unwrap();
+    let changed = batched(&f, &[1]);
+    assert_eq!(changed[&1].name, name_of(&f, 1));
+    assert!(matches!(changed[&1].name, VerifiedDatName::NotUsable(_)));
+    assert_eq!(changed[&1].raw_sha1, None);
+}
+
+#[test]
+fn an_archive_member_match_carries_the_outer_files_sha1_never_the_members() {
+    let f = Fixture::new();
+    f.zip("z.zip", "inner.tap", MATCHING);
+    f.add(4, "z.zip", None, Some("ZX Spectrum"));
+    f.run();
+    let evidence = &batched(&f, &[4])[&4];
+    assert!(
+        matches!(
+            &evidence.name,
+            VerifiedDatName::Usable {
+                through_archive_member: true,
+                ..
+            }
+        ),
+        "{:?}",
+        evidence.name
+    );
+    let outer = std::fs::read(f.root.join("z.zip")).unwrap();
+    assert_eq!(
+        evidence.raw_sha1.as_deref(),
+        Some(sha1_hex(&outer).as_str())
+    );
+    assert_ne!(
+        evidence.raw_sha1.as_deref(),
+        Some(sha1_hex(MATCHING).as_str())
+    );
+}

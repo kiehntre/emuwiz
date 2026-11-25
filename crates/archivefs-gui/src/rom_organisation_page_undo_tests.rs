@@ -348,6 +348,7 @@ fn the_apply_confirmation_is_scrolled_into_view() {
             original_metadata: Default::default(),
             status: OrganisationStatus::Suggested,
             reason: None,
+            deferred_capture: None,
         });
     state.pending_apply = Some(1);
     state.reveal = true;

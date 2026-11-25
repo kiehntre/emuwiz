@@ -354,10 +354,17 @@ fn bar_shows_the_count_clear_and_only_read_only_actions() {
         "Launch check: 1 ready · 0 not ready · 2 not checked",
         "actions include the hidden games",
         "Copied 3 titles.",
+        // Opens a preview only; nothing changes until a separate confirmation.
+        "Rename the 2 shown…",
+        "Rename all 3 selected (incl. 1 hidden)…",
     ] {
         assert!(text.contains(expected), "missing {expected:?} in {text}");
     }
-    let lower = text.to_lowercase();
+    // Apart from those two preview buttons, still no changing action.
+    let lower = text
+        .replace("Rename the 2 shown…", "")
+        .replace("Rename all 3 selected (incl. 1 hidden)…", "")
+        .to_lowercase();
     for forbidden in [
         "delete",
         "move",
@@ -382,6 +389,9 @@ fn bar_shows_the_count_clear_and_only_read_only_actions() {
         notice: None,
     });
     assert!(!text.contains("Keep only shown"));
+    // D2: with nothing hidden, one plain button and no hidden-games choice.
+    assert!(text.contains("Rename selected…"), "{text}");
+    assert!(!text.contains("hidden)…"), "{text}");
 }
 
 fn key_press(key: egui::Key, modifiers: egui::Modifiers) -> egui::RawInput {
