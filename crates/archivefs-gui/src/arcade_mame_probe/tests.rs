@@ -406,3 +406,60 @@ fn peek_never_starts_a_probe() {
     std::thread::sleep(Duration::from_millis(200));
     assert!(!log.exists(), "peek must not run MAME");
 }
+
+#[test]
+fn a_set_blocked_by_its_bios_setting_is_checked_again_once_corrected() {
+    let root = tempfile::tempdir().unwrap();
+    let ini = root.path().join("ini");
+    std::fs::create_dir(&ini).unwrap();
+    std::fs::write(ini.join("gam.ini"), "bios us\n").unwrap();
+    // A stand-in for MAME: its settings name `ini` as the only ini folder,
+    // and verify reports only a file of the non-default BIOS version missing.
+    let bios = r#"<biosset name="euro"/><biosset name="us"/><rom name="sp-s2.sp1" bios="euro" size="131072"/><rom name="sp-u2.sp1" bios="us" size="131072"/>"#;
+    let exe = root.path().join("m");
+    std::fs::write(
+        &exe,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n*-showconfig*) printf 'readconfig 1\\ninipath {}\\nbios \\n' ;;\n*-listxml*) cat <<'XML'\n<mame><machine name=\"gam\" romof=\"neogeo\"><driver status=\"good\" emulation=\"good\"/>{bios}</machine></mame>\nXML\n;;\n*-verifyroms*) cat <<'V'\ngam         : sp-u2.sp1 (131072 bytes) - NOT FOUND (neogeo)\nromset gam [neogeo] is bad\nV\n;;\nesac\n",
+            ini.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let dir = set_dir(root.path());
+    let id: Id = (exe.clone(), dir.clone(), Vec::new());
+    let first = settle(&exe, &dir, &[]);
+    assert_eq!(first.verdict.readiness, ArcadeReadiness::Blocked);
+    assert!(first.bios_evidence.is_some());
+    // The user puts the default back; force the next re-validation now.
+    std::fs::write(ini.join("gam.ini"), "bios euro\n").unwrap();
+    manager()
+        .state
+        .lock()
+        .unwrap()
+        .done
+        .get_mut(&id)
+        .unwrap()
+        .validated = Instant::now() - Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let again = loop {
+        if let Some(Lookup::Done(p)) = lookup_with(&exe, &dir, &[], &[])
+            && !Arc::ptr_eq(&p, &first)
+        {
+            break p;
+        }
+        assert!(Instant::now() < deadline, "no fresh check after the change");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(again.verdict.readiness, ArcadeReadiness::ReadyWithWarning);
+    assert!(
+        again
+            .verdict
+            .warnings
+            .iter()
+            .any(|n| n.contains("only files for other BIOS versions are missing")),
+        "{:?}",
+        again.verdict.warnings
+    );
+    assert!(again.bios_evidence.is_some());
+}

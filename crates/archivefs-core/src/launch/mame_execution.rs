@@ -32,7 +32,7 @@ pub struct MameLaunchRequest {
     /// Additional read-only ROM search paths (default empty), passed after
     /// `rom_search_path`. Re-validated at preflight; never written to.
     pub extra_rompaths: Vec<PathBuf>,
-    /// The MAME BIOS settings a ready Arcade verdict relied on (default-BIOS
+    /// The MAME BIOS settings the Arcade verdict depends on (default-BIOS
     /// exemption). Preflight refuses the launch if they changed since.
     pub default_bios_evidence: Option<crate::arcade_mame_routing::BiosSettingsEvidence>,
 }

@@ -945,7 +945,10 @@ fn settings(global: &str, files: &[(&str, &str)]) -> BiosSettings {
             .map(|(name, bios)| {
                 (
                     name.to_string(),
-                    (PathBuf::from(format!("/ini/{name}.ini")), bios.to_string()),
+                    (
+                        PathBuf::from(format!("/ini/{name}.ini")),
+                        Some(bios.to_string()),
+                    ),
                 )
             })
             .collect(),
@@ -1034,11 +1037,11 @@ fn bios_settings_are_read_once_from_the_first_file_of_each_name() {
     );
     let s = read_bios_settings(&out, Some(home.path())).unwrap();
     assert_eq!(s.global, "");
-    let bios = |name: &str| s.files.get(name).map(|(_, b)| b.as_str());
-    assert_eq!(bios("aof"), Some("us"));
-    assert_eq!(bios("source/neogeo"), Some("euro"));
-    assert_eq!(bios("sf2"), Some(""));
-    assert_eq!(bios("mame"), Some(""));
+    let bios = |name: &str| s.files.get(name).map(|(_, b)| b.as_deref());
+    assert_eq!(bios("aof"), Some(Some("us")));
+    assert_eq!(bios("source/neogeo"), Some(Some("euro")));
+    assert_eq!(bios("sf2"), Some(None));
+    assert_eq!(bios("mame"), Some(None));
     assert_eq!(bios("notes"), None);
 }
 
@@ -1074,13 +1077,13 @@ fn an_unconfirmed_bios_version_withdraws_the_exemption_and_blocks() {
         evidence.is_some(),
         "a ready verdict that used the exemption carries its evidence"
     );
-    for result in [
-        Ok(settings("", &[("neogeo", "us")])),
-        Err("MAME's settings could not be read".to_string()),
+    for (result, keeps_evidence) in [
+        (Ok(settings("", &[("neogeo", "us")])), true),
+        (Err("MAME's settings could not be read".to_string()), false),
     ] {
         let (withdrawn, evidence) =
             confirm_effective_bios("aof", Some(&f), &verify, false, ready.clone(), || result);
-        assert!(evidence.is_none());
+        assert_eq!(evidence.is_some(), keeps_evidence);
         assert_eq!(withdrawn.readiness, ArcadeReadiness::Blocked);
         assert_eq!(
             withdrawn.block_reason,
@@ -1230,11 +1233,11 @@ fn ini_values_are_read_as_mame_0_264_reads_them() {
     std::fs::write(mame.join("pacman.ini"), "bios us\nbios\n").unwrap();
     let out = "readconfig 1\ninipath $HOME/.mame\nbios \n";
     let s = read_bios_settings(out, Some(home.path())).unwrap();
-    let bios = |name: &str| s.files.get(name).map(|(_, b)| b.as_str());
-    assert_eq!(bios("aof"), Some("us"));
-    assert_eq!(bios("kof98"), Some("us"));
-    assert_eq!(bios("sf2"), Some(""));
-    assert_eq!(bios("pacman"), Some(""));
+    let bios = |name: &str| s.files.get(name).map(|(_, b)| b.as_deref());
+    assert_eq!(bios("aof"), Some(Some("us")));
+    assert_eq!(bios("kof98"), Some(Some("us")));
+    assert_eq!(bios("sf2"), Some(None));
+    assert_eq!(bios("pacman"), Some(Some("")));
     let aof = bios_set("aof", r#"romof="neogeo""#);
     let neo = ["neogeo".to_string()];
     assert!(effective_bios_check(&aof, &neo, &s).is_err());
@@ -1293,4 +1296,85 @@ fn a_set_with_a_bios_parent_but_no_named_root_is_not_confirmed() {
             "{providers:?}"
         );
     }
+}
+
+#[test]
+fn a_set_blocked_by_a_bios_setting_is_checked_again_once_it_is_corrected() {
+    let home = tempfile::tempdir().unwrap();
+    let mame = home.path().join(".mame");
+    std::fs::create_dir_all(&mame).unwrap();
+    std::fs::write(mame.join("aof.ini"), "bios us\n").unwrap();
+    let out = "readconfig 1\ninipath $HOME/.mame\nbios \n";
+    let f = bios_set("aof", r#"romof="neogeo""#);
+    let verify = verify_text(
+        "aof         : sp-u2.sp1 (131072 bytes) - NOT FOUND (neogeo)\nromset aof [neogeo] is bad\n",
+        "aof",
+    );
+    let ready = evaluate_arcade_set("aof", Some(&f), &verify, false);
+    let check = || {
+        confirm_effective_bios("aof", Some(&f), &verify, false, ready.clone(), || {
+            read_bios_settings(out, Some(home.path()))
+        })
+    };
+    let (blocked, evidence) = check();
+    assert_eq!(blocked.readiness, ArcadeReadiness::Blocked);
+    let evidence = evidence.expect("a verdict blocked by a setting keeps its evidence");
+    assert!(evidence.is_current());
+    // The user puts the default back: the blocked verdict is now stale.
+    std::fs::write(mame.join("aof.ini"), "bios euro\n").unwrap();
+    assert!(!evidence.is_current());
+    let (again, _) = check();
+    assert_eq!(again, ready);
+}
+
+#[test]
+fn an_empty_bios_value_resets_to_the_default() {
+    let home = tempfile::tempdir().unwrap();
+    let mame = home.path().join(".mame");
+    std::fs::create_dir_all(&mame).unwrap();
+    let out = "readconfig 1\ninipath $HOME/.mame\nbios \n";
+    let aof = bios_set("aof", r#"romof="neogeo""#);
+    let neo = ["neogeo".to_string()];
+    std::fs::write(mame.join("neogeo.ini"), "bios us\n").unwrap();
+    // Measured with 0.264: with `bios us` in neogeo.ini, a bare `bios` or
+    // `bios ""` in aof.ini starts the default BIOS.
+    for own in ["bios\n", "bios \"\"\n", "bios us\nbios\n"] {
+        std::fs::write(mame.join("aof.ini"), own).unwrap();
+        let s = read_bios_settings(out, Some(home.path())).unwrap();
+        assert_eq!(effective_bios_check(&aof, &neo, &s), Ok(()), "{own:?}");
+    }
+    // Without a `bios` line in aof.ini, neogeo.ini's `us` still decides.
+    std::fs::write(mame.join("aof.ini"), "skip_warnings 1\n").unwrap();
+    let s = read_bios_settings(out, Some(home.path())).unwrap();
+    assert!(effective_bios_check(&aof, &neo, &s).is_err());
+    // An empty value in a file that only possibly applies decides nothing:
+    // the global `us` below it still withdraws the exemption.
+    std::fs::remove_file(mame.join("aof.ini")).unwrap();
+    std::fs::remove_file(mame.join("neogeo.ini")).unwrap();
+    std::fs::write(mame.join("horizont.ini"), "bios\n").unwrap();
+    let global_us = "readconfig 1\ninipath $HOME/.mame\nbios us\n";
+    let s = read_bios_settings(global_us, Some(home.path())).unwrap();
+    assert!(effective_bios_check(&aof, &neo, &s).is_err());
+}
+
+#[test]
+fn an_empty_bios_value_never_overrides_a_possible_higher_layer() {
+    let home = tempfile::tempdir().unwrap();
+    let mame = home.path().join(".mame");
+    std::fs::create_dir_all(mame.join("source")).unwrap();
+    // The test machine's sourcefile is x/y.cpp, so its source ini is y.ini.
+    let aof = bios_set("aof", r#"romof="neogeo""#);
+    let neo = ["neogeo".to_string()];
+    // neogeo.ini (the BIOS root, which only possibly applies) ranks above
+    // source/y.ini, so its `us` still withdraws the exemption.
+    std::fs::write(mame.join("neogeo.ini"), "bios us\n").unwrap();
+    std::fs::write(mame.join("source").join("y.ini"), "bios\n").unwrap();
+    let global_us = "readconfig 1\ninipath $HOME/.mame\nbios us\n";
+    let s = read_bios_settings(global_us, Some(home.path())).unwrap();
+    assert!(effective_bios_check(&aof, &neo, &s).is_err());
+    // Without it, the empty value in source/y.ini (which certainly applies)
+    // resets to the default above the global `us`.
+    std::fs::remove_file(mame.join("neogeo.ini")).unwrap();
+    let s = read_bios_settings(global_us, Some(home.path())).unwrap();
+    assert_eq!(effective_bios_check(&aof, &neo, &s), Ok(()));
 }

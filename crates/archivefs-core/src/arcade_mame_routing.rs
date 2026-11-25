@@ -742,9 +742,11 @@ pub struct BiosSettings {
     pub global: String,
     /// Ini name (`aof`, `source/neogeo`) -> (file, `bios` value). Only the
     /// first file of each name on the `inipath` counts, as MAME opens only
-    /// that one; a file without a `bios` line is recorded with an empty value
-    /// because it still hides later files of the same name.
-    pub files: std::collections::BTreeMap<String, (PathBuf, String)>,
+    /// that one; a file without a `bios` line is recorded as `None` because it
+    /// still hides later files of the same name. `Some("")` is a `bios` line
+    /// with an empty value, which resets to the default BIOS (measured with
+    /// 0.264: an empty `bios` in aof.ini overrides `bios us` in neogeo.ini).
+    pub files: std::collections::BTreeMap<String, (PathBuf, Option<String>)>,
     /// Ini names (as in `files`) whose file changes which ini files MAME
     /// reads next: `readconfig` (or its short name `rc`) other than `1` stops
     /// reading, and an `inipath` line moves where later files are opened
@@ -964,7 +966,7 @@ fn read_bios_settings(showconfig: &str, home: Option<&Path>) -> Result<BiosSetti
                 if readconfig.any(|v| v != "1") || last("inipath").is_some() {
                     settings.changes_reading.insert(key.clone());
                 }
-                let bios = last("bios").unwrap_or_default();
+                let bios = last("bios");
                 settings.files.insert(key, (path, bios));
             }
         }
@@ -1056,8 +1058,9 @@ fn effective_bios_check(
         .file_stem()
         .and_then(|stem| stem.to_str())
         .map(|stem| format!("source/{stem}"));
-    // (where, value, certainly applies), highest priority first.
-    let mut layers: Vec<(String, String, bool)> = Vec::new();
+    // (where, value if it has a `bios` line, certainly applies), highest
+    // priority first.
+    let mut layers: Vec<(String, Option<String>, bool)> = Vec::new();
     let mut add = |name: Option<String>, certain: bool, applies: bool| {
         if let Some(name) = name
             && applies
@@ -1099,11 +1102,18 @@ fn effective_bios_check(
     }
     layers.push((
         "MAME's global settings".into(),
-        settings.global.clone(),
+        Some(settings.global.clone()),
         true,
     ));
     for (place, bios, certain) in layers {
+        let Some(bios) = bios else {
+            continue;
+        };
         if bios.is_empty() {
+            // An empty value resets to the default BIOS where it applies.
+            if certain {
+                return Ok(());
+            }
             continue;
         }
         if bios.bytes().all(|b| b.is_ascii_digit()) {
@@ -1147,14 +1157,16 @@ fn confirm_effective_bios(
     let Some(providers) = exemption_providers(facts, verify) else {
         return (verdict, None);
     };
-    let why = match settings() {
+    let (why, evidence) = match settings() {
         Ok(read) => match effective_bios_check(facts, &providers, &read) {
             // Ready on the strength of these settings: the launch rechecks
             // that they are unchanged (see `preflight_mame_launch`).
             Ok(()) => return (verdict, Some(read.evidence)),
-            Err(why) => why,
+            // Blocked on the strength of these settings: kept so that a
+            // corrected setting is noticed and the set checked again.
+            Err(why) => (why, Some(read.evidence)),
         },
-        Err(why) => why,
+        Err(why) => (why, None),
     };
     let strict = MameMachineFacts {
         alternative_bios_files: Vec::new(),
@@ -1164,7 +1176,7 @@ fn confirm_effective_bios(
     strict_verdict.notes.push(format!(
         "files for other BIOS versions count as required because MAME may not start the default BIOS version: {why}"
     ));
-    (strict_verdict, None)
+    (strict_verdict, evidence)
 }
 
 /// One read of MAME's BIOS settings shared by all probes, so a library-wide
@@ -1500,9 +1512,11 @@ pub struct ArcadeProbe {
     pub facts: Option<MameMachineFacts>,
     pub verify: VerifyReport,
     pub verdict: ArcadeMameVerdict,
-    /// Present when the verdict is not blocked only because of the
-    /// default-BIOS exemption: the BIOS settings it relied on. A launch must
-    /// confirm [`BiosSettingsEvidence::is_current`] first.
+    /// Present when the verdict depends on MAME's BIOS settings: not blocked
+    /// only because of the default-BIOS exemption, or blocked because those
+    /// settings withdrew it. A launch must confirm
+    /// [`BiosSettingsEvidence::is_current`] first, and a cached verdict is
+    /// checked again once they change.
     pub bios_evidence: Option<BiosSettingsEvidence>,
 }
 
