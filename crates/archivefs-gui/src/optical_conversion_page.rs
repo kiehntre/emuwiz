@@ -365,19 +365,21 @@ impl PspShrinkPageState {
             self.error = Some(overwrite_refusal(&output));
             return;
         }
-        let validator = match validator {
-            Ok(validator) => validator,
-            Err(error) => {
-                self.error = Some(error.to_string());
-                return;
-            }
-        };
+        // The configuration is checked before the validator so each refusal
+        // has its own reachable branch (both refuse before anything is written).
         let placement = match placement {
             Ok(placement) => placement,
             Err(error) => {
                 self.error = Some(format!(
                     "EmuWiz could not read the configured game folders, so it cannot choose a safe place for conversion evidence. Nothing was written. {error}"
                 ));
+                return;
+            }
+        };
+        let validator = match validator {
+            Ok(validator) => validator,
+            Err(error) => {
+                self.error = Some(error.to_string());
                 return;
             }
         };
@@ -3059,9 +3061,18 @@ mod tests {
             IndependentCsoValidator::maxcso_at(Path::new("/nonexistent/maxcso")),
             Err("no configuration".into()),
         );
-        // The missing validator is reported first; with one present the
-        // configuration error is reported instead. Either way nothing is written.
-        assert!(state.error.is_some());
+        // The configuration is checked first, so this reaches the
+        // configuration branch even though no validator exists either (the
+        // missing-validator refusal has its own test with a valid placement).
+        let error = state.error.as_deref().unwrap();
+        assert!(
+            error.contains("could not read the configured game folders"),
+            "{error}"
+        );
+        assert!(error.contains("no configuration"), "{error}");
+        assert!(error.contains("Nothing was written"), "{error}");
+        assert!(!error.contains("independent validator"), "{error}");
+        assert!(state.result.is_none());
         assert!(!output.exists());
     }
 

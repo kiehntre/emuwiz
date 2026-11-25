@@ -29,7 +29,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use super::PspShrinkError;
+use super::{DestinationProblem, PspShrinkError};
 
 pub const DIAGNOSTICS_DIR_NAME: &str = ".emuwiz-diagnostics";
 pub const PSP_CSO_DIAGNOSTICS: &str = "psp-cso";
@@ -102,6 +102,62 @@ fn ensure_private_dir(path: &Path) -> Result<fs::Metadata, PspShrinkError> {
         }
     }
     check_private_dir(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: an errno the hard-link step of the probe reports instead
+    /// of calling `link` (CI has no FAT or exFAT mount).
+    pub(super) static LINK_PROBE_ERRNO: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn link_for_probe(original: &Path, link: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(errno) = LINK_PROBE_ERRNO.with(std::cell::Cell::get) {
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+    fs::hard_link(original, link)
+}
+
+fn classify_probe_error(error: &io::Error, linking: bool) -> DestinationProblem {
+    match error.raw_os_error() {
+        // FAT/exFAT answer link() with EPERM; others with EOPNOTSUPP. A
+        // failure to create our own probe file is a permission problem instead.
+        Some(libc::EPERM) if linking => DestinationProblem::HardLinksUnsupported,
+        Some(libc::EOPNOTSUPP) | Some(libc::EXDEV) if linking => {
+            DestinationProblem::HardLinksUnsupported
+        }
+        Some(libc::EPERM) | Some(libc::EACCES) => DestinationProblem::PermissionDenied,
+        Some(libc::ENOSPC) | Some(libc::EDQUOT) => DestinationProblem::StorageFull,
+        Some(libc::EROFS) => DestinationProblem::ReadOnly,
+        _ => DestinationProblem::Other,
+    }
+}
+
+/// Proves the filesystem can make the no-clobber hard link that publication
+/// uses, before any expensive work. Creates a disposable probe file and one
+/// link to it inside the private `staging` folder, then removes exactly
+/// those two names. Nothing else is touched.
+pub(super) fn probe_hard_links(staging: &Path) -> Result<(), PspShrinkError> {
+    let id = unique_id();
+    let probe = staging.join(format!(".link-probe-{id}"));
+    let linked = staging.join(format!(".link-probe-{id}.link"));
+    let unsuitable =
+        |error: io::Error, linking: bool, step: &str| PspShrinkError::DestinationUnsuitable {
+            problem: classify_probe_error(&error, linking),
+            detail: format!("{step} in {}: {error}", staging.display()),
+        };
+    write_new(&probe, b"").map_err(|error| unsuitable(error, false, "creating a probe file"))?;
+    let linked_result = link_for_probe(&probe, &linked);
+    let _ = fs::remove_file(&probe);
+    match linked_result {
+        Ok(()) => {
+            let _ = fs::remove_file(&linked);
+            Ok(())
+        }
+        Err(error) => Err(unsuitable(error, true, "making a hard link")),
+    }
 }
 
 /// The highest ancestor of `dir` on the same device: its mount point.
@@ -197,6 +253,9 @@ impl DiagnosticsRoot {
         for (source, base, create_base) in candidates {
             match Self::try_candidate(&base, create_base, device, &placement.source_folders) {
                 Ok(dir) => {
+                    // Same device as the output (checked above), so this is
+                    // the destination filesystem's own hard-link capability.
+                    probe_hard_links(&dir.join(STAGING))?;
                     return Ok(Self {
                         dir,
                         device,

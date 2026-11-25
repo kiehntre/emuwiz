@@ -86,6 +86,13 @@ pub enum PspShrinkError {
     DependencyMissing(String),
     /// No safe same-filesystem diagnostics location; nothing was written.
     DiagnosticsUnavailable(String),
+    /// The output's filesystem failed the hard-link check that safe,
+    /// no-overwrite publication depends on. Checked before the source is
+    /// hashed or anything is converted; nothing was written.
+    DestinationUnsuitable {
+        problem: DestinationProblem,
+        detail: String,
+    },
     /// Not enough free space for the CSO, the transient restore and the
     /// retained evidence; nothing was written.
     InsufficientSpace {
@@ -104,6 +111,21 @@ pub enum PspShrinkError {
     },
 }
 
+/// Why the destination filesystem failed the hard-link check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestinationProblem {
+    /// The filesystem cannot make hard links (for example FAT32 or exFAT).
+    HardLinksUnsupported,
+    /// Creating the probe file or link was not permitted.
+    PermissionDenied,
+    /// No space or quota left.
+    StorageFull,
+    /// Read-only filesystem.
+    ReadOnly,
+    /// Any other filesystem error.
+    Other,
+}
+
 impl fmt::Display for PspShrinkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -120,6 +142,20 @@ impl fmt::Display for PspShrinkError {
                 f,
                 "no safe place for conversion evidence on this disk: {message}. Nothing was written."
             ),
+            Self::DestinationUnsuitable { problem, detail } => {
+                let what = match problem {
+                    DestinationProblem::HardLinksUnsupported => {
+                        "the output's disk cannot make hard links, which EmuWiz needs to publish a verified CSO without any risk of replacing a file. Choose an output folder on a filesystem that supports hard links (for example ext4, Btrfs or XFS; FAT32 and exFAT do not)"
+                    }
+                    DestinationProblem::PermissionDenied => {
+                        "EmuWiz is not allowed to create files in its diagnostics folder on the output's disk"
+                    }
+                    DestinationProblem::StorageFull => "the output's disk is full or over quota",
+                    DestinationProblem::ReadOnly => "the output's disk is mounted read-only",
+                    DestinationProblem::Other => "the output's disk reported an error",
+                };
+                write!(f, "{what} ({detail}). Nothing was converted or written.")
+            }
             Self::InsufficientSpace { needed, available } => write!(
                 f,
                 "not enough free space: {needed} bytes needed, {available} available. Nothing was written."
@@ -385,20 +421,22 @@ fn convert_internal(
     placement: &DiagnosticsPlacement,
     failure: TestFailure,
 ) -> Result<PspShrinkResult, PspShrinkError> {
-    let inspection = inspect_psp_iso(source)?;
     if fs::symlink_metadata(output).is_ok() {
         return Err(PspShrinkError::OutputExists(output.to_path_buf()));
-    }
-    if failure == TestFailure::Tool {
-        return Err(PspShrinkError::Verification(
-            "conversion tool failed before producing trusted output".to_string(),
-        ));
     }
     let output_dir = match output.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
     };
+    // The destination checks (safe diagnostics folder, hard-link probe on the
+    // output's filesystem) come before the source is hashed or converted.
     let root = DiagnosticsRoot::resolve(output_dir, placement)?;
+    let inspection = inspect_psp_iso(source)?;
+    if failure == TestFailure::Tool {
+        return Err(PspShrinkError::Verification(
+            "conversion tool failed before producing trusted output".to_string(),
+        ));
+    }
     let needed = required_free_bytes(inspection.source_size);
     let available = root.available_bytes()?;
     if available < needed {
@@ -876,7 +914,16 @@ pub fn classify_cso_dialect(path: &Path) -> Result<CsoDialect, PspShrinkError> {
         return Ok(CsoDialect::Unknown("not a CSO v1 layout".into()));
     }
     let blocks = total / u64::from(block_size);
-    let data_start = CSO_HEADER_SIZE + (blocks + 1) * CSO_INDEX_ENTRY_SIZE;
+    // Every size here comes from an untrusted header: checked arithmetic
+    // throughout, and an implausible header is Unknown, never a panic or wrap.
+    let implausible = || Ok(CsoDialect::Unknown("implausible CSO header sizes".into()));
+    let Some(data_start) = blocks
+        .checked_add(1)
+        .and_then(|entries| entries.checked_mul(CSO_INDEX_ENTRY_SIZE))
+        .and_then(|table| table.checked_add(CSO_HEADER_SIZE))
+    else {
+        return implausible();
+    };
     let mut first = [0u8; 4];
     file.read_exact(&mut first)
         .map_err(|_| PspShrinkError::InvalidCso("truncated CSO index table".into()))?;
@@ -884,12 +931,22 @@ pub fn classify_cso_dialect(path: &Path) -> Result<CsoDialect, PspShrinkError> {
     if align == 0 && first == data_start {
         return Ok(CsoDialect::Standard { align });
     }
-    if align == 0 && first * 4 == data_start {
+    if align == 0 && first.checked_mul(4) == Some(data_start) {
         return Ok(CsoDialect::LegacyEmuWiz);
     }
-    let unit = 1u64 << u32::from(align.min(31));
-    if align < 32 && (first << align) >= data_start && (first << align) < data_start + unit {
-        return Ok(CsoDialect::Standard { align });
+    if align < 32 {
+        let unit = 1u64 << u32::from(align);
+        let (Some(start), Some(end)) = (
+            first
+                .checked_shl(u32::from(align))
+                .filter(|_| first.leading_zeros() >= u32::from(align)),
+            data_start.checked_add(unit),
+        ) else {
+            return implausible();
+        };
+        if start >= data_start && start < end {
+            return Ok(CsoDialect::Standard { align });
+        }
     }
     Ok(CsoDialect::Unknown(
         "first index entry does not point at the data".into(),

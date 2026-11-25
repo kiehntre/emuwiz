@@ -1087,3 +1087,258 @@ fn legacy_recovery_refuses_a_standard_cso_and_leaves_nothing_behind() {
     assert!(restore_legacy_emuwiz_cso(&cso, &restored).is_err());
     assert!(!restored.exists());
 }
+
+// R1: hard-link capability of the destination filesystem (owner 2026-11-25).
+
+fn with_link_errno<T>(errno: i32, run: impl FnOnce() -> T) -> T {
+    super::diagnostics::LINK_PROBE_ERRNO.with(|cell| cell.set(Some(errno)));
+    let result = run();
+    super::diagnostics::LINK_PROBE_ERRNO.with(|cell| cell.set(None));
+    result
+}
+
+fn assert_refused_before_any_work(scratch: &Scratch, source: &Path, bytes: &[u8]) {
+    assert!(!scratch.output().exists(), "nothing published");
+    assert_eq!(fs::read(source).unwrap(), bytes, "source untouched");
+    assert!(
+        scratch.entries("staging").is_empty(),
+        "no stage and no probe left"
+    );
+    assert!(scratch.entries("failed").is_empty(), "no evidence needed");
+    assert!(scratch.manifest_lines().is_empty());
+}
+
+#[test]
+fn a_filesystem_without_hard_links_is_refused_before_hashing_or_converting() {
+    let scratch = Scratch::new();
+    // A source that inspection would reject proves the probe runs first.
+    let source = scratch.root.join("games").join("not-sector-aligned.iso");
+    let bytes = vec![7u8; 1000];
+    fs::write(&source, &bytes).unwrap();
+    let error = with_link_errno(libc::EPERM, || {
+        convert_psp_iso_to_cso(
+            &source,
+            &scratch.output(),
+            &reference(),
+            &scratch.placement(),
+        )
+        .unwrap_err()
+    });
+    assert!(
+        matches!(
+            error,
+            PspShrinkError::DestinationUnsuitable {
+                problem: DestinationProblem::HardLinksUnsupported,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("supports hard links"), "{message}");
+    assert!(message.contains("for example ext4"), "{message}");
+    assert!(message.contains("Nothing was converted"), "{message}");
+    assert_refused_before_any_work(&scratch, &source, &bytes);
+}
+
+#[test]
+fn operation_not_supported_is_also_reported_as_no_hard_links() {
+    let scratch = Scratch::new();
+    let (source, bytes) = scratch.source();
+    let error = with_link_errno(libc::EOPNOTSUPP, || {
+        convert_psp_iso_to_cso(
+            &source,
+            &scratch.output(),
+            &reference(),
+            &scratch.placement(),
+        )
+        .unwrap_err()
+    });
+    assert!(matches!(
+        error,
+        PspShrinkError::DestinationUnsuitable {
+            problem: DestinationProblem::HardLinksUnsupported,
+            ..
+        }
+    ));
+    assert_refused_before_any_work(&scratch, &source, &bytes);
+}
+
+#[test]
+fn permission_storage_read_only_and_other_link_errors_are_told_apart() {
+    for (errno, expected, words) in [
+        (
+            libc::EACCES,
+            DestinationProblem::PermissionDenied,
+            "not allowed",
+        ),
+        (libc::ENOSPC, DestinationProblem::StorageFull, "full"),
+        (libc::EDQUOT, DestinationProblem::StorageFull, "quota"),
+        (libc::EROFS, DestinationProblem::ReadOnly, "read-only"),
+        (libc::EIO, DestinationProblem::Other, "reported an error"),
+    ] {
+        let scratch = Scratch::new();
+        let (source, bytes) = scratch.source();
+        let error = with_link_errno(errno, || {
+            convert_psp_iso_to_cso(
+                &source,
+                &scratch.output(),
+                &reference(),
+                &scratch.placement(),
+            )
+            .unwrap_err()
+        });
+        match &error {
+            PspShrinkError::DestinationUnsuitable { problem, .. } => {
+                assert_eq!(*problem, expected, "errno {errno}")
+            }
+            other => panic!("errno {errno}: {other:?}"),
+        }
+        let message = error.to_string();
+        assert!(message.contains(words), "errno {errno}: {message}");
+        assert!(
+            !message.contains("supports hard links"),
+            "errno {errno}: {message}"
+        );
+        assert_refused_before_any_work(&scratch, &source, &bytes);
+    }
+}
+
+#[test]
+fn a_probe_file_that_cannot_be_created_is_a_permission_problem_not_missing_links() {
+    let staging = tempfile::tempdir().unwrap();
+    let missing = staging.path().join("gone");
+    match super::diagnostics::probe_hard_links(&missing).unwrap_err() {
+        PspShrinkError::DestinationUnsuitable { problem, detail } => {
+            assert_ne!(problem, DestinationProblem::HardLinksUnsupported);
+            assert!(detail.contains("creating a probe file"), "{detail}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_real_probe_passes_here_and_removes_only_its_own_two_names() {
+    let staging = tempfile::tempdir().unwrap();
+    let keep = staging.path().join("unrelated.cso");
+    fs::write(&keep, b"keep me").unwrap();
+    super::diagnostics::probe_hard_links(staging.path()).unwrap();
+    let names: Vec<_> = fs::read_dir(staging.path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("unrelated.cso")]);
+    assert_eq!(fs::read(&keep).unwrap(), b"keep me");
+}
+
+#[test]
+fn a_successful_conversion_still_publishes_without_replacing_anything() {
+    let scratch = Scratch::new();
+    let (source, bytes) = scratch.source();
+    let result = convert_psp_iso_to_cso(
+        &source,
+        &scratch.output(),
+        &reference(),
+        &scratch.placement(),
+    )
+    .unwrap();
+    assert!(result.checks.format_valid);
+    assert!(scratch.output().is_file());
+    assert_eq!(fs::read(&source).unwrap(), bytes);
+    assert!(
+        scratch.entries("staging").is_empty(),
+        "probe and stage removed"
+    );
+    let again = convert_psp_iso_to_cso(
+        &source,
+        &scratch.output(),
+        &reference(),
+        &scratch.placement(),
+    );
+    assert!(matches!(again, Err(PspShrinkError::OutputExists(_))));
+}
+
+// R3: untrusted header sizes never panic or wrap (owner 2026-11-25).
+
+fn header_only(total: u64, block_size: u32, align: u8, first_entry: Option<u32>) -> Vec<u8> {
+    let mut out = b"CISO".to_vec();
+    out.extend_from_slice(&24u32.to_le_bytes());
+    out.extend_from_slice(&total.to_le_bytes());
+    out.extend_from_slice(&block_size.to_le_bytes());
+    out.extend_from_slice(&[1, align, 0, 0]);
+    if let Some(entry) = first_entry {
+        out.extend_from_slice(&entry.to_le_bytes());
+    }
+    out
+}
+
+fn classify_bytes(bytes: &[u8]) -> Result<CsoDialect, PspShrinkError> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hostile.cso");
+    fs::write(&path, bytes).unwrap();
+    classify_cso_dialect(&path)
+}
+
+#[test]
+fn overflowing_header_sizes_are_unknown_not_a_panic() {
+    let max = u64::MAX;
+    for (total, label) in [
+        // blocks + 1 overflows.
+        (max, "blocks = u64::MAX"),
+        // (blocks + 1) * 4 overflows.
+        (max - 1, "entries * 4"),
+        (max / 4 + 1, "just past the multiply limit"),
+        // ... + 24 overflows: (blocks + 1) * 4 = u64::MAX - 3.
+        (max / 4 - 1, "header + table"),
+    ] {
+        for first in [None, Some(0), Some(0x7fff_ffff)] {
+            let result = classify_bytes(&header_only(total, 1, 0, first));
+            match result {
+                Ok(CsoDialect::Unknown(reason)) => {
+                    assert!(reason.contains("implausible"), "{label}: {reason}")
+                }
+                other => panic!("{label} {first:?}: {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn the_largest_header_whose_sizes_still_fit_is_classified_without_overflow() {
+    // blocks + 1 = (u64::MAX - 24) / 4: the table end is the largest that fits.
+    let blocks = (u64::MAX - 24) / 4 - 1;
+    let result = classify_bytes(&header_only(blocks, 1, 0, Some(0x7fff_ffff)));
+    assert!(matches!(result, Ok(CsoDialect::Unknown(_))), "{result:?}");
+    // Every alignment, including the largest, with the largest first entry.
+    for align in [0u8, 1, 2, 11, 30, 31, 32, 255] {
+        let result = classify_bytes(&header_only(2048 * 96, 2048, align, Some(0x7fff_ffff)));
+        assert!(
+            matches!(result, Ok(CsoDialect::Unknown(_))),
+            "align {align}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn malformed_headers_are_unknown_or_an_error_never_a_panic() {
+    for bytes in [
+        Vec::new(),
+        b"CISO".to_vec(),
+        header_only(0, 0, 0, Some(0)),
+        header_only(2049, 2048, 0, Some(0)),
+        header_only(2048, 2048, 0, None),
+        {
+            let mut bad = header_only(2048, 2048, 0, Some(0));
+            bad[20] = 2; // version 2
+            bad
+        },
+    ] {
+        let _ = classify_bytes(&bytes);
+    }
+    // Recovery of a hostile "legacy" file is refused, not a panic.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hostile.cso");
+    fs::write(&path, header_only(u64::MAX, 1, 0, Some(0))).unwrap();
+    assert!(confirm_legacy_emuwiz_cso(&path).is_err());
+}
