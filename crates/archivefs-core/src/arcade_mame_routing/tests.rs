@@ -949,7 +949,7 @@ fn settings(global: &str, files: &[(&str, &str)]) -> BiosSettings {
                 )
             })
             .collect(),
-        readconfig_off: Default::default(),
+        changes_reading: Default::default(),
         evidence: BiosSettingsEvidence::default(),
     }
 }
@@ -1252,11 +1252,22 @@ fn readconfig_off_makes_the_layers_above_it_unknown() {
     std::fs::write(mame.join("sf2.ini"), "readconfig 0\n").unwrap();
     let out = "readconfig 1\ninipath $HOME/.mame\nbios \n";
     let s = read_bios_settings(out, Some(home.path())).unwrap();
-    assert!(s.readconfig_off.contains("neogeo"));
+    assert!(s.changes_reading.contains("neogeo"));
     let aof = bios_set("aof", r#"romof="neogeo""#);
     let neo = ["neogeo".to_string()];
     let why = effective_bios_check(&aof, &neo, &s).unwrap_err();
     assert!(why.contains("readconfig"), "{why}");
+    // Measured: the short name `rc 0` stops reading too, and an `inipath`
+    // line in a lower file moves where aof.ini is opened from.
+    for text in ["rc 0\nbios us\n", "inipath /elsewhere\n"] {
+        std::fs::write(mame.join("neogeo.ini"), text).unwrap();
+        let s = read_bios_settings(out, Some(home.path())).unwrap();
+        assert!(effective_bios_check(&aof, &neo, &s).is_err(), "{text:?}");
+    }
+    std::fs::write(mame.join("horizont.ini"), "inipath /elsewhere\n").unwrap();
+    let s = read_bios_settings(out, Some(home.path())).unwrap();
+    assert!(effective_bios_check(&aof, &neo, &s).is_err());
+    std::fs::remove_file(mame.join("horizont.ini")).unwrap();
     // Another set's `readconfig 0` does not reach aof.
     std::fs::remove_file(mame.join("neogeo.ini")).unwrap();
     let s = read_bios_settings(out, Some(home.path())).unwrap();

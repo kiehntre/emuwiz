@@ -745,10 +745,11 @@ pub struct BiosSettings {
     /// that one; a file without a `bios` line is recorded with an empty value
     /// because it still hides later files of the same name.
     pub files: std::collections::BTreeMap<String, (PathBuf, String)>,
-    /// Ini names (as in `files`) whose file sets `readconfig` to anything but
-    /// `1`: MAME then reads no later ini file, so the layers above it are
-    /// unknown (measured with 0.264).
-    pub readconfig_off: std::collections::BTreeSet<String>,
+    /// Ini names (as in `files`) whose file changes which ini files MAME
+    /// reads next: `readconfig` (or its short name `rc`) other than `1` stops
+    /// reading, and an `inipath` line moves where later files are opened
+    /// from. Either way the layers above it are unknown (measured with 0.264).
+    pub changes_reading: std::collections::BTreeSet<String>,
     /// What these settings were read from, to see later whether they changed.
     pub evidence: BiosSettingsEvidence,
 }
@@ -873,7 +874,7 @@ fn read_bios_settings(showconfig: &str, home: Option<&Path>) -> Result<BiosSetti
     let mut settings = BiosSettings {
         global: ini_value(&global),
         files: std::collections::BTreeMap::new(),
-        readconfig_off: std::collections::BTreeSet::new(),
+        changes_reading: std::collections::BTreeSet::new(),
         evidence: BiosSettingsEvidence::default(),
     };
     let mut checked = 0usize;
@@ -958,8 +959,10 @@ fn read_bios_settings(showconfig: &str, home: Option<&Path>) -> Result<BiosSetti
                         })
                         .next_back()
                 };
-                if last("readconfig").is_some_and(|v| v != "1") {
-                    settings.readconfig_off.insert(key.clone());
+                // `rc` is readconfig's short name; any value but 1 counts.
+                let mut readconfig = last("readconfig").into_iter().chain(last("rc"));
+                if readconfig.any(|v| v != "1") || last("inipath").is_some() {
+                    settings.changes_reading.insert(key.clone());
                 }
                 let bios = last("bios").unwrap_or_default();
                 settings.files.insert(key, (path, bios));
@@ -969,7 +972,6 @@ fn read_bios_settings(showconfig: &str, home: Option<&Path>) -> Result<BiosSetti
     Ok(settings)
 }
 
-/// The first token of an ini value without quotes (`"us" # note` -> `us`).
 /// The value of an ini line: a quoted value up to its closing quote, else
 /// the text before an unquoted `#` (MAME 0.264 reads `bios us#x` as `us`),
 /// first word only. A word MAME would read differently can only be a name
@@ -1028,7 +1030,7 @@ fn effective_bios_check(
     }
     let mut stops_reading: Option<String> = None;
     let mut file = |name: &str| {
-        if settings.readconfig_off.contains(name) && stops_reading.is_none() {
+        if settings.changes_reading.contains(name) && stops_reading.is_none() {
             stops_reading = Some(name.to_string());
         }
         settings
@@ -1092,7 +1094,7 @@ fn effective_bios_check(
     }
     if let Some(name) = stops_reading {
         return Err(format!(
-            "{name}.ini turns off reading later settings (readconfig), so which BIOS version applies is not known"
+            "{name}.ini changes which settings MAME reads next (readconfig or inipath), so which BIOS version applies is not known"
         ));
     }
     layers.push((
