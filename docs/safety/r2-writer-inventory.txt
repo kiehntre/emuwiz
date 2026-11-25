@@ -145,11 +145,14 @@ B. Conversion and extraction
    gui/optical_conversion_page.rs:539/:608 and its unified Undo helper :43/:46
    are callers; cli/repair/chd_recovery.rs:211 handles CHD recovery.
 
-9. PSP ISO -> CSO writes directly.
-   core/psp_reversible_shrink.rs:124 convert_psp_iso_to_cso opens a new output
-   at :148, writes compressed data, verifies restored temporary ISO and writes
-   provenance. gui/optical_conversion_page.rs:352 invokes it. It bypasses
-   rename_apply, despite living beside the CHD workflow in the GUI.
+9. PSP ISO -> CSO (ALCHEMY Q1-A) stages on the output's filesystem.
+   core/psp_reversible_shrink.rs convert_psp_iso_to_cso writes only inside
+   <diagnostics>/psp-cso/staging/<id> on the output's filesystem (configured
+   folder, else data dir, else mount-root .emuwiz-diagnostics; diagnostics.rs),
+   publishes by no-clobber hard link after format, EmuWiz-restore and maxcso
+   checks, and on failure renames the stage to failed/<id> (never deleted).
+   gui/optical_conversion_page.rs PspShrinkPageState::convert invokes it. It
+   still bypasses rename_apply/Repair; journal and Undo arrive in Q1-B.
 
 10. Wii U conversion and durable background queue.
     core/wiiu_conversion.rs:717/:734 executes into staging; :807 creates
