@@ -3982,7 +3982,7 @@ fn show_plan(
     }
 }
 
-/// Every approved change, as "old → new", in plan order (D2: the complete
+/// Every approved change, as "old -> new", in plan order (D2: the complete
 /// list the confirmation shows).
 pub(crate) fn approved_changes<'a>(
     plan: &'a OrganisationPlan,
@@ -4000,7 +4000,7 @@ pub(crate) fn approved_changes<'a>(
                     .unwrap_or_default(),
                 false => entry.destination_path.display().to_string(),
             };
-            (entry, format!("{old}  →  {new}"))
+            (entry, format!("{old}  ->  {new}"))
         })
         .collect()
 }

@@ -60,8 +60,8 @@ fn the_confirmation_lists_every_approved_change() {
     assert_eq!(
         lines,
         [
-            "/roms/gbc/a.gbc  →  New (World).gbc",
-            "/roms/gbc/b.gbc  →  New (World).gbc"
+            "/roms/gbc/a.gbc  ->  New (World).gbc",
+            "/roms/gbc/b.gbc  ->  New (World).gbc"
         ]
     );
 }
