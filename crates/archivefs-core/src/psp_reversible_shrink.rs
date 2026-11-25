@@ -51,6 +51,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+mod bounded;
 pub mod diagnostics;
 pub use diagnostics::{
     CONFIGURE_HINT, DiagnosticsPlacement, DiagnosticsRoot, DiagnosticsSource, DiagnosticsUsage,
@@ -237,6 +238,14 @@ enum ValidatorKind {
     /// Unit tests only: an independent reader that disagrees.
     #[cfg(test)]
     TestDisagrees,
+    /// Unit tests only: runs `program args` through the same bounded
+    /// runner as maxcso, with `timeout` instead of the size-based one.
+    #[cfg(test)]
+    TestCommand {
+        program: PathBuf,
+        args: Vec<String>,
+        timeout: std::time::Duration,
+    },
 }
 
 impl IndependentCsoValidator {
@@ -255,16 +264,10 @@ impl IndependentCsoValidator {
         if !path.is_file() {
             return Err(missing("no file"));
         }
-        let output = std::process::Command::new(path)
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map_err(|_| missing("it could not be run"))?;
-        // maxcso 1.13.0 prints its version to stderr and exits 1, so the exit
-        // status is not used; the version line is the identity check.
-        let Some(version) = maxcso_version_line(&output.stdout, &output.stderr) else {
-            return Err(missing("it did not report a maxcso version"));
-        };
+        let mut command = std::process::Command::new(path);
+        command.arg("--version");
+        let version =
+            version_from(command, bounded::VERSION_TIMEOUT).map_err(|why| missing(&why))?;
         Ok(Self {
             kind: ValidatorKind::Maxcso {
                 path: path.to_path_buf(),
@@ -287,21 +290,63 @@ impl IndependentCsoValidator {
             ValidatorKind::TestDisagrees => {
                 "disagreeing test decoder (unit tests only)".to_string()
             }
+            #[cfg(test)]
+            ValidatorKind::TestCommand { program, .. } => {
+                format!("test command {} (unit tests only)", program.display())
+            }
         }
     }
 
-    /// Decodes `cso` into `workdir` and returns the SHA-256 of the result.
-    /// The restored copy is removed before returning.
-    fn restored_sha256(&self, cso: &Path, workdir: &Path) -> Result<String, PspShrinkError> {
+    /// Decodes `cso` (of an `iso_size`-byte ISO) into `workdir` and returns
+    /// the SHA-256 of the result. The restored copy is removed before returning.
+    fn restored_sha256(
+        &self,
+        cso: &Path,
+        workdir: &Path,
+        iso_size: u64,
+    ) -> Result<String, PspShrinkError> {
         match &self.kind {
             ValidatorKind::Maxcso { path, .. } => {
-                independent_restore_sha256_with_maxcso(path, cso, workdir)
+                independent_restore_sha256_with_maxcso(path, cso, workdir, iso_size)
             }
             #[cfg(test)]
             ValidatorKind::TestReference => tests::reference_restore_sha256(cso),
             #[cfg(test)]
             ValidatorKind::TestDisagrees => Ok("0".repeat(64)),
+            #[cfg(test)]
+            ValidatorKind::TestCommand {
+                program,
+                args,
+                timeout,
+            } => {
+                let mut command = std::process::Command::new(program);
+                command.args(args);
+                restore_with_bounded_command(command, &workdir.join(MAXCSO_RESTORE_NAME), *timeout)
+            }
         }
+    }
+}
+
+/// Runs a `--version` command within `timeout` and returns its maxcso
+/// version line, or why there is none.
+fn version_from(
+    command: std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    match bounded::run_bounded(command, timeout) {
+        // maxcso 1.13.0 prints its version to stderr and exits 1, so the exit
+        // status is not used; the version line is the identity check.
+        Ok(finished) => maxcso_version_line(&finished.stdout_tail, &finished.stderr_tail)
+            .ok_or_else(|| "it did not report a maxcso version".to_string()),
+        Err(bounded::BoundedError::Spawn(_)) => Err("it could not be run".to_string()),
+        Err(bounded::BoundedError::Wait(error)) => Err(format!("waiting for it failed: {error}")),
+        Err(bounded::BoundedError::TimedOut {
+            after, reaped, pid, ..
+        }) => Err(format!(
+            "it (process {pid}) did not answer --version within {} s and was stopped{}",
+            after.as_secs(),
+            bounded::not_reaped_note(reaped)
+        )),
     }
 }
 
@@ -603,8 +648,9 @@ fn verify_staged(
     }
 
     // 3. Independent reversibility.
-    let independent_restored_sha256 =
-        validator.restored_sha256(staged, stage).map_err(|error| {
+    let independent_restored_sha256 = validator
+        .restored_sha256(staged, stage, inspection.source_size)
+        .map_err(|error| {
             format!(
                 "independent reversibility ({}): {error}",
                 validator.describe()
@@ -845,10 +891,13 @@ const MAXCSO_RESTORE_NAME: &str = "maxcso-restored.iso";
 /// licence, run as a separate process, never bundled) into `workdir` and
 /// returns the SHA-256 of what it produced. `maxcso` is a pinned absolute
 /// path chosen by the caller (the tool probe), never looked up on PATH.
+/// maxcso gets 120 s plus 1 s per 16 MiB of ISO (`iso_size`) and is stopped
+/// through its own process handle if it takes longer.
 pub fn independent_restore_sha256_with_maxcso(
     maxcso: &Path,
     cso: &Path,
     workdir: &Path,
+    iso_size: u64,
 ) -> Result<String, PspShrinkError> {
     if !maxcso.is_absolute() {
         return Err(PspShrinkError::Verification(
@@ -856,27 +905,63 @@ pub fn independent_restore_sha256_with_maxcso(
         ));
     }
     let restored = workdir.join(MAXCSO_RESTORE_NAME);
-    if restored.exists() {
-        return Err(PspShrinkError::OutputExists(restored));
-    }
-    let status = std::process::Command::new(maxcso)
+    let mut command = std::process::Command::new(maxcso);
+    command
         .arg("--decompress")
         .arg(cso)
         .arg("-o")
-        .arg(&restored)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
-    if !status.success() || !restored.is_file() {
-        let _ = fs::remove_file(&restored);
-        return Err(PspShrinkError::Verification(
-            "maxcso could not decode the CSO".into(),
-        ));
+        .arg(&restored);
+    restore_with_bounded_command(command, &restored, bounded::decompress_timeout(iso_size))
+}
+
+/// Runs a decoder that writes `restored`, within `timeout`, and returns the
+/// SHA-256 of what it wrote. `restored` must not exist beforehand and is
+/// removed afterwards in every case. A failure or timeout is a
+/// `Verification` error carrying the last part of the decoder's stderr.
+fn restore_with_bounded_command(
+    command: std::process::Command,
+    restored: &Path,
+    timeout: std::time::Duration,
+) -> Result<String, PspShrinkError> {
+    if fs::symlink_metadata(restored).is_ok() {
+        return Err(PspShrinkError::OutputExists(restored.to_path_buf()));
     }
-    let digest = hash_reader(&mut File::open(&restored)?);
-    let _ = fs::remove_file(&restored);
-    Ok(digest?)
+    let outcome = bounded::run_bounded(command, timeout);
+    let result = match outcome {
+        Ok(finished) if finished.status.success() && restored.is_file() => File::open(restored)
+            .and_then(|mut file| hash_reader(&mut file))
+            .map_err(PspShrinkError::from),
+        Ok(finished) => Err(PspShrinkError::Verification(format!(
+            "maxcso could not decode the CSO ({}; stderr: {})",
+            finished.status,
+            bounded::tail_text(&finished.stderr_tail)
+        ))),
+        Err(bounded::BoundedError::TimedOut {
+            after,
+            reaped,
+            pid,
+            stderr_tail,
+        }) => Err(PspShrinkError::Verification(format!(
+            "maxcso (process {pid}) did not finish within {} s and was stopped{}; stderr: {}",
+            after.as_secs(),
+            bounded::not_reaped_note(reaped),
+            bounded::tail_text(&stderr_tail)
+        ))),
+        Err(bounded::BoundedError::Spawn(error)) => Err(PspShrinkError::Verification(format!(
+            "maxcso could not be started: {error}"
+        ))),
+        Err(bounded::BoundedError::Wait(error)) => Err(PspShrinkError::Verification(format!(
+            "waiting for maxcso failed: {error}"
+        ))),
+    };
+    match fs::remove_file(restored) {
+        Ok(()) => result,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => result,
+        Err(error) => result.and(Err(PspShrinkError::Verification(format!(
+            "the independently restored copy {} could not be removed: {error}",
+            restored.display()
+        )))),
+    }
 }
 
 /// Which CSO convention a file follows, decided from the header and the

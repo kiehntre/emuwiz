@@ -1090,11 +1090,21 @@ fn legacy_recovery_refuses_a_standard_cso_and_leaves_nothing_behind() {
 
 // R1: hard-link capability of the destination filesystem (owner 2026-11-25).
 
-fn with_link_errno<T>(errno: i32, run: impl FnOnce() -> T) -> T {
-    super::diagnostics::LINK_PROBE_ERRNO.with(|cell| cell.set(Some(errno)));
+fn with_probe_hooks<T>(hooks: super::diagnostics::ProbeHooks, run: impl FnOnce() -> T) -> T {
+    super::diagnostics::PROBE_HOOKS.with(|cell| cell.set(hooks));
     let result = run();
-    super::diagnostics::LINK_PROBE_ERRNO.with(|cell| cell.set(None));
+    super::diagnostics::PROBE_HOOKS.with(|cell| cell.set(Default::default()));
     result
+}
+
+fn with_link_errno<T>(errno: i32, run: impl FnOnce() -> T) -> T {
+    with_probe_hooks(
+        super::diagnostics::ProbeHooks {
+            link: Some(errno),
+            ..Default::default()
+        },
+        run,
+    )
 }
 
 fn assert_refused_before_any_work(scratch: &Scratch, source: &Path, bytes: &[u8]) {
@@ -1205,16 +1215,17 @@ fn permission_storage_read_only_and_other_link_errors_are_told_apart() {
 }
 
 #[test]
-fn a_probe_file_that_cannot_be_created_is_a_permission_problem_not_missing_links() {
+fn a_probe_file_that_cannot_be_created_in_a_missing_folder_is_another_error_not_missing_links() {
     let staging = tempfile::tempdir().unwrap();
     let missing = staging.path().join("gone");
     match super::diagnostics::probe_hard_links(&missing).unwrap_err() {
         PspShrinkError::DestinationUnsuitable { problem, detail } => {
-            assert_ne!(problem, DestinationProblem::HardLinksUnsupported);
+            assert_eq!(problem, DestinationProblem::Other);
             assert!(detail.contains("creating a probe file"), "{detail}");
         }
         other => panic!("{other:?}"),
     }
+    assert!(!missing.exists(), "nothing created");
 }
 
 #[test]
@@ -1341,4 +1352,318 @@ fn malformed_headers_are_unknown_or_an_error_never_a_panic() {
     let path = dir.path().join("hostile.cso");
     fs::write(&path, header_only(u64::MAX, 1, 0, Some(0))).unwrap();
     assert!(confirm_legacy_emuwiz_cso(&path).is_err());
+}
+
+// Probe cleanup (owner 2026-11-25): only this call's own probe files are
+// removed, on every path, and a failed removal is reported.
+
+fn staging_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_failed_sync_removes_the_probe_it_created_and_is_not_missing_links() {
+    let staging = tempfile::tempdir().unwrap();
+    fs::write(staging.path().join("unrelated"), b"keep").unwrap();
+    let hooks = super::diagnostics::ProbeHooks {
+        sync: Some(libc::EIO),
+        ..Default::default()
+    };
+    let error = with_probe_hooks(hooks, || {
+        super::diagnostics::probe_hard_links(staging.path()).unwrap_err()
+    });
+    match error {
+        PspShrinkError::DestinationUnsuitable { problem, detail } => {
+            assert_eq!(problem, DestinationProblem::Other);
+            assert!(detail.contains("syncing the probe file"), "{detail}");
+            assert!(!detail.contains("could not be removed"), "{detail}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(staging_names(staging.path()), vec!["unrelated".to_string()]);
+}
+
+#[test]
+fn a_failed_sync_on_a_full_disk_is_a_storage_problem_and_cleans_up() {
+    let staging = tempfile::tempdir().unwrap();
+    let hooks = super::diagnostics::ProbeHooks {
+        sync: Some(libc::ENOSPC),
+        ..Default::default()
+    };
+    let error = with_probe_hooks(hooks, || {
+        super::diagnostics::probe_hard_links(staging.path()).unwrap_err()
+    });
+    assert!(matches!(
+        error,
+        PspShrinkError::DestinationUnsuitable {
+            problem: DestinationProblem::StorageFull,
+            ..
+        }
+    ));
+    assert!(staging_names(staging.path()).is_empty());
+}
+
+#[test]
+fn enosys_from_link_means_no_hard_links() {
+    let staging = tempfile::tempdir().unwrap();
+    let error = with_link_errno(libc::ENOSYS, || {
+        super::diagnostics::probe_hard_links(staging.path()).unwrap_err()
+    });
+    assert!(matches!(
+        error,
+        PspShrinkError::DestinationUnsuitable {
+            problem: DestinationProblem::HardLinksUnsupported,
+            ..
+        }
+    ));
+    assert!(staging_names(staging.path()).is_empty());
+}
+
+#[test]
+fn a_probe_that_cannot_be_removed_is_reported_not_ignored() {
+    let staging = tempfile::tempdir().unwrap();
+    let hooks = super::diagnostics::ProbeHooks {
+        remove: Some(libc::EBUSY),
+        ..Default::default()
+    };
+    let error = with_probe_hooks(hooks, || {
+        super::diagnostics::probe_hard_links(staging.path()).unwrap_err()
+    });
+    match error {
+        PspShrinkError::DestinationUnsuitable { problem, detail } => {
+            assert_eq!(problem, DestinationProblem::Other);
+            assert!(detail.contains("hard-link check passed"), "{detail}");
+            assert!(detail.contains("could not be removed"), "{detail}");
+            // Both of this call's names are listed: the probe and its link.
+            assert_eq!(detail.matches(".link-probe-").count(), 2, "{detail}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // The hook only simulated the failure; the two names really remain.
+    let left = staging_names(staging.path());
+    assert_eq!(left.len(), 2, "{left:?}");
+    assert!(left.iter().all(|name| name.starts_with(".link-probe-")));
+}
+
+#[test]
+fn a_link_failure_with_a_failed_cleanup_reports_both() {
+    let staging = tempfile::tempdir().unwrap();
+    let hooks = super::diagnostics::ProbeHooks {
+        link: Some(libc::EPERM),
+        remove: Some(libc::EBUSY),
+        ..Default::default()
+    };
+    let error = with_probe_hooks(hooks, || {
+        super::diagnostics::probe_hard_links(staging.path()).unwrap_err()
+    });
+    match error {
+        PspShrinkError::DestinationUnsuitable { problem, detail } => {
+            assert_eq!(problem, DestinationProblem::HardLinksUnsupported);
+            assert!(detail.contains("making a hard link"), "{detail}");
+            // Only the probe was created (the link failed), so only it is listed.
+            assert_eq!(detail.matches(".link-probe-").count(), 1, "{detail}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_staging_folder_the_user_cannot_write_is_a_real_permission_refusal() {
+    if !not_root() {
+        return;
+    }
+    let staging = tempfile::tempdir().unwrap();
+    fs::set_permissions(staging.path(), fs::Permissions::from_mode(0o500)).unwrap();
+    let result = super::diagnostics::probe_hard_links(staging.path());
+    fs::set_permissions(staging.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    match result.unwrap_err() {
+        PspShrinkError::DestinationUnsuitable { problem, detail } => {
+            assert_eq!(problem, DestinationProblem::PermissionDenied, "{detail}");
+            assert!(detail.contains("creating a probe file"), "{detail}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(staging_names(staging.path()).is_empty());
+}
+
+// R4: maxcso runs with a monotonic deadline (owner 2026-11-25).
+
+use super::bounded::{self, BoundedError};
+use std::time::{Duration, Instant};
+
+fn sleep_command(seconds: &str) -> std::process::Command {
+    let mut command = std::process::Command::new("/bin/sleep");
+    command.arg(seconds);
+    command
+}
+
+fn process_is_gone(pid: u32) -> bool {
+    // Gone, or the pid was reused by something that is not our sleep.
+    match fs::read(format!("/proc/{pid}/cmdline")) {
+        Err(_) => true,
+        Ok(cmdline) => !cmdline.starts_with(b"/bin/sleep\0"),
+    }
+}
+
+#[test]
+fn the_approved_timeouts_hold_without_overflow() {
+    assert_eq!(bounded::VERSION_TIMEOUT, Duration::from_secs(10));
+    assert_eq!(bounded::decompress_timeout(0), Duration::from_secs(120));
+    assert_eq!(
+        bounded::decompress_timeout(16 * 1024 * 1024 - 1),
+        Duration::from_secs(120)
+    );
+    assert_eq!(
+        bounded::decompress_timeout(16 * 1024 * 1024),
+        Duration::from_secs(121)
+    );
+    // A full 1.8 GB UMD image: 120 + 107 s.
+    assert_eq!(
+        bounded::decompress_timeout(1_800_000_000),
+        Duration::from_secs(227)
+    );
+    assert_eq!(
+        bounded::decompress_timeout(u64::MAX),
+        Duration::from_secs(120 + u64::MAX / (16 * 1024 * 1024))
+    );
+    // An unrepresentable deadline refuses to start anything.
+    assert!(matches!(
+        bounded::run_bounded(sleep_command("30"), Duration::MAX),
+        Err(BoundedError::Spawn(_))
+    ));
+}
+
+#[test]
+fn a_hung_tool_is_stopped_through_its_own_handle_and_reaped() {
+    // An unrelated process that merely shares the name must survive.
+    let mut bystander = sleep_command("30").spawn().unwrap();
+    let started = Instant::now();
+    let outcome = bounded::run_bounded(sleep_command("30"), Duration::from_millis(300));
+    let elapsed = started.elapsed();
+    let BoundedError::TimedOut {
+        after, reaped, pid, ..
+    } = outcome.unwrap_err()
+    else {
+        panic!("expected a timeout");
+    };
+    assert_eq!(after, Duration::from_millis(300));
+    assert!(reaped, "a sleeping child must be reaped after SIGKILL");
+    assert!(process_is_gone(pid), "pid {pid} is still our sleep");
+    assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    assert!(
+        bystander.try_wait().unwrap().is_none(),
+        "an unrelated process was stopped"
+    );
+    bystander.kill().unwrap();
+    bystander.wait().unwrap();
+}
+
+#[test]
+fn the_version_probe_gives_up_after_its_timeout() {
+    let started = Instant::now();
+    let why = version_from(sleep_command("30"), Duration::from_millis(300)).unwrap_err();
+    assert!(why.contains("did not answer --version within"), "{why}");
+    assert!(why.contains("was stopped"), "{why}");
+    assert!(!why.contains("kernel I/O"), "{why}");
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn large_output_on_both_streams_cannot_deadlock_and_only_the_stderr_tail_is_kept() {
+    // Far more than a 64 KiB pipe buffer on both streams at once.
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg("head -c 300000 /dev/zero; head -c 300000 /dev/zero | tr '\\0' x >&2; echo END >&2");
+    let finished = bounded::run_bounded(command, Duration::from_secs(60)).unwrap();
+    assert!(finished.status.success());
+    assert_eq!(finished.stdout_tail.len(), bounded::TAIL_LIMIT);
+    assert_eq!(finished.stderr_tail.len(), bounded::TAIL_LIMIT);
+    assert!(finished.stderr_tail.ends_with(b"xxxEND\n"));
+}
+
+fn command_validator(program: &str, args: &[&str], timeout: Duration) -> IndependentCsoValidator {
+    IndependentCsoValidator {
+        kind: ValidatorKind::TestCommand {
+            program: PathBuf::from(program),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            timeout,
+        },
+    }
+}
+
+fn failed_entry_report(scratch: &Scratch) -> (PathBuf, String) {
+    let failed = scratch.entries("failed");
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    let report = fs::read_to_string(failed[0].join("diagnostic.json")).unwrap();
+    (failed[0].clone(), report)
+}
+
+#[test]
+fn a_decompress_timeout_publishes_nothing_and_keeps_the_iso_and_the_evidence() {
+    let scratch = Scratch::new();
+    let (source, bytes) = scratch.source();
+    let validator = command_validator("/bin/sleep", &["30"], Duration::from_millis(300));
+    let started = Instant::now();
+    let error =
+        convert_psp_iso_to_cso(&source, &scratch.output(), &validator, &scratch.placement())
+            .unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(30));
+    let message = error.to_string();
+    assert!(
+        matches!(error, PspShrinkError::ConversionFailed { .. }),
+        "{message}"
+    );
+    assert!(message.contains("did not finish within"), "{message}");
+    assert!(!scratch.output().exists(), "nothing published");
+    assert_eq!(fs::read(&source).unwrap(), bytes, "ISO untouched");
+    let (entry, report) = failed_entry_report(&scratch);
+    assert!(entry.join("output.cso").is_file(), "failed CSO kept");
+    assert!(report.contains("did not finish within"), "{report}");
+    assert!(!entry.join("maxcso-restored.iso").exists());
+    assert_eq!(scratch.manifest_lines().len(), 1);
+    assert!(scratch.entries("staging").is_empty());
+}
+
+#[test]
+fn a_failing_decoder_reports_its_stderr_tail_and_publishes_nothing() {
+    let scratch = Scratch::new();
+    let (source, bytes) = scratch.source();
+    let validator = command_validator(
+        "/bin/sh",
+        &["-c", "echo 'bad block 7 at offset 14336' >&2; exit 3"],
+        Duration::from_secs(60),
+    );
+    let error =
+        convert_psp_iso_to_cso(&source, &scratch.output(), &validator, &scratch.placement())
+            .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("bad block 7 at offset 14336"), "{message}");
+    assert!(message.contains("exit status: 3"), "{message}");
+    assert!(!scratch.output().exists());
+    assert_eq!(fs::read(&source).unwrap(), bytes);
+    let (_, report) = failed_entry_report(&scratch);
+    assert!(report.contains("bad block 7 at offset 14336"), "{report}");
+}
+
+#[test]
+fn a_decoder_that_exits_cleanly_without_writing_is_a_failure_too() {
+    let scratch = Scratch::new();
+    let (source, _) = scratch.source();
+    let validator = command_validator("/bin/true", &[], Duration::from_secs(60));
+    let error =
+        convert_psp_iso_to_cso(&source, &scratch.output(), &validator, &scratch.placement())
+            .unwrap_err();
+    assert!(
+        error.to_string().contains("could not decode the CSO"),
+        "{error}"
+    );
+    assert!(!scratch.output().exists());
 }

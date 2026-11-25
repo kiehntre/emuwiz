@@ -104,59 +104,131 @@ fn ensure_private_dir(path: &Path) -> Result<fs::Metadata, PspShrinkError> {
     check_private_dir(path)
 }
 
+/// Test hooks: errnos the probe's steps report instead of calling the real
+/// operation (CI has no FAT or exFAT mount, and sync/unlink failures cannot
+/// be provoked on demand).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ProbeHooks {
+    pub sync: Option<i32>,
+    pub link: Option<i32>,
+    pub remove: Option<i32>,
+}
+
 #[cfg(test)]
 thread_local! {
-    /// Test hook: an errno the hard-link step of the probe reports instead
-    /// of calling `link` (CI has no FAT or exFAT mount).
-    pub(super) static LINK_PROBE_ERRNO: std::cell::Cell<Option<i32>> =
-        const { std::cell::Cell::new(None) };
+    pub(super) static PROBE_HOOKS: std::cell::Cell<ProbeHooks> =
+        const { std::cell::Cell::new(ProbeHooks { sync: None, link: None, remove: None }) };
+}
+
+#[cfg(test)]
+fn hooked(pick: fn(ProbeHooks) -> Option<i32>) -> Option<io::Error> {
+    pick(PROBE_HOOKS.with(std::cell::Cell::get)).map(io::Error::from_raw_os_error)
+}
+
+fn sync_probe(file: &File) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(error) = hooked(|hooks| hooks.sync) {
+        return Err(error);
+    }
+    file.sync_all()
 }
 
 fn link_for_probe(original: &Path, link: &Path) -> io::Result<()> {
     #[cfg(test)]
-    if let Some(errno) = LINK_PROBE_ERRNO.with(std::cell::Cell::get) {
-        return Err(io::Error::from_raw_os_error(errno));
+    if let Some(error) = hooked(|hooks| hooks.link) {
+        return Err(error);
     }
     fs::hard_link(original, link)
 }
 
+fn remove_probe(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(error) = hooked(|hooks| hooks.remove) {
+        return Err(error);
+    }
+    fs::remove_file(path)
+}
+
 fn classify_probe_error(error: &io::Error, linking: bool) -> DestinationProblem {
     match error.raw_os_error() {
-        // FAT/exFAT answer link() with EPERM; others with EOPNOTSUPP. A
-        // failure to create our own probe file is a permission problem instead.
-        Some(libc::EPERM) if linking => DestinationProblem::HardLinksUnsupported,
-        Some(libc::EOPNOTSUPP) | Some(libc::EXDEV) if linking => {
+        // FAT/exFAT answer link() with EPERM; others with EOPNOTSUPP, and a
+        // FUSE filesystem without a link operation with ENOSYS. A failure to
+        // create or sync our own probe file is never "no hard links".
+        Some(libc::EPERM | libc::EOPNOTSUPP | libc::ENOSYS | libc::EXDEV) if linking => {
             DestinationProblem::HardLinksUnsupported
         }
-        Some(libc::EPERM) | Some(libc::EACCES) => DestinationProblem::PermissionDenied,
-        Some(libc::ENOSPC) | Some(libc::EDQUOT) => DestinationProblem::StorageFull,
+        Some(libc::EPERM | libc::EACCES) => DestinationProblem::PermissionDenied,
+        Some(libc::ENOSPC | libc::EDQUOT) => DestinationProblem::StorageFull,
         Some(libc::EROFS) => DestinationProblem::ReadOnly,
         _ => DestinationProblem::Other,
     }
 }
 
 /// Proves the filesystem can make the no-clobber hard link that publication
-/// uses, before any expensive work. Creates a disposable probe file and one
-/// link to it inside the private `staging` folder, then removes exactly
-/// those two names. Nothing else is touched.
+/// uses, before any expensive work. Creates a disposable probe file
+/// (`create_new`, so it is always this call's own) and one link to it inside
+/// the private `staging` folder, then removes exactly the names this call
+/// created, on every path. A removal that fails is reported, never ignored.
 pub(super) fn probe_hard_links(staging: &Path) -> Result<(), PspShrinkError> {
     let id = unique_id();
     let probe = staging.join(format!(".link-probe-{id}"));
     let linked = staging.join(format!(".link-probe-{id}.link"));
-    let unsuitable =
-        |error: io::Error, linking: bool, step: &str| PspShrinkError::DestinationUnsuitable {
-            problem: classify_probe_error(&error, linking),
-            detail: format!("{step} in {}: {error}", staging.display()),
-        };
-    write_new(&probe, b"").map_err(|error| unsuitable(error, false, "creating a probe file"))?;
-    let linked_result = link_for_probe(&probe, &linked);
-    let _ = fs::remove_file(&probe);
-    match linked_result {
-        Ok(()) => {
-            let _ = fs::remove_file(&linked);
-            Ok(())
+    let place = staging.display();
+    let file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe)
+        .map_err(|error| PspShrinkError::DestinationUnsuitable {
+            problem: classify_probe_error(&error, false),
+            detail: format!("creating a probe file in {place}: {error}"),
+        })?;
+    // From here on `probe` is ours and is removed whatever happens.
+    let mut created = vec![probe.clone()];
+    let outcome = match sync_probe(&file) {
+        Err(error) => Err((
+            classify_probe_error(&error, false),
+            format!("syncing the probe file in {place}: {error}"),
+        )),
+        Ok(()) => match link_for_probe(&probe, &linked) {
+            Ok(()) => {
+                created.push(linked.clone());
+                Ok(())
+            }
+            Err(error) => Err((
+                classify_probe_error(&error, true),
+                format!("making a hard link in {place}: {error}"),
+            )),
+        },
+    };
+    drop(file);
+    let leftovers: Vec<String> = created
+        .iter()
+        .filter_map(|path| {
+            remove_probe(path)
+                .err()
+                .map(|error| format!("{}: {error}", path.display()))
+        })
+        .collect();
+    let cleanup = || {
+        format!(
+            "the probe file(s) could not be removed: {}",
+            leftovers.join("; ")
+        )
+    };
+    match outcome {
+        Ok(()) if leftovers.is_empty() => Ok(()),
+        Ok(()) => Err(PspShrinkError::DestinationUnsuitable {
+            problem: DestinationProblem::Other,
+            detail: format!("the hard-link check passed, but {}", cleanup()),
+        }),
+        Err((problem, detail)) if leftovers.is_empty() => {
+            Err(PspShrinkError::DestinationUnsuitable { problem, detail })
         }
-        Err(error) => Err(unsuitable(error, true, "making a hard link")),
+        Err((problem, detail)) => Err(PspShrinkError::DestinationUnsuitable {
+            problem,
+            detail: format!("{detail}; {}", cleanup()),
+        }),
     }
 }
 
