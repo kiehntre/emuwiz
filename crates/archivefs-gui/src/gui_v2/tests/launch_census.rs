@@ -215,8 +215,18 @@ fn real_library_launch_census() {
     if let Some((_, _, _, index)) = picks.first() {
         app.router.current = Route::BrowsePlayGame(app.library.games[*index].archive.id);
         let warm = Instant::now();
+        let mut overrides_loaded = false;
         loop {
             paint(&mut app, &context);
+            // The test app starts with EmulatorReadinessState::default(), whose
+            // emulator path overrides are empty, so MAME (configured only by
+            // override) would never be probed. A real-library census must see
+            // the configured overrides, exactly as App::new loads them.
+            if !overrides_loaded && let Some(w) = app.native_workflows.as_mut() {
+                w.app.emulator_readiness.emulator_setup_overrides =
+                    crate::emulator_setup_overrides::EmulatorPathOverrides::load();
+                overrides_loaded = true;
+            }
             let ready = app.native_workflows.as_ref().is_some_and(|w| {
                 super::super::bg_readiness::EnvSnapshot::capture(&w.app.emulator_readiness)
                     .is_some()

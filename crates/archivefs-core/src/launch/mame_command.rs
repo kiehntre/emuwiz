@@ -261,6 +261,10 @@ pub fn build_mame_command_plan_with_extra(
     let executable = executable.expect("executable exists when no blockers exist");
     let rom_search_path = rom_search_path.expect("ROM search path exists when no blockers exist");
     let set_name = resolution.identity.game_name.trim().to_string();
+    // No -bios and no -noreadconfig: MAME's ini files choose the BIOS
+    // version. Arcade readiness (`arcade_mame_routing::confirm_effective_bios`)
+    // relies on exactly this when it treats other versions' files as
+    // optional; change both together.
     MameCommandPlan {
         command: Some(MameCommand {
             executable: executable.to_path_buf(),

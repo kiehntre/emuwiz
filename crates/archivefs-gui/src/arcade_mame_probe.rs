@@ -55,6 +55,9 @@ pub(crate) struct ArcadeSetProbe {
     pub(crate) extra_rompaths: Vec<PathBuf>,
     /// Lines of the extra-rompath list that were ignored, with the reason.
     pub(crate) extra_diagnostics: Vec<String>,
+    /// BIOS settings the verdict depends on (default-BIOS exemption, kept or
+    /// withdrawn); a change makes the cached verdict be checked again.
+    pub(crate) bios_evidence: Option<archivefs_core::arcade_mame_routing::BiosSettingsEvidence>,
 }
 
 #[derive(Debug, Clone)]
@@ -257,7 +260,15 @@ fn lookup_inner(
                 return Some(Lookup::Done(entry.probe.clone()));
             }
             let now = fingerprint(set_dir, extras, &entry.probe_deps());
-            if now == entry.fingerprint {
+            // Throttled to REVALIDATE_EVERY; re-lists and re-hashes only the
+            // recorded ini folders and files, and only for a verdict that
+            // depends on them.
+            let bios_current = entry
+                .probe
+                .bios_evidence
+                .as_ref()
+                .is_none_or(|evidence| evidence.is_current());
+            if now == entry.fingerprint && bios_current {
                 entry.validated = Instant::now();
                 return Some(Lookup::Done(entry.probe.clone()));
             }
@@ -452,6 +463,7 @@ fn run_job(job: &Job, cancel: &AtomicBool) -> Option<Arc<ArcadeSetProbe>> {
         verdict: probe.verdict,
         extra_rompaths: extras.clone(),
         extra_diagnostics: job.diagnostics.clone(),
+        bios_evidence: probe.bios_evidence,
     });
     if let Ok(mut state) = manager().state.lock() {
         state.inflight.remove(&job.id);

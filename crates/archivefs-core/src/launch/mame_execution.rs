@@ -32,6 +32,9 @@ pub struct MameLaunchRequest {
     /// Additional read-only ROM search paths (default empty), passed after
     /// `rom_search_path`. Re-validated at preflight; never written to.
     pub extra_rompaths: Vec<PathBuf>,
+    /// The MAME BIOS settings the Arcade verdict depends on (default-BIOS
+    /// exemption). Preflight refuses the launch if they changed since.
+    pub default_bios_evidence: Option<crate::arcade_mame_routing::BiosSettingsEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +54,18 @@ pub enum MameLaunchExecutionError {
 pub fn preflight_mame_launch(
     request: &MameLaunchRequest,
 ) -> Result<MameCommand, MameLaunchPreflightError> {
+    if request
+        .default_bios_evidence
+        .as_ref()
+        .is_some_and(|evidence| !evidence.is_current())
+    {
+        return Err(MameLaunchPreflightError {
+            blockers: vec![LaunchBlocker::new(
+                crate::launch::readiness::LaunchBlockerKind::MameSetVerdictUnavailable,
+                "MAME's BIOS settings changed after this set was checked; it is being checked again",
+            )],
+        });
+    }
     let executable = &request.expected_executable;
     let metadata = fs::symlink_metadata(executable).map_err(|_| MameLaunchPreflightError {
         blockers: vec![LaunchBlocker::new(
@@ -209,6 +224,7 @@ mod tests {
             expected_content_identity,
             rom_search_path,
             extra_rompaths: Vec::new(),
+            default_bios_evidence: None,
         }
     }
 
