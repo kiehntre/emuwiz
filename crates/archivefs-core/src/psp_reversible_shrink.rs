@@ -341,11 +341,15 @@ fn version_from(
         Err(bounded::BoundedError::Spawn(_)) => Err("it could not be run".to_string()),
         Err(bounded::BoundedError::Wait(error)) => Err(format!("waiting for it failed: {error}")),
         Err(bounded::BoundedError::TimedOut {
-            after, reaped, pid, ..
+            after,
+            stop_error,
+            reaped,
+            pid,
+            ..
         }) => Err(format!(
-            "it (process {pid}) did not answer --version within {} s and was stopped{}",
+            "it (process {pid}) did not answer --version within {} s{}",
             after.as_secs(),
-            bounded::not_reaped_note(reaped)
+            bounded::stop_summary(stop_error.as_deref(), reaped)
         )),
     }
 }
@@ -938,13 +942,14 @@ fn restore_with_bounded_command(
         ))),
         Err(bounded::BoundedError::TimedOut {
             after,
+            stop_error,
             reaped,
             pid,
             stderr_tail,
         }) => Err(PspShrinkError::Verification(format!(
-            "maxcso (process {pid}) did not finish within {} s and was stopped{}; stderr: {}",
+            "maxcso (process {pid}) did not finish within {} s{}; stderr: {}",
             after.as_secs(),
-            bounded::not_reaped_note(reaped),
+            bounded::stop_summary(stop_error.as_deref(), reaped),
             bounded::tail_text(&stderr_tail)
         ))),
         Err(bounded::BoundedError::Spawn(error)) => Err(PspShrinkError::Verification(format!(
@@ -957,10 +962,18 @@ fn restore_with_bounded_command(
     match fs::remove_file(restored) {
         Ok(()) => result,
         Err(error) if error.kind() == io::ErrorKind::NotFound => result,
-        Err(error) => result.and(Err(PspShrinkError::Verification(format!(
-            "the independently restored copy {} could not be removed: {error}",
-            restored.display()
-        )))),
+        Err(error) => {
+            // Reported on every path, never dropped behind an earlier error.
+            let note = format!(
+                "the independently restored copy {} could not be removed: {error}",
+                restored.display()
+            );
+            Err(PspShrinkError::Verification(match result {
+                Ok(_) => note,
+                Err(PspShrinkError::Verification(message)) => format!("{message}; {note}"),
+                Err(other) => format!("{other}; {note}"),
+            }))
+        }
     }
 }
 

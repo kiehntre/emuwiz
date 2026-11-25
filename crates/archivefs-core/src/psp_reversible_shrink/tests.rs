@@ -1570,8 +1570,8 @@ fn the_version_probe_gives_up_after_its_timeout() {
     let started = Instant::now();
     let why = version_from(sleep_command("30"), Duration::from_millis(300)).unwrap_err();
     assert!(why.contains("did not answer --version within"), "{why}");
-    assert!(why.contains("was stopped"), "{why}");
-    assert!(!why.contains("kernel I/O"), "{why}");
+    assert!(why.contains("sent it SIGKILL and it exited"), "{why}");
+    assert!(!why.contains("may still be running"), "{why}");
     assert!(started.elapsed() < Duration::from_secs(10));
 }
 
@@ -1666,4 +1666,42 @@ fn a_decoder_that_exits_cleanly_without_writing_is_a_failure_too() {
         "{error}"
     );
     assert!(!scratch.output().exists());
+}
+
+#[test]
+fn the_stop_summary_never_claims_more_than_is_known() {
+    let exited = bounded::stop_summary(None, true);
+    assert!(exited.contains("SIGKILL and it exited"), "{exited}");
+    for (stop_error, reaped) in [(None, false), (Some("EPERM"), false)] {
+        let summary = bounded::stop_summary(stop_error, reaped);
+        assert!(summary.contains("may still be running"), "{summary}");
+        assert!(!summary.contains("and it exited"), "{summary}");
+        assert!(!summary.contains("was stopped"), "{summary}");
+    }
+    let failed_but_gone = bounded::stop_summary(Some("EPERM"), true);
+    assert!(
+        failed_but_gone.contains("failed (EPERM)"),
+        "{failed_but_gone}"
+    );
+}
+
+#[test]
+fn a_restored_copy_that_cannot_be_removed_is_reported_with_the_original_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let restored = dir.path().join("maxcso-restored.iso");
+    // The "decoder" leaves a directory where the restored file belongs (so
+    // it cannot be removed as a file), reports an error and exits 3.
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg("mkdir \"$1\"; echo 'bad block 9' >&2; exit 3")
+        .arg("sh")
+        .arg(&restored);
+    let error = restore_with_bounded_command(command, &restored, Duration::from_secs(60))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("bad block 9"), "{error}");
+    assert!(error.contains("exit status: 3"), "{error}");
+    assert!(error.contains("could not be removed"), "{error}");
+    fs::remove_dir(&restored).unwrap();
 }

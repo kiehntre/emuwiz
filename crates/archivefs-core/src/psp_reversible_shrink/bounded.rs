@@ -49,10 +49,12 @@ pub(super) enum BoundedError {
     Spawn(io::Error),
     /// Waiting for the tool failed; it was stopped through its handle.
     Wait(io::Error),
-    /// The deadline passed. The child was sent SIGKILL through its own
-    /// handle; `reaped` says whether it then exited within the grace period.
+    /// The deadline passed. SIGKILL was sent through the child's own handle
+    /// (`stop_error` if even that failed); `reaped` says whether it then
+    /// exited within the grace period.
     TimedOut {
         after: Duration,
+        stop_error: Option<String>,
         reaped: bool,
         pid: u32,
         stderr_tail: Vec<u8>,
@@ -135,7 +137,7 @@ pub(super) fn run_bounded(
                 let now = Instant::now();
                 if now >= deadline {
                     // Our own child, through its own handle: never by name.
-                    let _ = child.kill();
+                    let stop_error = child.kill().err().map(|error| error.to_string());
                     let reap_until = Instant::now() + REAP_GRACE;
                     let reaped = loop {
                         match child.try_wait() {
@@ -149,6 +151,7 @@ pub(super) fn run_bounded(
                     }
                     return Err(BoundedError::TimedOut {
                         after: timeout,
+                        stop_error,
                         reaped,
                         pid,
                         stderr_tail: snapshot(&stderr_tail),
@@ -176,11 +179,18 @@ pub(super) fn tail_text(tail: &[u8]) -> String {
     }
 }
 
-/// The note added when a stopped tool did not exit.
-pub(super) fn not_reaped_note(reaped: bool) -> &'static str {
-    if reaped {
-        ""
-    } else {
-        "; it did not exit after being stopped and may be stuck in kernel I/O, so it may still be running"
+/// What happened when a timed-out tool was stopped, without claiming more
+/// than is known: a process in uninterruptible kernel I/O ignores SIGKILL.
+pub(super) fn stop_summary(stop_error: Option<&str>, reaped: bool) -> String {
+    match (stop_error, reaped) {
+        (None, true) => "; EmuWiz sent it SIGKILL and it exited".to_string(),
+        (None, false) => format!(
+            "; EmuWiz sent it SIGKILL but it had not exited {} s later (it may be stuck in kernel I/O and may still be running)",
+            REAP_GRACE.as_secs()
+        ),
+        (Some(error), true) => format!("; sending it SIGKILL failed ({error}), but it has exited"),
+        (Some(error), false) => {
+            format!("; sending it SIGKILL failed ({error}) and it may still be running")
+        }
     }
 }
