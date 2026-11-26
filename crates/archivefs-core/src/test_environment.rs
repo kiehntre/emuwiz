@@ -15,8 +15,14 @@
 //! debug builds contain none of it.
 //!
 //! * `HOME` and `XDG_RUNTIME_DIR` are set to directories under
-//!   `<target>/<profile>/emuwiz-test-env/<exe>-<pid>` (beside the test binary,
-//!   not under `/tmp`, which sandbox-visibility logic treats as host-only).
+//!   `<target>/<profile>/emuwiz-test-env/<exe>-<pid>-<start>-<n>` (beside the
+//!   test binary, not under `/tmp`, which sandbox-visibility logic treats as
+//!   host-only). The pid alone is not unique: test processes in different PID
+//!   namespaces (containers, sandboxes) that share one build directory can have
+//!   the same pid at the same time. Each tree is therefore owned through a
+//!   sibling `<name>.lock` that its process holds locked (`flock`) for its whole
+//!   life; a tree is only ever removed by its owner, or by a later process that
+//!   has proven the owner gone by taking that lock.
 //! * `XDG_{CONFIG,DATA,CACHE,STATE}_HOME` and `EMUWIZ_DATA_HOME` /
 //!   `EMUWIZ_CONFIG_HOME` are removed, so an inherited override cannot point a
 //!   test back at real data and everything resolves under the private `$HOME`
@@ -68,6 +74,9 @@ struct Isolation {
     root: PathBuf,
     /// False for an adopted tree, which only its creating process may remove.
     owned: bool,
+    /// The locked `<root>.lock` proving this process owns `root`; held (never
+    /// read) until exit. `None` for an adopted tree.
+    _owner_lock: Option<std::fs::File>,
     real_home: Option<PathBuf>,
     sentinels: Vec<(PathBuf, Option<(u64, std::time::SystemTime)>)>,
 }
@@ -139,6 +148,7 @@ pub fn isolate_process_environment() {
             return Some(Isolation {
                 root: adopted,
                 owned: false,
+                _owner_lock: None,
                 real_home,
                 sentinels: Vec::new(),
             });
@@ -174,20 +184,19 @@ pub fn isolate_process_environment() {
                     .map(|profile_dir| profile_dir.join("emuwiz-test-env"))
             })
             .unwrap_or_else(|| std::env::temp_dir().join("emuwiz-test-env"));
-        let root = base.join(format!("{exe}-{}", std::process::id()));
         // The shared parent must be a real directory we can create, never a
-        // symlink someone planted; the per-process root is then created
-        // *exclusively* (after clearing a stale tree left by an earlier process
-        // that happened to have this pid), so we never adopt a pre-existing path.
+        // symlink someone planted. Trees abandoned by processes that died
+        // without running their exit hook are cleared first, but only after
+        // their owner lock proves the owner gone; a live tree - whatever its
+        // pid, in whatever PID namespace - is never touched.
         std::fs::create_dir_all(&base).expect("create the test environment parent");
         assert!(is_real_directory(&base), "{base:?} must not be a symlink");
-        if std::fs::symlink_metadata(&root).is_ok() {
-            // `remove_dir_all` does not follow symlinks, so a planted link is
-            // removed itself, not its target.
-            std::fs::remove_dir_all(&root).expect("clear a stale test environment");
-        }
-        std::fs::create_dir(&root).expect("create the test environment root exclusively");
-        assert!(is_real_directory(&root), "{root:?} must not be a symlink");
+        prune_abandoned_trees(&base);
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let (root, owner_lock) = claim_unique_root(&base, &exe, std::process::id(), started);
         let home = root.join("home");
         let dirs = [
             ("HOME", home.clone()),
@@ -222,6 +231,7 @@ pub fn isolate_process_environment() {
         Some(Isolation {
             root,
             owned: true,
+            _owner_lock: Some(owner_lock),
             real_home,
             sentinels,
         })
@@ -256,6 +266,118 @@ extern "C" fn finish_isolation() {
             .is_some_and(|name| name == "emuwiz-test-env")
     {
         let _ = std::fs::remove_dir_all(&isolation.root);
+        // Still holding the lock: nobody else can be acting on this name.
+        let _ = std::fs::remove_file(owner_lock_path(&isolation.root));
+    }
+}
+
+/// `<base>/<name>.lock` for the tree `<base>/<name>`.
+fn owner_lock_path(root: &Path) -> PathBuf {
+    let mut name = root.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    root.with_file_name(name)
+}
+
+/// Whether the open `file` is still the file at `path` (same device and
+/// inode, not following a final symlink): a lock on an unlinked or replaced
+/// file proves nothing about the name.
+fn still_named(file: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::symlink_metadata(path)) {
+        (Ok(open), Ok(named)) => {
+            named.file_type().is_file() && open.dev() == named.dev() && open.ino() == named.ino()
+        }
+        _ => false,
+    }
+}
+
+fn try_lock(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `flock` on a descriptor this function borrows for the call.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+/// Creates and locks a fresh `<name>.lock`, then the tree `<name>`, with a
+/// name no other process can hold: `<exe>-<pid>-<started>-<n>`, where the
+/// lock file is created exclusively. The lock is taken *before* the tree
+/// exists, so a pruner can never see an unlocked tree that is about to be used.
+fn claim_unique_root(base: &Path, exe: &str, pid: u32, started: u128) -> (PathBuf, std::fs::File) {
+    use std::os::unix::fs::OpenOptionsExt;
+    for attempt in 0..1024u32 {
+        let root = base.join(format!("{exe}-{pid}-{started:x}-{attempt}"));
+        let lock_path = owner_lock_path(&root);
+        let lock = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&lock_path)
+        {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create the test environment lock {lock_path:?}: {error}"),
+        };
+        // A pruner may have taken (and unlinked) the brand-new lock between
+        // the create and this flock; then the name is not ours: try the next.
+        if !try_lock(&lock) || !still_named(&lock, &lock_path) {
+            continue;
+        }
+        match std::fs::create_dir(&root) {
+            Ok(()) => {
+                assert!(is_real_directory(&root), "{root:?} must not be a symlink");
+                return (root, lock);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Something already sits at a name whose lock we just
+                // created: never adopt it. Give the name back, try the next.
+                let _ = std::fs::remove_file(&lock_path);
+            }
+            Err(error) => panic!("create the test environment root {root:?}: {error}"),
+        }
+    }
+    panic!("no free test environment name under {base:?}");
+}
+
+/// Removes trees whose owner is proven gone: their `<name>.lock` is a regular
+/// file (never a symlink) that this process can lock, and is still the file
+/// at that name. A held lock means a live owner, in any PID namespace, and the
+/// tree is left alone; so is anything without a lock (for example trees from
+/// older test binaries), which cannot be proven abandoned.
+fn prune_abandoned_trees(base: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let lock_path = entry.path();
+        let Some(stem) = lock_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".lock"))
+        else {
+            continue;
+        };
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let Ok(lock) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&lock_path)
+        else {
+            continue;
+        };
+        if !try_lock(&lock) || !still_named(&lock, &lock_path) {
+            continue;
+        }
+        let root = base.join(stem);
+        if is_real_directory(&root) {
+            let _ = std::fs::remove_dir_all(&root);
+        } else if std::fs::symlink_metadata(&root).is_ok() {
+            // A planted link (or file) is removed itself, never its target.
+            let _ = std::fs::remove_file(&root);
+        }
+        let _ = std::fs::remove_file(&lock_path);
     }
 }
 
@@ -296,6 +418,47 @@ pub fn private_home_for_fixtures() -> PathBuf {
         "HOME {home:?} is outside the isolated tree {root:?}"
     );
     home
+}
+
+/// This binary's test environment trees belonging to process `pid` (any
+/// start), beside this process's own tree. For a parent that re-executed this
+/// test binary as a child: the child's tree name is not predictable, but it
+/// always starts `<exe>-<pid>-`.
+pub fn trees_of_process(pid: u32) -> Vec<PathBuf> {
+    let Some(root) = isolated_root() else {
+        return Vec::new();
+    };
+    let (Some(base), Some(name)) = (root.parent(), root.file_name().and_then(|n| n.to_str()))
+    else {
+        return Vec::new();
+    };
+    // Only a tree this process created names its pid; an adopted one does not.
+    let Some(at) = name.rfind(&format!("-{}-", std::process::id())) else {
+        return Vec::new();
+    };
+    let wanted = format!("{}-{pid}-", &name[..at]);
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&wanted) && !name.ends_with(".lock"))
+        })
+        .collect()
+}
+
+/// Removes every test environment tree beside this process's own whose owner
+/// is proven gone (its owner lock can be taken). For a parent that killed or
+/// reaped a re-executed child, whose exit hook may not have run. A live
+/// tree, in any PID namespace, is never touched.
+pub fn clear_abandoned_test_environments() {
+    if let Some(base) = isolated_root().and_then(Path::parent) {
+        prune_abandoned_trees(base);
+    }
 }
 
 /// Variables that are removed so they cannot redirect a test to real data.
@@ -450,6 +613,87 @@ mod tests {
             .map(|home| stat(&home.join(".local/share/archivefs/rom_organisation_approvals.json")));
         assert_eq!(before, after);
         std::fs::remove_file(&sidecar).unwrap();
+    }
+
+    fn scratch_base(name: &str) -> PathBuf {
+        let base = isolated_root()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("ownership-{name}"))
+            .join("emuwiz-test-env");
+        let _ = std::fs::remove_dir_all(base.parent().unwrap());
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[test]
+    fn the_same_pid_in_two_pid_namespaces_gets_two_distinct_live_trees() {
+        let base = scratch_base("same-pid");
+        // Two processes that both see themselves as pid 2, started together.
+        let (first, first_lock) = claim_unique_root(&base, "suite", 2, 7);
+        let (second, second_lock) = claim_unique_root(&base, "suite", 2, 7);
+        assert_ne!(first, second);
+        std::fs::write(first.join("live.txt"), "first").unwrap();
+        // The second process's start-up clean-up must not touch the first.
+        prune_abandoned_trees(&base);
+        assert_eq!(
+            std::fs::read_to_string(first.join("live.txt")).unwrap(),
+            "first"
+        );
+        assert!(is_real_directory(&second));
+        drop((first_lock, second_lock));
+        std::fs::remove_dir_all(base.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn only_a_tree_whose_owner_is_gone_is_pruned() {
+        let base = scratch_base("abandoned");
+        let (live, live_lock) = claim_unique_root(&base, "suite", 10, 1);
+        let (dead, dead_lock) = claim_unique_root(&base, "suite", 11, 1);
+        std::fs::write(dead.join("left-behind.txt"), "x").unwrap();
+        drop(dead_lock); // the owner died without its exit hook
+        prune_abandoned_trees(&base);
+        assert!(is_real_directory(&live));
+        assert!(owner_lock_path(&live).exists());
+        assert!(!dead.exists(), "{dead:?} should have been pruned");
+        assert!(!owner_lock_path(&dead).exists());
+        drop(live_lock);
+        std::fs::remove_dir_all(base.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn trees_without_a_provable_owner_lock_are_left_alone() {
+        let base = scratch_base("unprovable");
+        // A tree from an older test binary (no lock), and a planted symlink
+        // lock pointing at an unlocked file elsewhere.
+        let legacy = base.join("suite-42");
+        std::fs::create_dir_all(legacy.join("home")).unwrap();
+        let elsewhere = base.parent().unwrap().join("elsewhere.lock");
+        std::fs::write(&elsewhere, "").unwrap();
+        let planted = base.join("suite-43");
+        std::fs::create_dir_all(&planted).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, base.join("suite-43.lock")).unwrap();
+        prune_abandoned_trees(&base);
+        assert!(is_real_directory(&legacy.join("home")));
+        assert!(is_real_directory(&planted));
+        assert!(elsewhere.exists());
+        std::fs::remove_dir_all(base.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn this_process_holds_the_lock_on_its_own_tree() {
+        let Some(root) = isolated() else { return };
+        let Some(Some(isolation)) = ISOLATION.get() else {
+            return;
+        };
+        if !isolation.owned {
+            return;
+        }
+        let lock = std::fs::File::open(owner_lock_path(root)).unwrap();
+        assert!(
+            !try_lock(&lock),
+            "the owner lock must be held for the process lifetime"
+        );
     }
 
     #[test]

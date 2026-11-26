@@ -397,13 +397,15 @@ fn recorder_bounds_oversized_headers_and_counts_the_connection() {
 fn parent_deadline_kills_and_reaps_a_stalled_child() {
     let mut child = ManagedChild::spawn(&mut command("hang")).unwrap();
     let reaped = child.reaped.clone();
-    let isolation_root = child.isolation_root.clone();
+    let isolated_child = child.isolated_child;
     let start = Instant::now();
     let error = child.wait(Duration::from_millis(100)).err().unwrap();
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     assert!(start.elapsed() < Duration::from_secs(2));
     assert!(reaped.load(Ordering::SeqCst));
-    assert!(isolation_root.is_none_or(|root| !root.exists()));
+    assert!(
+        isolated_child.is_none_or(|pid| crate::test_environment::trees_of_process(pid).is_empty())
+    );
 }
 
 #[test]
@@ -416,7 +418,7 @@ fn panic_cleanup_joins_listeners_closes_sockets_and_reaps_the_child() {
     server.wait_for_connection();
     let child = ManagedChild::spawn(&mut command("hang")).unwrap();
     let reaped = child.reaped.clone();
-    let isolation_root = child.isolation_root.clone();
+    let isolated_child = child.isolated_child;
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let _server = server;
         let _child = child;
@@ -425,7 +427,9 @@ fn panic_cleanup_joins_listeners_closes_sockets_and_reaps_the_child() {
     assert!(panic.is_err());
     assert!(joined.load(Ordering::SeqCst));
     assert!(reaped.load(Ordering::SeqCst));
-    assert!(isolation_root.is_none_or(|root| !root.exists()));
+    assert!(
+        isolated_child.is_none_or(|pid| crate::test_environment::trees_of_process(pid).is_empty())
+    );
     drop(stream);
     // Connection refusal proves the listener is closed without depending on
     // platform-specific TIME_WAIT rules for rebinding an accepted socket.
@@ -441,7 +445,7 @@ fn child_assertion_failure_also_cleans_up_the_parent_fixtures() {
     let joined = server.joined.clone();
     let mut child = ManagedChild::spawn(&mut command("panic")).unwrap();
     let reaped = child.reaped.clone();
-    let isolation_root = child.isolation_root.clone();
+    let isolated_child = child.isolated_child;
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let _server = server;
         let output = child.wait(CHILD_DEADLINE).unwrap();
@@ -450,5 +454,7 @@ fn child_assertion_failure_also_cleans_up_the_parent_fixtures() {
     assert!(panic.is_err());
     assert!(joined.load(Ordering::SeqCst));
     assert!(reaped.load(Ordering::SeqCst));
-    assert!(isolation_root.is_none_or(|root| !root.exists()));
+    assert!(
+        isolated_child.is_none_or(|pid| crate::test_environment::trees_of_process(pid).is_empty())
+    );
 }
