@@ -19,7 +19,8 @@ use archivefs_core::dat::rename_apply::{
     RenameTransaction, RollbackOutcome, RollbackResult, rollback_transaction,
 };
 use archivefs_core::psp_reversible_shrink::{
-    PspShrinkInspection, PspShrinkResult, PspShrinkTrust, convert_psp_iso_to_cso, inspect_psp_iso,
+    DiagnosticsPlacement, EmulatorCompatibility, IndependentCsoValidator, PspShrinkError,
+    PspShrinkInspection, PspShrinkResult, convert_psp_iso_to_cso, inspect_psp_iso,
 };
 use archivefs_core::repair::{
     ChdConversionError, ChdConversionPlan, ChdConversionResult, ChdConversionSourceMode,
@@ -338,7 +339,18 @@ impl PspShrinkPageState {
     }
 
     fn convert(&mut self) {
+        self.convert_with(IndependentCsoValidator::locate(), diagnostics_placement());
+    }
+
+    /// The conversion with its two environment inputs resolved by the
+    /// caller, so tests never read the real configuration or tool paths.
+    fn convert_with(
+        &mut self,
+        validator: Result<IndependentCsoValidator, PspShrinkError>,
+        placement: Result<DiagnosticsPlacement, String>,
+    ) {
         self.error = None;
+        self.result = None;
         let source = PathBuf::from(self.source_draft.trim());
         let output = PathBuf::from(self.output_draft.trim());
         if self.inspection.is_none() {
@@ -349,21 +361,76 @@ impl PspShrinkPageState {
             self.error = Some("Choose an output destination first.".into());
             return;
         }
-        match convert_psp_iso_to_cso(&source, &output) {
-            Ok(result) => self.result = Some(result),
+        if std::fs::symlink_metadata(&output).is_ok() {
+            self.error = Some(overwrite_refusal(&output));
+            return;
+        }
+        // The configuration is checked before the validator so each refusal
+        // has its own reachable branch (both refuse before anything is written).
+        let placement = match placement {
+            Ok(placement) => placement,
             Err(error) => {
-                self.error = Some(match error {
-                    archivefs_core::psp_reversible_shrink::PspShrinkError::OutputExists(path) => {
-                        format!(
-                            "EmuWiz will not overwrite the existing file: {}. Choose another destination or remove it yourself.",
-                            path.display()
-                        )
-                    }
-                    other => other.to_string(),
-                })
+                self.error = Some(format!(
+                    "EmuWiz could not read the configured game folders, so it cannot choose a safe place for conversion evidence. Nothing was written. {error}"
+                ));
+                return;
             }
+        };
+        let validator = match validator {
+            Ok(validator) => validator,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                return;
+            }
+        };
+        match convert_psp_iso_to_cso(&source, &output, &validator, &placement) {
+            Ok(result) => self.result = Some(result),
+            Err(PspShrinkError::OutputExists(path)) => self.error = Some(overwrite_refusal(&path)),
+            Err(other) => self.error = Some(other.to_string()),
         }
     }
+}
+
+fn overwrite_refusal(path: &Path) -> String {
+    format!(
+        "EmuWiz will not overwrite the existing file: {}. Choose another destination or remove it yourself.",
+        path.display()
+    )
+}
+
+/// One absolute path per line (blank lines and `#` comments ignored) in the
+/// EmuWiz configuration folder: the user's own diagnostics folders, tried
+/// first. A scratch profile's configuration folder holds its own copy.
+pub(crate) const CSO_DIAGNOSTICS_DIRS_FILE: &str = "cso-diagnostics-dirs.txt";
+
+/// The diagnostics preferences in the owner-approved order: configured
+/// folders, then the EmuWiz data folder, then the disk's top folder where
+/// that is already safely writable. Fails closed when the full list of game
+/// source folders (enabled and disabled) is not known.
+fn diagnostics_placement() -> Result<DiagnosticsPlacement, String> {
+    let config = crate::Config::load_default().map_err(|error| error.to_string())?;
+    let source_folders = config
+        .configured_source_roots
+        .clone()
+        .ok_or("the complete list of game folders is not known")?;
+    let config_dir = archivefs_core::app_dirs::config_dir().map_err(|error| error.to_string())?;
+    let configured_dirs = match std::fs::read_to_string(config_dir.join(CSO_DIAGNOSTICS_DIRS_FILE))
+    {
+        Ok(text) => text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(PathBuf::from)
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(format!("{CSO_DIAGNOSTICS_DIRS_FILE}: {error}")),
+    };
+    Ok(DiagnosticsPlacement {
+        source_folders,
+        configured_dirs,
+        data_dir: archivefs_core::app_dirs::data_dir().ok(),
+        allow_mount_root: true,
+    })
 }
 
 impl Default for OpticalConversionPageState {
@@ -1668,29 +1735,29 @@ fn show_psp_shrink_card(ui: &mut egui::Ui, state: &mut PspShrinkPageState) {
                 .inspection
                 .source_size
                 .saturating_sub(compressed_size);
-            let verified = result.trust == PspShrinkTrust::ReversibleVerified;
-            widgets::status_badge(
-                ui,
-                if verified {
-                    "Verified reversible"
-                } else {
-                    "Verification failed"
-                },
-                if verified {
-                    widgets::StatusTone::Success
-                } else {
-                    widgets::StatusTone::Blocked
-                },
-            );
+            // A result exists only when every publication check passed; the
+            // four results are still shown separately.
+            widgets::status_badge(ui, "Verified reversible", widgets::StatusTone::Success);
             ui.label(format!(
                 "CSO · {} · saved {}",
                 widgets::format_size(Some(compressed_size)),
                 widgets::format_size(Some(saved))
             ));
-            ui.label(if verified {
-                "The restored ISO matched the original byte-for-byte. Original unchanged."
+            let checks = &result.checks;
+            ui.label(if checks.format_valid {
+                "Format: standard CSO v1."
             } else {
-                "The restored ISO did not match the original. This result is not trusted."
+                "Format: not confirmed."
+            });
+            ui.label("Content: EmuWiz restored the original byte-for-byte. Original unchanged.");
+            ui.label(format!(
+                "Independent check: {} restored the original byte-for-byte.",
+                checks.independent_validator
+            ));
+            ui.label(match checks.emulator_compatibility {
+                EmulatorCompatibility::NotTested => {
+                    "Emulator compatibility: not tested yet. Try the game before relying on this copy."
+                }
             });
             widgets::technical_details(ui, ("psp-reversible-shrink-result",), |ui| {
                 ui.label(format!("Original: {}", result.inspection.source.display()));
@@ -1700,8 +1767,12 @@ fn show_psp_shrink_card(ui: &mut egui::Ui, state: &mut PspShrinkPageState) {
                     result.provenance.source_sha256
                 ));
                 ui.label(format!(
-                    "Restored SHA-256: {}",
-                    result.restored_sha256.as_deref().unwrap_or("not available")
+                    "Restored SHA-256 (EmuWiz): {}",
+                    result.checks.emuwiz_restored_sha256
+                ));
+                ui.label(format!(
+                    "Restored SHA-256 (independent): {}",
+                    result.checks.independent_restored_sha256
                 ));
                 ui.label(format!("Format: {}", result.provenance.format));
             });
@@ -2885,47 +2956,137 @@ mod tests {
         );
     }
 
-    #[test]
-    fn psp_preview_and_conversion_preserve_source_and_report_reversible_verification() {
-        let directory = tempfile::tempdir().unwrap();
-        let source = psp_fixture(directory.path());
-        let before = std::fs::read(&source).unwrap();
-        let output = directory.path().join("result.cso");
+    /// A scratch placement: diagnostics under the private temp root, the
+    /// fixture folder configured as a game source. Never the real config.
+    fn psp_scratch(directory: &Path) -> (PathBuf, PathBuf, DiagnosticsPlacement) {
+        let root = std::fs::canonicalize(directory).unwrap();
+        let games = root.join("games");
+        let out = root.join("out");
+        std::fs::create_dir(&games).unwrap();
+        std::fs::create_dir(&out).unwrap();
+        let diagnostics = root.join("diagnostics");
+        std::fs::create_dir(&diagnostics).unwrap();
+        // Private, as the diagnostics guard requires (umask may leave it
+        // group-writable).
+        std::fs::set_permissions(
+            &diagnostics,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let placement = DiagnosticsPlacement {
+            source_folders: vec![games.clone()],
+            configured_dirs: vec![diagnostics],
+            data_dir: None,
+            allow_mount_root: false,
+        };
+        (psp_fixture(&games), out.join("result.cso"), placement)
+    }
+
+    fn psp_state(source: &Path, output: &Path) -> PspShrinkPageState {
         let mut state = PspShrinkPageState {
             source_draft: source.display().to_string(),
             output_draft: output.display().to_string(),
             ..Default::default()
         };
         state.inspect();
+        state
+    }
+
+    #[test]
+    fn psp_conversion_reports_four_separate_results_when_maxcso_is_installed() {
+        let validator = match IndependentCsoValidator::locate() {
+            Ok(validator) => validator,
+            Err(error) => {
+                eprintln!("SKIPPED: {error}");
+                return;
+            }
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let (source, output, placement) = psp_scratch(directory.path());
+        let before = std::fs::read(&source).unwrap();
+        let mut state = psp_state(&source, &output);
+        state.convert_with(Ok(validator), Ok(placement));
+        assert!(state.error.is_none(), "{:?}", state.error);
+        let checks = &state.result.as_ref().unwrap().checks;
+        assert!(checks.format_valid);
         assert_eq!(
-            state.inspection.as_ref().unwrap().source_size,
-            before.len() as u64
+            checks.emuwiz_restored_sha256,
+            checks.independent_restored_sha256
         );
-        state.convert();
-        let result = state.result.as_ref().unwrap();
-        assert_eq!(result.trust, PspShrinkTrust::ReversibleVerified);
         assert_eq!(
-            result.provenance.source_sha256,
-            result.restored_sha256.clone().unwrap()
+            checks.emulator_compatibility,
+            EmulatorCompatibility::NotTested
         );
         assert_eq!(std::fs::read(&source).unwrap(), before);
-        assert!(state.error.is_none());
+        let context = egui::Context::default();
+        let rendered = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| show_psp_shrink_card(ui, &mut state));
+        });
+        assert!(rendered_text_contains(&rendered, "Independent check:"));
+        assert!(rendered_text_contains(
+            &rendered,
+            "Emulator compatibility: not tested"
+        ));
+    }
+
+    #[test]
+    fn psp_conversion_is_refused_without_an_independent_validator() {
+        let directory = tempfile::tempdir().unwrap();
+        let (source, output, placement) = psp_scratch(directory.path());
+        let mut state = psp_state(&source, &output);
+        state.convert_with(
+            IndependentCsoValidator::maxcso_at(Path::new("/nonexistent/maxcso")),
+            Ok(placement),
+        );
+        let error = state.error.as_deref().unwrap();
+        assert!(error.contains("independent validator"), "{error}");
+        assert!(error.contains("Nothing was written"), "{error}");
+        assert!(state.result.is_none());
+        assert!(!output.exists());
+        assert!(
+            !directory
+                .path()
+                .join("diagnostics")
+                .join("psp-cso")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn psp_conversion_is_refused_when_the_game_folders_cannot_be_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let (source, output, _) = psp_scratch(directory.path());
+        let mut state = psp_state(&source, &output);
+        state.convert_with(
+            IndependentCsoValidator::maxcso_at(Path::new("/nonexistent/maxcso")),
+            Err("no configuration".into()),
+        );
+        // The configuration is checked first, so this reaches the
+        // configuration branch even though no validator exists either (the
+        // missing-validator refusal has its own test with a valid placement).
+        let error = state.error.as_deref().unwrap();
+        assert!(
+            error.contains("could not read the configured game folders"),
+            "{error}"
+        );
+        assert!(error.contains("no configuration"), "{error}");
+        assert!(error.contains("Nothing was written"), "{error}");
+        assert!(!error.contains("independent validator"), "{error}");
+        assert!(state.result.is_none());
+        assert!(!output.exists());
     }
 
     #[test]
     fn psp_existing_output_is_refused_without_touching_source() {
         let directory = tempfile::tempdir().unwrap();
-        let source = psp_fixture(directory.path());
-        let output = directory.path().join("existing.cso");
+        let (source, output, placement) = psp_scratch(directory.path());
         std::fs::write(&output, b"keep this output").unwrap();
         let before = std::fs::read(&source).unwrap();
-        let mut state = PspShrinkPageState {
-            source_draft: source.display().to_string(),
-            output_draft: output.display().to_string(),
-            ..Default::default()
-        };
-        state.inspect();
-        state.convert();
+        let mut state = psp_state(&source, &output);
+        state.convert_with(
+            IndependentCsoValidator::maxcso_at(Path::new("/nonexistent/maxcso")),
+            Ok(placement),
+        );
         assert!(state.result.is_none());
         assert!(
             state
