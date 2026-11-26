@@ -178,6 +178,8 @@ fn a_short_window_puts_quick_actions_and_facts_before_the_long_notes() {
     let context = egui::Context::default();
     let mut app = blue_app(&context, vec![archive(7, "Fixture", Some("PSX"))], 7);
     app.detail = Some(checked(7, true));
+    super::own_library_database();
+    super::settle_verification_guidance(&context, &mut app, [1024.0, 600.0]);
     let short = settled(&context, &mut app, [1024.0, 600.0]);
     assert_first_screen(&short, [1024.0, 600.0], "Play");
     let tall = settled(&context, &mut app, [1024.0, 1600.0]);

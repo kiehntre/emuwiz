@@ -171,6 +171,17 @@ impl State {
         self.result = result;
     }
 
+    /// Test-only: wait for the running worker's answer and take it, exactly
+    /// as `poll` would once it arrives. Bounded by the worker itself, which
+    /// always either sends its result or hangs up (then: unavailable). No
+    /// sleeping, no timeout.
+    #[cfg(test)]
+    pub(super) fn finish_for_test(&mut self) {
+        if let Some(receiver) = self.receiver.take() {
+            self.result = Some(receiver.recv().unwrap_or_else(|_| unavailable()));
+        }
+    }
+
     /// This panel's finished result for `game`, if it has one.
     pub(super) fn result_for(&self, game: i64) -> Option<&Guidance> {
         (self.game == Some(game))
