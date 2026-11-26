@@ -607,46 +607,171 @@ impl Database {
             .next()
             .map_err(|error| db_error("failed to read verified DAT name", error))?
         {
-            let read = |error| db_error("failed to read verified DAT name", error);
-            let dat_source_id: String = row.get(0).map_err(read)?;
-            let bytes: Vec<u8> = row.get(1).map_err(read)?;
-            let size_bytes: Option<i64> = row.get(2).map_err(read)?;
-            let platform: Option<String> = row.get(3).map_err(read)?;
-            let path_bytes: Vec<u8> = row.get(4).map_err(read)?;
-            let marked_stale: bool = row.get(5).map_err(read)?;
-            let library_missing: bool = row.get(6).map_err(read)?;
-            let saved_verdict: String = row.get(7).map_err(read)?;
             // Unreadable saved evidence is never a name; it is reported.
-            let Ok(saved) = serde_json::from_slice::<
-                crate::dat::library_identity_summary::PersistedLibraryDatIdentity,
-            >(&bytes) else {
-                return Ok(VerifiedDatName::NotUsable(
-                    "the saved check for this game is unreadable".into(),
-                ));
+            let Some((name_row, _)) = judge_name_row(row, catalogues)? else {
+                return Ok(VerifiedDatName::NotUsable(UNREADABLE_SAVED_CHECK.into()));
             };
-            let path = PathBuf::from(std::ffi::OsString::from_vec(path_bytes));
-            let (status, _) = judge_saved_row(
-                &saved,
-                &SavedRowInputs {
-                    source_id: &dat_source_id,
-                    source: catalogues.get(&dat_source_id),
-                    path: &path,
-                    size_bytes,
-                    platform: platform.as_deref(),
-                    marked_stale,
-                    library_missing,
-                },
-            );
-            judged.push(SavedDatNameRow {
-                dat_source_id,
-                status,
-                saved_verdict,
-                canonical_rom_name: saved.canonical.canonical_rom_name.clone(),
-                canonical_dat_name: saved.canonical.canonical_dat_name.clone(),
-                through_archive_member: saved.archive_member.is_some(),
-            });
+            judged.push(name_row);
         }
         Ok(decide_verified_dat_name(&judged))
+    }
+}
+
+const UNREADABLE_SAVED_CHECK: &str = "the saved check for this game is unreadable";
+
+/// The columns both verified-name queries select, in this order.
+const NAME_ROW_COLUMNS: &str = "d.dat_source_id, d.facts_json, a.size_bytes, p.platform, \
+     a.absolute_path_cached, d.revision_marked_stale, a.last_verified_missing_at IS NOT NULL, \
+     d.verification_state";
+
+/// One joined saved row judged by the rename name rule, with the SHA-1 the
+/// saved check recorded for the item's own file (`audited_hashes`: for a zip
+/// the outer archive, for a headered ROM the whole file; never the matched
+/// member or headerless hash). `None`: the saved evidence is unreadable.
+fn judge_name_row(
+    row: &rusqlite::Row<'_>,
+    catalogues: &HashMap<String, ConfiguredCatalogue>,
+) -> Result<Option<(SavedDatNameRow, Option<String>)>> {
+    let read = |error| db_error("failed to read verified DAT name", error);
+    let dat_source_id: String = row.get(0).map_err(read)?;
+    let bytes: Vec<u8> = row.get(1).map_err(read)?;
+    let size_bytes: Option<i64> = row.get(2).map_err(read)?;
+    let platform: Option<String> = row.get(3).map_err(read)?;
+    let path_bytes: Vec<u8> = row.get(4).map_err(read)?;
+    let marked_stale: bool = row.get(5).map_err(read)?;
+    let library_missing: bool = row.get(6).map_err(read)?;
+    let saved_verdict: String = row.get(7).map_err(read)?;
+    let Ok(saved) = serde_json::from_slice::<
+        crate::dat::library_identity_summary::PersistedLibraryDatIdentity,
+    >(&bytes) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(std::ffi::OsString::from_vec(path_bytes));
+    let (status, _) = judge_saved_row(
+        &saved,
+        &SavedRowInputs {
+            source_id: &dat_source_id,
+            source: catalogues.get(&dat_source_id),
+            path: &path,
+            size_bytes,
+            platform: platform.as_deref(),
+            marked_stale,
+            library_missing,
+        },
+    );
+    let raw_sha1 = saved.audited_hashes.sha1.clone();
+    Ok(Some((
+        SavedDatNameRow {
+            dat_source_id,
+            status,
+            saved_verdict,
+            canonical_rom_name: saved.canonical.canonical_rom_name.clone(),
+            canonical_dat_name: saved.canonical.canonical_dat_name.clone(),
+            through_archive_member: saved.archive_member.is_some(),
+        },
+        raw_sha1,
+    )))
+}
+
+/// [`VerifiedDatName`] for one item from a batched read, with the raw-file
+/// SHA-1 that every current saved check for it agrees on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedDatEvidence {
+    pub name: VerifiedDatName,
+    /// Set only when `name` is usable and every current row records the same
+    /// raw SHA-1 (lower-case hex). Absent: the item needs verification.
+    pub raw_sha1: Option<String>,
+    /// At least one saved check for the item is current. Display only: it
+    /// tells "a current check found no match" from "every check is stale".
+    pub has_current_check: bool,
+}
+
+/// Ids per query; well under SQLite's bound-parameter limit.
+const NAME_BATCH: usize = 500;
+
+/// Saved DAT name rows for one archive (None once the archive is ambiguous).
+type SavedNameRows = Option<Vec<(SavedDatNameRow, Option<String>)>>;
+
+impl Database {
+    /// [`Self::verified_dat_name_for_archive`] for many items: one query per
+    /// 500 ids instead of one per item, and the same rule for every row.
+    /// Items with no saved row are absent from the result. Read-only.
+    pub fn verified_dat_names_for_archives(
+        &self,
+        archive_ids: &[i64],
+        catalogues: &HashMap<String, ConfiguredCatalogue>,
+    ) -> Result<HashMap<i64, VerifiedDatEvidence>> {
+        let mut rows_by_id: HashMap<i64, SavedNameRows> = HashMap::new();
+        for chunk in archive_ids.chunks(NAME_BATCH) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let mut statement = self
+                .connection
+                .prepare(&format!(
+                    "SELECT {NAME_ROW_COLUMNS}, d.archive_id \
+                     FROM library_dat_identities d JOIN archives a ON a.id = d.archive_id \
+                     LEFT JOIN platform_assignments p ON p.archive_id = a.id AND p.is_current = 1 \
+                     WHERE d.archive_id IN ({placeholders}) ORDER BY d.archive_id, d.dat_source_id"
+                ))
+                .map_err(|error| db_error("failed to prepare verified DAT names query", error))?;
+            let mut rows = statement
+                .query(rusqlite::params_from_iter(chunk.iter()))
+                .map_err(|error| db_error("failed to query verified DAT names", error))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|error| db_error("failed to read verified DAT names", error))?
+            {
+                let archive_id: i64 = row
+                    .get(8)
+                    .map_err(|error| db_error("failed to read verified DAT names", error))?;
+                let judged = judge_name_row(row, catalogues)?;
+                let slot = rows_by_id
+                    .entry(archive_id)
+                    .or_insert_with(|| Some(Vec::new()));
+                match (slot.as_mut(), judged) {
+                    (Some(list), Some(row)) => list.push(row),
+                    // Unreadable evidence spoils the whole item, as for one item.
+                    _ => *slot = None,
+                }
+            }
+        }
+        Ok(rows_by_id
+            .into_iter()
+            .map(|(archive_id, rows)| {
+                let Some(rows) = rows else {
+                    return (
+                        archive_id,
+                        VerifiedDatEvidence {
+                            name: VerifiedDatName::NotUsable(UNREADABLE_SAVED_CHECK.into()),
+                            raw_sha1: None,
+                            has_current_check: false,
+                        },
+                    );
+                };
+                let name_rows: Vec<SavedDatNameRow> =
+                    rows.iter().map(|(row, _)| row.clone()).collect();
+                let name = decide_verified_dat_name(&name_rows);
+                let mut current = rows
+                    .iter()
+                    .filter(|(row, _)| row.status == SavedDatEvidenceStatus::Current)
+                    .map(|(_, sha1)| sha1.as_deref().map(str::to_ascii_lowercase));
+                let first = current.next().flatten();
+                let agreed = first.filter(|sha1| current.all(|other| other.as_ref() == Some(sha1)));
+                let raw_sha1 = matches!(name, VerifiedDatName::Usable { .. })
+                    .then_some(agreed)
+                    .flatten();
+                let has_current_check = rows
+                    .iter()
+                    .any(|(row, _)| row.status == SavedDatEvidenceStatus::Current);
+                (
+                    archive_id,
+                    VerifiedDatEvidence {
+                        name,
+                        raw_sha1,
+                        has_current_check,
+                    },
+                )
+            })
+            .collect())
     }
 }
 

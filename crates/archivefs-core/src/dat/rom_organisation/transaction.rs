@@ -141,6 +141,27 @@ pub fn build_organisation_transaction(
     approved_sources: &BTreeSet<String>,
     generation: u64,
 ) -> Result<RenameTransaction, String> {
+    build_organisation_transaction_cancellable(
+        plan,
+        approved_sources,
+        generation,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+}
+
+/// The refusal when Apply is cancelled while it is still reading files:
+/// nothing has been changed or journalled at that point.
+pub const BUILD_CANCELLED: &str = "the apply was cancelled before any file was changed";
+
+/// [`build_organisation_transaction`], checking `cancel` before each file it
+/// reads, so cancelling Apply during its (possibly rate-limited) read of every
+/// approved file takes effect at the next file, not after the last one.
+pub fn build_organisation_transaction_cancellable(
+    plan: &OrganisationPlan,
+    approved_sources: &BTreeSet<String>,
+    generation: u64,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<RenameTransaction, String> {
     crate::dat::rename_apply::executor::validate_classifier_version(Some(&plan.classifier_version))
         .map_err(|error| error.to_string())?;
     if generation != plan.generation {
@@ -163,16 +184,27 @@ pub fn build_organisation_transaction(
         if entry.destination_path.as_os_str().is_empty() {
             continue;
         }
-        let identity = entry.source_identity.clone().ok_or_else(|| {
-            "the organisation preview has no source identity; regenerate it".to_string()
-        })?;
-        let current = capture_identity(&entry.source_path).map_err(|e| e.to_string())?;
-        if !crate::dat::rename_apply::identity::identity_matches(&identity, &current) {
-            return Err(format!(
-                "source identity changed since preview: {}; regenerate the plan",
-                entry.source_path.display()
-            ));
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(BUILD_CANCELLED.into());
         }
+        let identity = match &entry.deferred_capture {
+            // Evidence-first preview: read the file now, once. The journal
+            // binds exactly the bytes whose SHA-1 was just compared.
+            Some(deferred) => capture_deferred(entry, deferred)?,
+            None => {
+                let identity = entry.source_identity.clone().ok_or_else(|| {
+                    "the organisation preview has no source identity; regenerate it".to_string()
+                })?;
+                let current = capture_identity(&entry.source_path).map_err(|e| e.to_string())?;
+                if !crate::dat::rename_apply::identity::identity_matches(&identity, &current) {
+                    return Err(format!(
+                        "source identity changed since preview: {}; regenerate the plan",
+                        entry.source_path.display()
+                    ));
+                }
+                identity
+            }
+        };
         // Linked-library defence in depth: only a regular file may become a
         // link source, and both the recorded link target and the approved
         // destination root must be absolute so recovery/rollback can trust
@@ -264,6 +296,31 @@ pub fn build_organisation_transaction(
     })
 }
 
+/// Apply-time content check for an evidence-first preview entry: the file
+/// must be the same object with the same metadata as at preview, and its
+/// SHA-1, read in the same pass as the journal's SHA-256, must equal the raw
+/// SHA-1 its current saved catalogue check recorded. Anything else refuses
+/// the whole Apply before anything is renamed.
+fn capture_deferred(
+    entry: &super::model::OrganisationPlanEntry,
+    deferred: &super::model::DeferredCapture,
+) -> Result<crate::dat::rename_apply::model::ObjectIdentity, String> {
+    let path = entry.source_path.display();
+    let (identity, sha1) = crate::dat::rename_apply::identity::capture_identity_checking_sha1(
+        &entry.source_path,
+        &deferred.snapshot,
+    )
+    .map_err(|_| format!("source changed since preview: {path}; regenerate the plan"))?;
+    let actual: String = sha1.iter().map(|byte| format!("{byte:02x}")).collect();
+    if actual != deferred.expected_raw_sha1 {
+        return Err(format!(
+            "{path} no longer matches the catalogue check its new name came from \
+             (SHA-1 differs). Nothing was renamed; check the game again."
+        ));
+    }
+    Ok(identity)
+}
+
 /// Read-only: bind each Suggested preview to the exact catalogue game and
 /// associations it describes. A failed/stale preview must be regenerated.
 pub fn prepare_organisation_catalogue(
@@ -293,6 +350,15 @@ pub fn prepare_organisation_catalogue_with_platforms(
 ) -> Result<(), String> {
     // Rows blocked after planning (guard, name rules) block their whole set.
     super::disc_sets::hold_disc_sets_together(&mut plan.entries);
+    // An evidence-first preview read no file, so it has no content proof to
+    // seal into a binding. Its rows are bound at Apply instead
+    // ([`bind_organisation_transaction`]), from Apply's own single read.
+    if plan
+        .suggested()
+        .any(|entry| entry.deferred_capture.is_some())
+    {
+        return Ok(());
+    }
     let approved = plan
         .suggested()
         .map(|e| e.source_path.to_string_lossy().into_owned())
@@ -324,6 +390,19 @@ pub fn prepare_organisation_catalogue_with_platforms(
         }
     }
     Ok(())
+}
+
+/// Evidence-first Apply: binds each entry of a transaction just built from an
+/// evidence-first plan (whose preview left binding to Apply), exactly as
+/// [`prepare_organisation_catalogue`] binds a preview: the same checks, with
+/// the content proof taken by the read that also compared each file's
+/// catalogue SHA-1. [`apply_organisation_transaction`] then validates and
+/// seals the bindings as for any other plan. Refuses an entry already bound.
+pub fn bind_organisation_transaction(
+    transaction: &mut RenameTransaction,
+    database: &crate::Database,
+) -> Result<(), String> {
+    crate::database::organisation_paths::bind(transaction, database)
 }
 
 /// Apply an approved organisation with exact catalogue bindings sealed before
@@ -498,7 +577,10 @@ pub fn revalidate_organisation_plan(
     database_path: &Path,
     canonical_name_for: &dyn Fn(&Path) -> Option<String>,
 ) -> Result<(), String> {
-    use super::plan::{OrganisationCandidate, OrganisationPlanRequest, plan_each_candidate_alone};
+    use super::plan::{
+        OrganisationCandidate, OrganisationPlanRequest, SourceCapture,
+        plan_each_candidate_alone_with,
+    };
 
     let database = crate::Database::open_read_only(database_path)
         .map_err(|error| format!("could not open the platform identity database: {error}"))?;
@@ -533,15 +615,35 @@ pub fn revalidate_organisation_plan(
             original_metadata: entry.original_metadata.clone(),
         })
         .collect();
-    let mut re_entries = plan_each_candidate_alone(&OrganisationPlanRequest {
-        master_root: &plan.master_root,
-        mode: plan.mode,
-        content_policy: plan.content_policy,
-        candidates: &candidates,
-        generation: plan.generation,
-        unknown_folder: None,
-        link_target_roots: link_roots.as_deref(),
-    })
+    // An evidence-first preview is checked again from metadata too: its
+    // content is read once, by the transaction build, after this check.
+    let raw_sha1: std::collections::HashMap<std::path::PathBuf, String> = single
+        .iter()
+        .filter_map(|entry| {
+            let deferred = entry.deferred_capture.as_ref()?;
+            Some((
+                entry.source_path.clone(),
+                deferred.expected_raw_sha1.clone(),
+            ))
+        })
+        .collect();
+    let capture = if single.iter().any(|entry| entry.deferred_capture.is_some()) {
+        SourceCapture::Snapshot(&raw_sha1)
+    } else {
+        SourceCapture::Content
+    };
+    let mut re_entries = plan_each_candidate_alone_with(
+        &OrganisationPlanRequest {
+            master_root: &plan.master_root,
+            mode: plan.mode,
+            content_policy: plan.content_policy,
+            candidates: &candidates,
+            generation: plan.generation,
+            unknown_folder: None,
+            link_target_roots: link_roots.as_deref(),
+        },
+        capture,
+    )
     .into_iter();
     // Same order, first failure and message as the one-entry check.
     let mut disc_sets_checked = BTreeSet::new();
@@ -555,6 +657,14 @@ pub fn revalidate_organisation_plan(
         let re_entry = re_entries
             .next()
             .ok_or("the organisation could not be checked again")?;
+        if entry.deferred_capture.as_ref().map(|d| d.snapshot)
+            != re_entry.deferred_capture.as_ref().map(|d| d.snapshot)
+        {
+            return Err(format!(
+                "source changed since preview: {}; regenerate the plan",
+                entry.source_path.display()
+            ));
+        }
         if re_entry.status != super::model::OrganisationStatus::Suggested
             || re_entry.destination_path != entry.destination_path
             || re_entry.platform.as_deref() != entry.platform.as_deref()

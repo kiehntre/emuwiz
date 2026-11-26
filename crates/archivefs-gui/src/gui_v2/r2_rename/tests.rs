@@ -19,6 +19,7 @@ fn selection(count: usize) -> Selection {
             original_metadata: Default::default(),
             status: OrganisationStatus::Suggested,
             reason: None,
+            deferred_capture: None,
         })
         .collect::<Vec<_>>();
     let approved = entries

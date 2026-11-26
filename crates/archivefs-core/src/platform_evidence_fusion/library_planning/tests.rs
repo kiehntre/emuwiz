@@ -279,6 +279,7 @@ fn entry(
         original_metadata: Default::default(),
         status,
         reason: None,
+        deferred_capture: None,
     }
 }
 

@@ -58,7 +58,7 @@ fn capture_identity_with_budget(
     }
     let kind = classify_metadata(path, &metadata);
     let freshness = match kind {
-        ObjectKind::RegularFile => Some(capture_regular(path, &metadata)?),
+        ObjectKind::RegularFile => Some(capture_regular(path, &metadata, None)?),
         ObjectKind::Symlink | ObjectKind::BrokenSymlink => {
             let target = std::fs::read_link(path)?;
             #[cfg(unix)]
@@ -75,23 +75,95 @@ fn capture_identity_with_budget(
         }
         ObjectKind::Other => None,
     };
+    Ok(identity_of(&metadata, kind, freshness))
+}
+
+fn identity_of(
+    metadata: &Metadata,
+    kind: ObjectKind,
+    freshness: Option<ObjectFreshness>,
+) -> ObjectIdentity {
     let modified_unix = metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or(0);
-    let identity = ObjectIdentity {
+    ObjectIdentity {
         size_bytes: metadata.len(),
         modified_unix,
         kind,
         #[cfg(unix)]
-        ino: std::os::unix::fs::MetadataExt::ino(&metadata),
+        ino: std::os::unix::fs::MetadataExt::ino(metadata),
         #[cfg(unix)]
-        dev: std::os::unix::fs::MetadataExt::dev(&metadata),
+        dev: std::os::unix::fs::MetadataExt::dev(metadata),
         freshness,
-    };
-    Ok(identity)
+    }
+}
+
+/// A file's metadata at preview time, taken with one `lstat` and no read:
+/// what Apply requires to be exactly unchanged before it reads the file.
+/// Never a content proof (see [`capture_identity_checking_sha1`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PreviewSnapshot {
+    pub kind: ObjectKind,
+    pub size_bytes: u64,
+    pub device: u64,
+    pub inode: u64,
+    pub modified_seconds: i64,
+    pub modified_nanoseconds: i64,
+    pub changed_seconds: i64,
+    pub changed_nanoseconds: i64,
+}
+
+#[cfg(unix)]
+fn snapshot_of(metadata: &Metadata, kind: ObjectKind) -> PreviewSnapshot {
+    use std::os::unix::fs::MetadataExt;
+    PreviewSnapshot {
+        kind,
+        size_bytes: metadata.len(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    }
+}
+
+/// Metadata only: the object's identity *without* a content proof (which
+/// [`identity_matches`] never accepts) and its [`PreviewSnapshot`].
+#[cfg(unix)]
+pub fn preview_snapshot(path: &Path) -> io::Result<(ObjectIdentity, PreviewSnapshot)> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    let kind = classify_metadata(path, &metadata);
+    Ok((
+        identity_of(&metadata, kind, None),
+        snapshot_of(&metadata, kind),
+    ))
+}
+
+/// Apply-time capture for an evidence-first preview. Refuses unless `path`
+/// is still a regular file whose metadata equals `expected` exactly; then
+/// reads it once, through one descriptor with the same before/after checks
+/// as [`capture_identity`], and returns that full identity (SHA-256 proof,
+/// as every journal records) together with the SHA-1 of the very same bytes.
+#[cfg(unix)]
+pub fn capture_identity_checking_sha1(
+    path: &Path,
+    expected: &PreviewSnapshot,
+) -> io::Result<(ObjectIdentity, [u8; 20])> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    let kind = classify_metadata(path, &metadata);
+    if kind != ObjectKind::RegularFile || snapshot_of(&metadata, kind) != *expected {
+        return Err(io::Error::other("the file changed since the preview"));
+    }
+    let mut sha1 = sha1::Sha1::new();
+    let freshness = capture_regular(path, &metadata, Some(&mut sha1))?;
+    Ok((
+        identity_of(&metadata, kind, Some(freshness)),
+        sha1.finalize().into(),
+    ))
 }
 
 /// Requires matching supported freshness proofs on BOTH sides. Legacy
@@ -142,7 +214,11 @@ pub fn content_identity_matches(expected: &ObjectIdentity, current: &ObjectIdent
             if a.version == FRESHNESS_VERSION && b.version == FRESHNESS_VERSION && a.sha256 == b.sha256)
 }
 
-fn capture_regular(path: &Path, before: &Metadata) -> io::Result<ObjectFreshness> {
+fn capture_regular(
+    path: &Path,
+    before: &Metadata,
+    mut also_sha1: Option<&mut sha1::Sha1>,
+) -> io::Result<ObjectFreshness> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -168,6 +244,10 @@ fn capture_regular(path: &Path, before: &Metadata) -> io::Result<ObjectFreshness
         }
         bytes_read += count as u64;
         digest.update(&buffer[..count]);
+        if let Some(sha1) = also_sha1.as_deref_mut() {
+            sha1.update(&buffer[..count]);
+        }
+        pace_read(count);
     }
     if bytes_read != before.len() {
         return Err(changed());
@@ -179,6 +259,67 @@ fn capture_regular(path: &Path, before: &Metadata) -> io::Result<ObjectFreshness
         modified: before.modified()?,
         sha256: digest.finalize().into(),
     })
+}
+
+/// A per-thread cap on how fast content captures read, for long batches on
+/// a shared disk. Off unless a caller enters one; nested entries keep the
+/// outer limit. It only slows reads down: every check is unchanged.
+pub struct ReadLimit {
+    entered: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ReadPace {
+    bytes_per_second: u64,
+    started: std::time::Instant,
+    bytes: u64,
+}
+
+thread_local! {
+    static READ_PACE: std::cell::Cell<Option<ReadPace>> = const { std::cell::Cell::new(None) };
+}
+
+impl ReadLimit {
+    /// `None` (or zero): no limit.
+    pub fn enter(bytes_per_second: Option<u64>) -> Self {
+        let entered = match bytes_per_second.filter(|rate| *rate > 0) {
+            Some(rate) if READ_PACE.with(|pace| pace.get().is_none()) => {
+                READ_PACE.with(|pace| {
+                    pace.set(Some(ReadPace {
+                        bytes_per_second: rate,
+                        started: std::time::Instant::now(),
+                        bytes: 0,
+                    }))
+                });
+                true
+            }
+            _ => false,
+        };
+        Self { entered }
+    }
+}
+
+impl Drop for ReadLimit {
+    fn drop(&mut self) {
+        if self.entered {
+            READ_PACE.with(|pace| pace.set(None));
+        }
+    }
+}
+
+/// Counts `count` bytes against this thread's limit and waits (in short
+/// steps) while reading is ahead of it.
+fn pace_read(count: usize) {
+    let Some(mut pace) = READ_PACE.with(std::cell::Cell::get) else {
+        return;
+    };
+    pace.bytes += count as u64;
+    READ_PACE.with(|cell| cell.set(Some(pace)));
+    let due = std::time::Duration::from_secs_f64(pace.bytes as f64 / pace.bytes_per_second as f64);
+    let elapsed = pace.started.elapsed();
+    if due > elapsed {
+        std::thread::sleep((due - elapsed).min(std::time::Duration::from_millis(200)));
+    }
 }
 
 fn changed() -> io::Error {
@@ -269,6 +410,27 @@ mod tests {
     }
 
     #[test]
+    fn a_read_limit_only_slows_capture_and_ends_with_its_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("game.bin");
+        std::fs::write(&path, vec![7_u8; 400_000]).unwrap();
+        let unlimited = capture_identity(&path).unwrap();
+        let started = std::time::Instant::now();
+        let limited = {
+            let _limit = ReadLimit::enter(Some(1_000_000));
+            capture_identity(&path).unwrap()
+        };
+        assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+        assert!(identity_matches(&unlimited, &limited), "same proof");
+        let started = std::time::Instant::now();
+        capture_identity(&path).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(300),
+            "limit released"
+        );
+    }
+
+    #[test]
     fn identity_matches_itself_and_rejects_a_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.bin");
@@ -313,7 +475,7 @@ mod tests {
         let before = std::fs::symlink_metadata(&path).unwrap();
         std::fs::rename(&path, dir.path().join("retained")).unwrap();
         std::fs::write(&path, b"same bytes").unwrap();
-        assert!(capture_regular(&path, &before).is_err());
+        assert!(capture_regular(&path, &before, None).is_err());
     }
 
     #[cfg(unix)]
@@ -326,7 +488,7 @@ mod tests {
         let before = std::fs::symlink_metadata(&path).unwrap();
         std::fs::rename(&path, &retained).unwrap();
         std::os::unix::fs::symlink(&retained, &path).unwrap();
-        assert!(capture_regular(&path, &before).is_err());
+        assert!(capture_regular(&path, &before, None).is_err());
     }
 
     #[test]

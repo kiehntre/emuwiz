@@ -565,6 +565,10 @@ impl App {
                     });
                     ui.label("1 Choose  ·  2 Preview  ·  3 Confirm  ·  4 Apply");
                     ui.label("MOVE changes the original file's folder. RENAME changes its name in place. LINK leaves the original untouched and creates a shortcut in a new library.");
+                    if self.canonical_organisation.uses_scope() {
+                        let busy = self.canonical_organisation_job.is_some();
+                        self.rename_scope_card(ui, busy);
+                    }
                     super::r2_rename::choice(ui,&mut self.canonical_organisation.advanced_r2_selected,
                         self.canonical_organisation_job.is_some()||self.organisation.r2.busy(),self.organisation.r2.can_choose_standard());
                     canonical_action = rom_organisation_page::show_rom_organisation_page_with_busy(
@@ -720,6 +724,10 @@ impl App {
     pub(super) fn quick_rename(&mut self, ui: &mut egui::Ui) {
         self.organisation_job_card(ui);
         self.invalidate_changed_canonical_organisation_plan();
+        if self.canonical_organisation.uses_scope() {
+            let busy = self.canonical_organisation_job.is_some();
+            self.rename_scope_card(ui, busy);
+        }
         let action = rom_organisation_page::show_quick_rename_page_with_busy(
             ui,
             &mut self.canonical_organisation,

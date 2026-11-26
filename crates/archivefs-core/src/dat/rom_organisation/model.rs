@@ -134,6 +134,25 @@ pub struct OrganisationPlanEntry {
     pub status: OrganisationStatus,
     /// Why the entry is Blocked / Unsupported / Conflict, when it is.
     pub reason: Option<String>,
+    /// Evidence-first preview only (see
+    /// [`super::plan::build_rename_plan_from_evidence`]): the file was not read
+    /// at preview. `None`: its content was captured at preview, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_capture: Option<DeferredCapture>,
+}
+
+/// What an evidence-first preview recorded instead of reading the file, and
+/// what Apply requires before renaming it: the exact metadata seen at
+/// preview, and the SHA-1 that the file's current saved catalogue check
+/// recorded for the file itself. That is always the raw file's own hash (for
+/// a zip, the outer archive; for a headered ROM, the whole file), never the
+/// matched archive member or header-stripped hash, so like is compared with
+/// like.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferredCapture {
+    pub snapshot: crate::dat::rename_apply::identity::PreviewSnapshot,
+    /// Lower-case hex.
+    pub expected_raw_sha1: String,
 }
 
 /// A read-only organisation plan over one batch of candidates.

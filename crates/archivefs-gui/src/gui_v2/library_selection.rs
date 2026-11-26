@@ -386,6 +386,11 @@ pub(super) enum BarAction {
     CopyTitles,
     CopyPaths,
     ShowInFileManager,
+    /// Standard Bulk Rename of the selection. `include_hidden`: also the
+    /// selected games the filter hides (D2: only by this explicit choice).
+    Rename {
+        include_hidden: bool,
+    },
 }
 
 pub(super) struct BarView<'a> {
@@ -445,6 +450,35 @@ pub(super) fn show_bar(ui: &mut egui::Ui, view: &BarView<'_>) -> Option<BarActio
         ] {
             if ui.button(label).on_hover_text(hint).clicked() {
                 action = Some(choice);
+            }
+        }
+        ui.separator();
+        let shown = view.count.selected.saturating_sub(view.count.hidden);
+        if view.count.hidden == 0 {
+            if ui
+                .button("Rename selected…")
+                .on_hover_text("Preview verified catalogue names for the selected games. Nothing changes until you confirm.")
+                .clicked()
+            {
+                action = Some(BarAction::Rename { include_hidden: false });
+            }
+        } else {
+            if ui
+                .add_enabled(shown > 0, egui::Button::new(format!("Rename the {shown} shown…")))
+                .on_hover_text("Preview only the selected games the filter shows.")
+                .clicked()
+            {
+                action = Some(BarAction::Rename { include_hidden: false });
+            }
+            if ui
+                .button(format!(
+                    "Rename all {} selected (incl. {} hidden)…",
+                    view.count.selected, view.count.hidden
+                ))
+                .on_hover_text("Also preview the selected games the filter hides. The preview lists every one.")
+                .clicked()
+            {
+                action = Some(BarAction::Rename { include_hidden: true });
             }
         }
     });
@@ -607,6 +641,25 @@ impl App {
                         }
                     }
                     Err(refusal) => self.library_selection.notice = Some(refusal),
+                }
+            }
+            BarAction::Rename { include_hidden } => {
+                let games = ordered();
+                let shown = self.library_selection.shown(&library, list).clone();
+                let hidden_by_filter = games
+                    .iter()
+                    .filter(|game| !shown.contains(&game.archive.id))
+                    .count();
+                let picked: Vec<&Game> = games
+                    .into_iter()
+                    .filter(|game| include_hidden || shown.contains(&game.archive.id))
+                    .collect();
+                if !picked.is_empty() {
+                    let scope = crate::rom_organisation_page::scope::OrganisationScope::Games {
+                        games: super::rename_scope::scoped_games(picked.into_iter()),
+                        hidden_by_filter: if include_hidden { hidden_by_filter } else { 0 },
+                    };
+                    self.open_bulk_rename(scope);
                 }
             }
         }

@@ -45,6 +45,8 @@ pub mod transaction;
 #[cfg(test)]
 mod disc_set_tests;
 #[cfg(test)]
+mod evidence_first_tests;
+#[cfg(test)]
 mod game_rename_tests;
 #[cfg(test)]
 mod linked_library_tests;
@@ -54,14 +56,19 @@ mod rename_guard_tests;
 mod tests;
 
 pub use disc_sets::{disc_set_of, hold_disc_sets_together, refuse_partial_disc_sets};
-pub use model::{OrganisationMode, OrganisationPlan, OrganisationPlanEntry, OrganisationStatus};
+pub use model::{
+    DeferredCapture, OrganisationMode, OrganisationPlan, OrganisationPlanEntry, OrganisationStatus,
+};
 pub use plan::{
-    OrganisationCandidate, OrganisationPlanRequest, build_organisation_plan,
-    build_organisation_plan_reporting, layout_folder_in,
+    NEEDS_VERIFICATION_REASON, OrganisationCandidate, OrganisationPlanRequest,
+    build_organisation_plan, build_organisation_plan_reporting, build_rename_plan_from_evidence,
+    layout_folder_in,
 };
 pub use transaction::{
-    OrganisationRollbackOutcome, PlatformCorrection, apply_organisation_transaction,
-    build_organisation_transaction, is_organisation_transaction, open_history_transaction_for_undo,
-    prepare_organisation_catalogue, prepare_organisation_catalogue_with_platforms,
-    revalidate_organisation_plan, rollback_organisation_transaction, undo_blocker,
+    BUILD_CANCELLED, OrganisationRollbackOutcome, PlatformCorrection,
+    apply_organisation_transaction, bind_organisation_transaction, build_organisation_transaction,
+    build_organisation_transaction_cancellable, is_organisation_transaction,
+    open_history_transaction_for_undo, prepare_organisation_catalogue,
+    prepare_organisation_catalogue_with_platforms, revalidate_organisation_plan,
+    rollback_organisation_transaction, undo_blocker,
 };

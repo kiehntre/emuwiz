@@ -127,6 +127,22 @@ fn plan_reporting(
     progress: &mut crate::job_progress::ProgressReporter<'_>,
     group_disc_sets: bool,
 ) -> Option<OrganisationPlan> {
+    plan_reporting_with(
+        request,
+        cancel,
+        progress,
+        group_disc_sets,
+        SourceCapture::Content,
+    )
+}
+
+fn plan_reporting_with(
+    request: &OrganisationPlanRequest<'_>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    progress: &mut crate::job_progress::ProgressReporter<'_>,
+    group_disc_sets: bool,
+    capture: SourceCapture<'_>,
+) -> Option<OrganisationPlan> {
     let stop = || cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
     // A disc set keeps every name (its sheets name the files), so its files
     // are planned under their own names. A linked library links the whole
@@ -162,9 +178,9 @@ fn plan_reporting(
                 canonical_name: None,
                 ..candidate.clone()
             };
-            plan_entry(request, &own_name)
+            plan_entry_with(request, &own_name, capture)
         } else {
-            plan_entry(request, candidate)
+            plan_entry_with(request, candidate, capture)
         });
     }
     progress.tick(request.candidates.len() as u64);
@@ -201,18 +217,89 @@ fn plan_reporting(
     })
 }
 
+/// How the planner records each source.
+#[derive(Clone, Copy)]
+pub(crate) enum SourceCapture<'a> {
+    /// Read and hash every source now (every planner before evidence-first).
+    Content,
+    /// Metadata only. Each file's raw SHA-1 from its current saved catalogue
+    /// check, by path: a Suggested rename without one is Blocked.
+    Snapshot(&'a std::collections::HashMap<PathBuf, String>),
+}
+
+/// Why an evidence-first preview holds back an otherwise ready rename.
+pub const NEEDS_VERIFICATION_REASON: &str = "Needs verification: no current catalogue check \
+     records this exact file. Check it again in DAT Management, then preview again.";
+
+/// Standard Bulk Rename preview from saved evidence: [`build_organisation_plan_reporting`]
+/// for `RenameInPlace`, except that no file is read. Each source is recorded
+/// by its metadata ([`DeferredCapture`](super::model::DeferredCapture)); a
+/// Suggested rename also needs the file's raw SHA-1 in `raw_sha1` (from a
+/// current, unchanged-file saved check), or it is Blocked as needing
+/// verification. Apply then reads each approved file once and refuses it
+/// unless both still hold. Every other mode reads content, as before.
+pub fn build_rename_plan_from_evidence(
+    request: &OrganisationPlanRequest<'_>,
+    raw_sha1: &std::collections::HashMap<PathBuf, String>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    progress: &mut crate::job_progress::ProgressReporter<'_>,
+) -> Option<OrganisationPlan> {
+    let capture = if request.mode == OrganisationMode::RenameInPlace {
+        SourceCapture::Snapshot(raw_sha1)
+    } else {
+        SourceCapture::Content
+    };
+    plan_reporting_with(request, cancel, progress, true, capture)
+}
+
 /// Plans one candidate into an entry, classifying the status.
-fn plan_entry(
+fn plan_entry_with(
     request: &OrganisationPlanRequest<'_>,
     candidate: &OrganisationCandidate,
+    capture: SourceCapture<'_>,
+) -> OrganisationPlanEntry {
+    let SourceCapture::Snapshot(raw_sha1) = capture else {
+        let identity =
+            crate::dat::rename_apply::identity::capture_identity(&candidate.source_path).ok();
+        return plan_entry_from(request, candidate, identity);
+    };
+    let observed = crate::dat::rename_apply::identity::preview_snapshot(&candidate.source_path);
+    let (identity, snapshot) = match observed {
+        Ok((identity, snapshot)) => (Some(identity), Some(snapshot)),
+        Err(_) => (None, None),
+    };
+    let mut entry = plan_entry_from(request, candidate, identity);
+    if entry.status == OrganisationStatus::Suggested {
+        match (snapshot, raw_sha1.get(&candidate.source_path)) {
+            (Some(snapshot), Some(sha1))
+                if snapshot.kind == crate::dat::rename_apply::model::ObjectKind::RegularFile =>
+            {
+                entry.deferred_capture = Some(super::model::DeferredCapture {
+                    snapshot,
+                    expected_raw_sha1: sha1.to_ascii_lowercase(),
+                });
+            }
+            _ => {
+                // The proposed name stays visible (display only: a Blocked
+                // row is never applied), as every other blocked row's does.
+                entry.status = OrganisationStatus::Blocked;
+                entry.reason = Some(NEEDS_VERIFICATION_REASON.to_string());
+            }
+        }
+    }
+    entry
+}
+
+fn plan_entry_from(
+    request: &OrganisationPlanRequest<'_>,
+    candidate: &OrganisationCandidate,
+    source_identity: Option<crate::dat::rename_apply::model::ObjectIdentity>,
 ) -> OrganisationPlanEntry {
     let source_basename = candidate
         .source_path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let source_identity =
-        crate::dat::rename_apply::identity::capture_identity(&candidate.source_path).ok();
     let object_kind = source_identity.as_ref().map(|identity| identity.kind);
     let mode = request.mode;
 
@@ -232,6 +319,7 @@ fn plan_entry(
         original_metadata: candidate.original_metadata.clone(),
         status: OrganisationStatus::Blocked,
         reason: Some(reason.to_string()),
+        deferred_capture: None,
     };
 
     let unsupported = |reason: &str, platform: Option<String>, display: &str, source: &str| {
@@ -251,6 +339,7 @@ fn plan_entry(
             original_metadata: candidate.original_metadata.clone(),
             status: OrganisationStatus::Unsupported,
             reason: Some(reason.to_string()),
+            deferred_capture: None,
         }
     };
 
@@ -474,6 +563,7 @@ fn plan_entry(
             OrganisationStatus::Suggested
         },
         reason: None,
+        deferred_capture: None,
     }
 }
 
@@ -527,6 +617,7 @@ fn unknown_entry(
         original_metadata: candidate.original_metadata.clone(),
         status,
         reason,
+        deferred_capture: None,
     }
 }
 
@@ -570,15 +661,16 @@ pub(crate) struct FolderNames {
 /// [`build_organisation_plan`] would (no collision checks between them), but
 /// lists each destination folder once for the whole call. Used by the Apply
 /// revalidation, which checks each entry independently.
-pub(crate) fn plan_each_candidate_alone(
+pub(crate) fn plan_each_candidate_alone_with(
     request: &OrganisationPlanRequest<'_>,
+    capture: SourceCapture<'_>,
 ) -> Vec<OrganisationPlanEntry> {
     let mut folders = FolderNames::default();
     request
         .candidates
         .iter()
         .map(|candidate| {
-            let mut entry = [plan_entry(request, candidate)];
+            let mut entry = [plan_entry_with(request, candidate, capture)];
             detect_collisions_with(request.master_root, &mut entry, &mut folders);
             let [entry] = entry;
             entry
