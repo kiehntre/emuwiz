@@ -105,6 +105,12 @@ pub enum PspShrinkError {
     ConversionFailed {
         reason: String,
         evidence: PathBuf,
+        /// Whether the failed CSO exists in `evidence` (it may never have
+        /// been written, e.g. when writing it failed on a full disk).
+        cso_retained: bool,
+        /// Set when `diagnostic.json` could not be (fully) written; it is
+        /// then missing or incomplete and `reason` is the only full record.
+        report_error: Option<String>,
         manifest: PathBuf,
         /// Set when the manifest line could not be written. The evidence is
         /// still kept at `evidence`.
@@ -164,14 +170,27 @@ impl fmt::Display for PspShrinkError {
             Self::ConversionFailed {
                 reason,
                 evidence,
+                cso_retained,
+                report_error,
                 manifest,
                 manifest_error,
             } => {
-                write!(
-                    f,
-                    "conversion failed and nothing was published: {reason}. The failed CSO and its report are kept at {}",
-                    evidence.display()
-                )?;
+                write!(f, "conversion failed and nothing was published: {reason}. ")?;
+                let kept = match (cso_retained, report_error) {
+                    (true, None) => "The failed CSO and its report are kept at",
+                    (false, None) => "No CSO was written; the report is kept at",
+                    (true, Some(_)) => "The failed CSO is kept at",
+                    (false, Some(_)) => {
+                        "No CSO was written and no complete report could be saved; what was written is kept at"
+                    }
+                };
+                write!(f, "{kept} {}", evidence.display())?;
+                if let Some(error) = report_error {
+                    write!(
+                        f,
+                        " (its report could not be written: {error}; diagnostic.json is missing or incomplete)"
+                    )?;
+                }
                 if let Some(error) = manifest_error {
                     write!(
                         f,
@@ -606,7 +625,7 @@ fn retain(
         "failed_cso_sha256": cso_sha256,
         "emulator_compatibility": "not tested",
     });
-    root.retain_failure(stage, &report, reason)
+    root.retain_failure(stage, &report, reason, cso_size.is_some())
 }
 
 /// Runs the three publication checks in order. Each failure names its check.

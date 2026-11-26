@@ -745,6 +745,23 @@ fn assert_retained(scratch: &Scratch, error: &PspShrinkError, check: &str) -> Pa
     };
     assert!(reason.starts_with(check), "{reason}");
     assert!(manifest_error.is_none());
+    assert!(
+        matches!(
+            error,
+            PspShrinkError::ConversionFailed {
+                cso_retained: true,
+                report_error: None,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("The failed CSO and its report are kept at"),
+        "{error}"
+    );
     assert!(evidence.starts_with(scratch.diagnostics().join("failed")));
     assert!(evidence.join("output.cso").is_file(), "failed CSO kept");
     assert!(evidence.join("intent.json").is_file());
@@ -1704,4 +1721,369 @@ fn a_restored_copy_that_cannot_be_removed_is_reported_with_the_original_error() 
     assert!(error.contains("exit status: 3"), "{error}");
     assert!(error.contains("could not be removed"), "{error}");
     fs::remove_dir(&restored).unwrap();
+}
+
+// Codex P2 (PR #543): a location-specific probe failure falls back to the
+// next eligible location; a filesystem-wide one refuses at once.
+
+/// `<root>/<name>` as a configured diagnostics folder (0700), optionally with
+/// a pre-existing `psp-cso/staging` the user can read but not write (0500).
+fn configured_location(root: &Path, name: &str, unwritable_staging: bool) -> PathBuf {
+    let base = root.join(name);
+    fs::DirBuilder::new().mode(0o700).create(&base).unwrap();
+    if unwritable_staging {
+        let psp = base.join("psp-cso");
+        fs::DirBuilder::new().mode(0o700).create(&psp).unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(psp.join("failed"))
+            .unwrap();
+        fs::DirBuilder::new()
+            .mode(0o500)
+            .create(psp.join("staging"))
+            .unwrap();
+    }
+    base
+}
+
+fn two_locations(scratch: &Scratch, first: PathBuf, second: PathBuf) -> DiagnosticsPlacement {
+    DiagnosticsPlacement {
+        source_folders: vec![scratch.root.join("games")],
+        configured_dirs: vec![first, second],
+        data_dir: None,
+        allow_mount_root: false,
+    }
+}
+
+fn restore_writable(base: &Path) {
+    let staging = base.join("psp-cso").join("staging");
+    if staging.exists() {
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+#[test]
+fn a_permission_denied_location_falls_back_to_the_next_eligible_one() {
+    if !not_root() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let first = configured_location(&scratch.root, "diag-locked", true);
+    let second = configured_location(&scratch.root, "diag-open", false);
+    let placement = two_locations(&scratch, first.clone(), second.clone());
+    let root = DiagnosticsRoot::resolve(&scratch.root.join("out"), &placement).unwrap();
+    assert_eq!(root.path(), second.join("psp-cso"));
+    assert_eq!(root.skipped().len(), 1, "{:?}", root.skipped());
+    assert!(root.skipped()[0].starts_with(&first.display().to_string()));
+    assert!(
+        root.skipped()[0].contains("creating a probe file"),
+        "{:?}",
+        root.skipped()
+    );
+    // A whole conversion then works through the second location.
+    let (source, bytes) = scratch.source();
+    let result =
+        convert_psp_iso_to_cso(&source, &scratch.output(), &reference(), &placement).unwrap();
+    assert!(result.checks.format_valid);
+    assert!(scratch.output().is_file());
+    assert_eq!(fs::read(&source).unwrap(), bytes);
+    let locked = first.join("psp-cso").join("staging");
+    assert_eq!(
+        fs::read_dir(&locked).unwrap().count(),
+        0,
+        "nothing in the locked one"
+    );
+    restore_writable(&first);
+}
+
+#[test]
+fn when_every_location_is_permission_denied_the_refusal_names_each() {
+    if !not_root() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let first = configured_location(&scratch.root, "diag-a", true);
+    let second = configured_location(&scratch.root, "diag-b", true);
+    let placement = two_locations(&scratch, first.clone(), second.clone());
+    let (source, bytes) = scratch.source();
+    let error =
+        convert_psp_iso_to_cso(&source, &scratch.output(), &reference(), &placement).unwrap_err();
+    restore_writable(&first);
+    restore_writable(&second);
+    match &error {
+        PspShrinkError::DestinationUnsuitable { problem, detail } => {
+            assert_eq!(*problem, DestinationProblem::PermissionDenied);
+            assert!(detail.contains(&first.display().to_string()), "{detail}");
+            assert!(detail.contains(&second.display().to_string()), "{detail}");
+            assert!(detail.contains("cso-diagnostics-dirs.txt"), "{detail}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        error.to_string().contains("Nothing was converted"),
+        "{error}"
+    );
+    assert!(!scratch.output().exists());
+    assert_eq!(fs::read(&source).unwrap(), bytes);
+}
+
+#[test]
+fn filesystem_wide_probe_failures_refuse_without_trying_other_locations() {
+    for (hooks, expected) in [
+        (
+            super::diagnostics::ProbeHooks {
+                link: Some(libc::EPERM),
+                ..Default::default()
+            },
+            DestinationProblem::HardLinksUnsupported,
+        ),
+        (
+            super::diagnostics::ProbeHooks {
+                sync: Some(libc::ENOSPC),
+                ..Default::default()
+            },
+            DestinationProblem::StorageFull,
+        ),
+        (
+            super::diagnostics::ProbeHooks {
+                sync: Some(libc::EROFS),
+                ..Default::default()
+            },
+            DestinationProblem::ReadOnly,
+        ),
+    ] {
+        let scratch = Scratch::new();
+        let first = configured_location(&scratch.root, "diag-first", false);
+        let second = configured_location(&scratch.root, "diag-second", false);
+        let placement = two_locations(&scratch, first.clone(), second.clone());
+        let (source, bytes) = scratch.source();
+        let error = with_probe_hooks(hooks, || {
+            convert_psp_iso_to_cso(&source, &scratch.output(), &reference(), &placement)
+                .unwrap_err()
+        });
+        match error {
+            PspShrinkError::DestinationUnsuitable { problem, .. } => {
+                assert_eq!(problem, expected)
+            }
+            other => panic!("{expected:?}: {other:?}"),
+        }
+        assert!(
+            !second.join("psp-cso").exists(),
+            "{expected:?}: the second location must not be tried"
+        );
+        assert!(!scratch.output().exists());
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+    }
+}
+
+// Codex P2 (PR #543): a report that cannot be written is reported, and the
+// message says exactly what was kept.
+
+fn retained_with_unwritable_report(write_cso: bool) -> (Scratch, PspShrinkError) {
+    let scratch = Scratch::new();
+    let root = DiagnosticsRoot::resolve(&scratch.root.join("out"), &scratch.placement()).unwrap();
+    let stage = root
+        .create_stage(&serde_json::json!({"kind": "test"}))
+        .unwrap();
+    if write_cso {
+        fs::write(stage.path.join("output.cso"), b"failed cso bytes").unwrap();
+    }
+    // A real write failure: a directory already occupies the report's name.
+    fs::create_dir(stage.path.join("diagnostic.json")).unwrap();
+    let error = root.retain_failure(
+        stage,
+        &serde_json::json!({"reason": "test failure"}),
+        "test failure",
+        write_cso,
+    );
+    (scratch, error)
+}
+
+#[test]
+fn a_report_that_cannot_be_written_is_reported_and_the_cso_is_still_kept() {
+    let (scratch, error) = retained_with_unwritable_report(true);
+    let message = error.to_string();
+    let PspShrinkError::ConversionFailed {
+        evidence,
+        cso_retained,
+        report_error,
+        manifest_error,
+        ..
+    } = &error
+    else {
+        panic!("{error:?}");
+    };
+    assert!(*cso_retained);
+    assert!(report_error.is_some(), "{error:?}");
+    assert!(manifest_error.is_none());
+    assert_eq!(
+        fs::read(evidence.join("output.cso")).unwrap(),
+        b"failed cso bytes"
+    );
+    assert!(message.contains("The failed CSO is kept at"), "{message}");
+    assert!(
+        message.contains("its report could not be written"),
+        "{message}"
+    );
+    assert!(!message.contains("and its report are kept"), "{message}");
+    let lines = scratch.manifest_lines();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["report_written"], false);
+    assert_eq!(lines[0]["failed_cso_kept"], true);
+}
+
+#[test]
+fn neither_cso_nor_report_is_described_as_kept_when_neither_exists() {
+    let (scratch, error) = retained_with_unwritable_report(false);
+    let message = error.to_string();
+    assert!(
+        message.contains("No CSO was written and no complete report could be saved"),
+        "{message}"
+    );
+    assert!(!message.contains("The failed CSO"), "{message}");
+    assert_eq!(scratch.manifest_lines()[0]["failed_cso_kept"], false);
+}
+
+#[test]
+fn a_written_report_is_recorded_as_written() {
+    let scratch = Scratch::new();
+    let (source, _) = scratch.source();
+    let _ = convert_psp_iso_to_cso(
+        &source,
+        &scratch.output(),
+        &disagreeing(),
+        &scratch.placement(),
+    )
+    .unwrap_err();
+    let lines = scratch.manifest_lines();
+    assert_eq!(lines[0]["report_written"], true);
+    assert_eq!(lines[0]["failed_cso_kept"], true);
+}
+
+// Probe files a failed location could not remove are reported by refusing,
+// never left behind silently while another location is used.
+#[test]
+fn a_location_whose_probe_files_cannot_be_removed_is_not_silently_passed_over() {
+    for (hooks, expected) in [
+        (
+            super::diagnostics::ProbeHooks {
+                sync: Some(libc::EACCES),
+                remove: Some(libc::EBUSY),
+                ..Default::default()
+            },
+            DestinationProblem::PermissionDenied,
+        ),
+        (
+            super::diagnostics::ProbeHooks {
+                remove: Some(libc::EBUSY),
+                ..Default::default()
+            },
+            DestinationProblem::Other,
+        ),
+    ] {
+        let scratch = Scratch::new();
+        let first = configured_location(&scratch.root, "diag-first", false);
+        let second = configured_location(&scratch.root, "diag-second", false);
+        let placement = two_locations(&scratch, first.clone(), second.clone());
+        let (source, bytes) = scratch.source();
+        let error = with_probe_hooks(hooks, || {
+            convert_psp_iso_to_cso(&source, &scratch.output(), &reference(), &placement)
+                .unwrap_err()
+        });
+        match &error {
+            PspShrinkError::DestinationUnsuitable { problem, detail } => {
+                assert_eq!(*problem, expected);
+                assert!(detail.contains("could not be removed"), "{detail}");
+                assert!(detail.contains(&first.display().to_string()), "{detail}");
+            }
+            other => panic!("{expected:?}: {other:?}"),
+        }
+        assert!(
+            !second.join("psp-cso").exists(),
+            "{expected:?}: second not tried"
+        );
+        assert!(!scratch.output().exists());
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+    }
+}
+
+// Report sync failure (Codex P2): a real conversion failure whose
+// diagnostic.json is written but cannot be synced.
+#[test]
+fn a_report_that_cannot_be_synced_is_reported_and_the_cso_is_still_kept() {
+    let scratch = Scratch::new();
+    let (source, bytes) = scratch.source();
+    let hooks = super::diagnostics::ProbeHooks {
+        report_sync: Some(libc::EIO),
+        ..Default::default()
+    };
+    let error = with_probe_hooks(hooks, || {
+        convert_psp_iso_to_cso(
+            &source,
+            &scratch.output(),
+            &disagreeing(),
+            &scratch.placement(),
+        )
+        .unwrap_err()
+    });
+    let message = error.to_string();
+    let PspShrinkError::ConversionFailed {
+        evidence,
+        cso_retained,
+        report_error,
+        manifest_error,
+        ..
+    } = &error
+    else {
+        panic!("{error:?}");
+    };
+    assert!(*cso_retained);
+    let report_error = report_error.as_deref().expect("sync failure reported");
+    assert!(
+        report_error.contains("Input/output error"),
+        "{report_error}"
+    );
+    assert!(manifest_error.is_none(), "manifest still written");
+    assert!(evidence.join("output.cso").is_file(), "failed CSO kept");
+    assert!(message.contains("The failed CSO is kept at"), "{message}");
+    assert!(
+        message.contains("diagnostic.json is missing or incomplete"),
+        "{message}"
+    );
+    assert!(!message.contains("and its report are kept"), "{message}");
+    assert_eq!(scratch.manifest_lines()[0]["report_written"], false);
+    assert!(!scratch.output().exists());
+    assert_eq!(fs::read(&source).unwrap(), bytes);
+}
+
+// Manifest failure stays visible alongside a report failure.
+#[test]
+fn report_and_manifest_failures_are_both_reported() {
+    let scratch = Scratch::new();
+    let root = DiagnosticsRoot::resolve(&scratch.root.join("out"), &scratch.placement()).unwrap();
+    let stage = root
+        .create_stage(&serde_json::json!({"kind": "test"}))
+        .unwrap();
+    fs::write(stage.path.join("output.cso"), b"failed cso bytes").unwrap();
+    fs::create_dir(stage.path.join("diagnostic.json")).unwrap();
+    fs::create_dir(scratch.diagnostics().join("manifest.jsonl")).unwrap();
+    let error = root.retain_failure(stage, &serde_json::json!({}), "test failure", true);
+    let message = error.to_string();
+    let PspShrinkError::ConversionFailed {
+        report_error,
+        manifest_error,
+        ..
+    } = &error
+    else {
+        panic!("{error:?}");
+    };
+    assert!(
+        report_error.is_some() && manifest_error.is_some(),
+        "{error:?}"
+    );
+    assert!(
+        message.contains("its report could not be written"),
+        "{message}"
+    );
+    assert!(message.contains("could not be listed"), "{message}");
 }

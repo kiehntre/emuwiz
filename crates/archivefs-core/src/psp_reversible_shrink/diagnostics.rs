@@ -36,6 +36,7 @@ pub const PSP_CSO_DIAGNOSTICS: &str = "psp-cso";
 const STAGING: &str = "staging";
 const FAILED: &str = "failed";
 const MANIFEST: &str = "manifest.jsonl";
+const REPORT: &str = "diagnostic.json";
 /// Space kept free beyond the computed need (filesystem metadata, reports).
 pub const FREE_SPACE_MARGIN: u64 = 64 * 1024 * 1024;
 
@@ -113,12 +114,22 @@ pub(super) struct ProbeHooks {
     pub sync: Option<i32>,
     pub link: Option<i32>,
     pub remove: Option<i32>,
+    /// Fails the `sync_all` of `diagnostic.json` (not a probe operation;
+    /// kept here so one test seam covers every injected sync failure).
+    pub report_sync: Option<i32>,
 }
 
 #[cfg(test)]
 thread_local! {
     pub(super) static PROBE_HOOKS: std::cell::Cell<ProbeHooks> =
-        const { std::cell::Cell::new(ProbeHooks { sync: None, link: None, remove: None }) };
+        const {
+            std::cell::Cell::new(ProbeHooks {
+                sync: None,
+                link: None,
+                remove: None,
+                report_sync: None,
+            })
+        };
 }
 
 #[cfg(test)]
@@ -165,12 +176,49 @@ fn classify_probe_error(error: &io::Error, linking: bool) -> DestinationProblem 
     }
 }
 
+/// Whether a probe failure belongs to one diagnostics location (its own
+/// permissions or an error there) rather than to the whole filesystem (no
+/// hard links, read-only, full). Only location-specific failures let the
+/// next eligible location be tried.
+fn is_location_specific(problem: DestinationProblem) -> bool {
+    match problem {
+        DestinationProblem::PermissionDenied | DestinationProblem::Other => true,
+        DestinationProblem::HardLinksUnsupported
+        | DestinationProblem::ReadOnly
+        | DestinationProblem::StorageFull => false,
+    }
+}
+
+/// [`probe_reporting_leftovers`] without the leftover flag, for tests.
+#[cfg(test)]
+pub(super) fn probe_hard_links(staging: &Path) -> Result<(), PspShrinkError> {
+    probe_reporting_leftovers(staging).map_err(ProbeFailure::into_error)
+}
+
+/// Why the hard-link probe failed, and whether it left probe files behind.
+struct ProbeFailure {
+    problem: DestinationProblem,
+    detail: String,
+    left_files: bool,
+}
+
+impl ProbeFailure {
+    fn into_error(self) -> PspShrinkError {
+        PspShrinkError::DestinationUnsuitable {
+            problem: self.problem,
+            detail: self.detail,
+        }
+    }
+}
+
 /// Proves the filesystem can make the no-clobber hard link that publication
 /// uses, before any expensive work. Creates a disposable probe file
 /// (`create_new`, so it is always this call's own) and one link to it inside
 /// the private `staging` folder, then removes exactly the names this call
-/// created, on every path. A removal that fails is reported, never ignored.
-pub(super) fn probe_hard_links(staging: &Path) -> Result<(), PspShrinkError> {
+/// created, on every path. A removal that fails is reported, never ignored:
+/// `left_files` is `true` when a probe file could not be removed, and such a
+/// location is never silently left behind for another.
+fn probe_reporting_leftovers(staging: &Path) -> Result<(), ProbeFailure> {
     let id = unique_id();
     let probe = staging.join(format!(".link-probe-{id}"));
     let linked = staging.join(format!(".link-probe-{id}.link"));
@@ -179,9 +227,10 @@ pub(super) fn probe_hard_links(staging: &Path) -> Result<(), PspShrinkError> {
         .create_new(true)
         .write(true)
         .open(&probe)
-        .map_err(|error| PspShrinkError::DestinationUnsuitable {
+        .map_err(|error| ProbeFailure {
             problem: classify_probe_error(&error, false),
             detail: format!("creating a probe file in {place}: {error}"),
+            left_files: false,
         })?;
     // From here on `probe` is ours and is removed whatever happens.
     let mut created = vec![probe.clone()];
@@ -216,18 +265,23 @@ pub(super) fn probe_hard_links(staging: &Path) -> Result<(), PspShrinkError> {
             leftovers.join("; ")
         )
     };
+    let left = !leftovers.is_empty();
     match outcome {
-        Ok(()) if leftovers.is_empty() => Ok(()),
-        Ok(()) => Err(PspShrinkError::DestinationUnsuitable {
+        Ok(()) if !left => Ok(()),
+        Ok(()) => Err(ProbeFailure {
             problem: DestinationProblem::Other,
             detail: format!("the hard-link check passed, but {}", cleanup()),
+            left_files: true,
         }),
-        Err((problem, detail)) if leftovers.is_empty() => {
-            Err(PspShrinkError::DestinationUnsuitable { problem, detail })
-        }
-        Err((problem, detail)) => Err(PspShrinkError::DestinationUnsuitable {
+        Err((problem, detail)) if !left => Err(ProbeFailure {
+            problem,
+            detail,
+            left_files: false,
+        }),
+        Err((problem, detail)) => Err(ProbeFailure {
             problem,
             detail: format!("{detail}; {}", cleanup()),
+            left_files: true,
         }),
     }
 }
@@ -322,21 +376,46 @@ impl DiagnosticsRoot {
             ));
         }
         let mut skipped = Vec::new();
+        // The last probe failure that belonged to one location only; if no
+        // later location works, it is the refusal (with the other reasons).
+        let mut location_failure: Option<(DestinationProblem, String)> = None;
         for (source, base, create_base) in candidates {
             match Self::try_candidate(&base, create_base, device, &placement.source_folders) {
-                Ok(dir) => {
-                    // Same device as the output (checked above), so this is
-                    // the destination filesystem's own hard-link capability.
-                    probe_hard_links(&dir.join(STAGING))?;
-                    return Ok(Self {
-                        dir,
-                        device,
-                        source,
-                        skipped,
-                    });
-                }
+                Ok(dir) => match probe_reporting_leftovers(&dir.join(STAGING)) {
+                    Ok(()) => {
+                        return Ok(Self {
+                            dir,
+                            device,
+                            source,
+                            skipped,
+                        });
+                    }
+                    // Every candidate is on the output's own device (checked
+                    // in try_candidate), so a filesystem-wide problem cannot
+                    // be avoided by another location: refuse at once. So does
+                    // a probe that left files behind, so the leftover is
+                    // reported now instead of only in a later intent.json.
+                    Err(ProbeFailure {
+                        problem,
+                        detail,
+                        left_files: false,
+                    }) if is_location_specific(problem) => {
+                        skipped.push(format!("{}: {detail}", base.display()));
+                        location_failure = Some((problem, detail));
+                    }
+                    Err(failure) => return Err(failure.into_error()),
+                },
                 Err(reason) => skipped.push(format!("{}: {reason}", base.display())),
             }
+        }
+        if let Some((problem, _)) = location_failure {
+            return Err(PspShrinkError::DestinationUnsuitable {
+                problem,
+                detail: format!(
+                    "no eligible diagnostics location on the output's disk could be used ({}). {CONFIGURE_HINT}",
+                    skipped.join("; ")
+                ),
+            });
         }
         Err(unavailable(format!(
             "no safe diagnostics folder on the output's disk ({}). {CONFIGURE_HINT}",
@@ -429,16 +508,20 @@ impl DiagnosticsRoot {
         Ok(Stage { id, path })
     }
 
-    /// Moves a failed stage to `failed/<id>` (same filesystem, no copy),
-    /// writes `diagnostic.json` and appends the manifest line. Never deletes
-    /// evidence: if the move fails the stage stays where it is.
+    /// Writes `diagnostic.json`, moves a failed stage to `failed/<id>` (same
+    /// filesystem, no copy) and appends the manifest line. Never deletes
+    /// evidence: if the move fails the stage stays where it is. A report that
+    /// could not be written is reported in the error, never claimed as kept.
     pub(super) fn retain_failure(
         &self,
         stage: Stage,
         report: &serde_json::Value,
         reason: &str,
+        cso_retained: bool,
     ) -> PspShrinkError {
-        let _ = write_new(&stage.path.join("diagnostic.json"), &to_json_bytes(report));
+        let report_error = write_report(&stage.path.join(REPORT), &to_json_bytes(report))
+            .err()
+            .map(|error| error.to_string());
         let target = self.dir.join(FAILED).join(&stage.id);
         let evidence = if !target.exists() && fs::rename(&stage.path, &target).is_ok() {
             target
@@ -452,6 +535,8 @@ impl DiagnosticsRoot {
             "evidence": evidence.to_string_lossy(),
             "bytes": bytes,
             "reason": reason,
+            "failed_cso_kept": cso_retained,
+            "report_written": report_error.is_none(),
             "recorded_unix": unix_now(),
         });
         let manifest = self.dir.join(MANIFEST);
@@ -461,6 +546,8 @@ impl DiagnosticsRoot {
         PspShrinkError::ConversionFailed {
             reason: reason.to_string(),
             evidence,
+            cso_retained,
+            report_error,
             manifest,
             manifest_error,
         }
@@ -568,6 +655,17 @@ fn to_json_bytes(value: &serde_json::Value) -> Vec<u8> {
 pub(super) fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
     file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// [`write_new`] for `diagnostic.json`, with a test seam on its sync.
+fn write_report(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    file.write_all(bytes)?;
+    #[cfg(test)]
+    if let Some(error) = hooked(|hooks| hooks.report_sync) {
+        return Err(error);
+    }
     file.sync_all()
 }
 
