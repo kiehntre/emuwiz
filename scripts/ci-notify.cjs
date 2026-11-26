@@ -6,16 +6,29 @@ const path = require('node:path');
 // Mirror the existing CI contract, without changing its gates. Unknown jobs
 // are also inspected; missing mandatory jobs cannot silently count as success.
 const ALWAYS = [
-  'Classify change risk', 'Repository guardrails', 'Clippy warning ratchet',
+  'Classify change risk', 'Repository guardrails', 'Formatting', 'Clippy warning ratchet',
   'R2 filesystem gate', 'Dependency and secret audit', 'Test shard coverage', 'CI gate',
   'DOSBox sandbox enforcement (ubuntu-24.04)',
   'DOSBox sandbox enforcement (ubuntu-latest)',
 ];
-const FULL = [
-  'Installer script tests', 'Maintenance script tests', 'Create canonical artifact', 'Verify downloaded artifact',
-  'Reproducibility build 1', 'Reproducibility build 2', 'Reproducibility',
+// Full-tier matrix jobs: Actions evaluates a job-level if before expanding a
+// matrix, so a skipped one appears once under its unexpanded name.
+const MATRIX_FULL = [
+  {unexpanded: 'Installer script tests (${{ matrix.suite }})',
+    expanded: ['install', 'upgrade', 'assets'].map(s => `Installer script tests (${s})`)},
+  {unexpanded: 'Maintenance script tests (${{ matrix.group }})',
+    expanded: [1, 2, 3, 4].map(g => `Maintenance script tests (${g})`)},
+  {unexpanded: 'Reject malformed artifacts (${{ matrix.group }})',
+    expanded: [1, 2].map(g => `Reject malformed artifacts (${g})`)},
+  {unexpanded: 'Reproducibility build ${{ matrix.run }}',
+    expanded: ['Reproducibility build 1', 'Reproducibility build 2']},
 ];
-const UNEXPANDED_BUILD = 'Reproducibility build ${{ matrix.run }}';
+const FULL = [
+  ...MATRIX_FULL[0].expanded, ...MATRIX_FULL[1].expanded, 'Create canonical artifact', 'Verify downloaded artifact',
+  ...MATRIX_FULL[2].expanded, ...MATRIX_FULL[3].expanded, 'Reproducibility',
+];
+// Must match scripts/ci_test_shards.py (SHARDS and GUI_TIER_SHARDS).
+const SHARDS = ['recovery', 'dat', 'gui-v2-shell', 'gui-v2', 'core-data', 'rest'];
 const ANALYZE = ['actions', 'c-cpp', 'python', 'rust'].map(x => `Analyze (${x})`);
 // One marker per PR, exact head and result. A changed result (e.g. FAILED, rerun,
 // then READY) is a new notification; the same result for the same head is not.
@@ -50,19 +63,21 @@ function decide({runs, jobs, tier, checks, statuses, mergeable, mergeStateStatus
       checks.some(c => c.status !== 'completed') ||
       statuses.some(s => s.state === 'pending')) return {status: 'PENDING'};
 
-  const shards = tier === 'gui' ? ['gui-tier-v2', 'gui-tier-other'] : ['recovery', 'dat', 'gui-v2', 'rest'];
+  const shards = tier === 'gui' ? ['gui-tier-v2', 'gui-tier-other'] : SHARDS;
   const ciJobs = jobs.filter(j => j.run_id === runs[0].id);
   const classifiedFast = (tier === 'core' || tier === 'gui') && ciJobs.some(j =>
     j.name === 'Classify change risk' && j.conclusion === 'success');
-  // Actions evaluates the job-level if before expanding a skipped matrix.
-  // Accept only that exact single skipped CI job, never missing full builds.
-  const unexpanded = ciJobs.filter(j => j.name === UNEXPANDED_BUILD);
-  const collapsedBuilds = classifiedFast && unexpanded.length === 1 &&
-    unexpanded[0].conclusion === 'skipped' &&
-    !ciJobs.some(j => /^Reproducibility build [12]$/.test(j.name));
-  const fullJobs = collapsedBuilds
-    ? [...FULL.filter(n => !/^Reproducibility build [12]$/.test(n)), UNEXPANDED_BUILD]
-    : FULL;
+  // Accept a collapsed matrix only as that exact single skipped CI job on a
+  // classified fast tier, never with any of its expanded jobs present.
+  const collapsed = MATRIX_FULL.filter(m => {
+    const unexpanded = ciJobs.filter(j => j.name === m.unexpanded);
+    return classifiedFast && unexpanded.length === 1 && unexpanded[0].conclusion === 'skipped' &&
+      !ciJobs.some(j => m.expanded.includes(j.name));
+  });
+  const fullJobs = [
+    ...FULL.filter(n => !collapsed.some(m => m.expanded.includes(n))),
+    ...collapsed.map(m => m.unexpanded),
+  ];
   const expected = [
     [...ALWAYS, ...fullJobs, ...shards.map(s => `Formatting and relevant tests (${s})`)],
     ANALYZE,
@@ -82,7 +97,7 @@ function decide({runs, jobs, tier, checks, statuses, mergeable, mergeStateStatus
   // Only the seven full-tier jobs may skip, only on core/gui PRs,
   // and only when classification itself succeeded. Never allowlist by name alone.
   const expectedSkip = j => classifiedFast && j.run_id === runs[0].id &&
-    (FULL.includes(j.name) || (collapsedBuilds && j.name === UNEXPANDED_BUILD));
+    (FULL.includes(j.name) || collapsed.some(m => m.unexpanded === j.name));
   const allowedCheckIds = new Set(jobs.filter(j => expectedSkip(j) &&
     j.conclusion === 'skipped').map(j => Number(j.check_run_url.split('/').pop())));
   for (const j of jobs) {
@@ -198,4 +213,4 @@ async function notify({github, context, core, dryRun = false}) {
   }
 }
 
-module.exports = {ALWAYS, FULL, ANALYZE, marker, classify, decide, notify};
+module.exports = {ALWAYS, FULL, MATRIX_FULL, SHARDS, ANALYZE, marker, classify, decide, notify};

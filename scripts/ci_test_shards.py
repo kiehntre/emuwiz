@@ -26,13 +26,20 @@ import pathlib
 import re
 import sys
 
-# Groups balance wall time only (from CI logs of 2026-10-24): moving a module
-# can shift the balance but never drops or duplicates a test.
+# Groups balance wall time only (FORGE H1b, from CI logs of 2026-11-25/26):
+# moving a module can shift the balance but never drops or duplicates a test.
+# First match wins, so gui-v2-shell must precede gui-v2. Measured medians of the
+# old four shards: gui-v2 571 s, rest 443 s, recovery 277 s, dat 271 s.
 SHARDS: list[tuple[str, list[str]]] = [
-    # One ~530 s and one ~410 s crash-injection test; run beside the others.
+    # Longest single test (~260 s median, 382 s max) is an interrupted-apply
+    # crash-injection test; it sets this shard's floor.
     ("recovery", ["interrupted_apply_tests::", "memory_card_inventory::"]),
     ("dat", ["dat::"]),
+    # gui_v2::tests is ~57% of the old gui-v2 shard.
+    ("gui-v2-shell", ["gui_v2::tests::"]),
     ("gui-v2", ["gui_v2::"]),
+    # database and folder_platform_check are the two largest core groups left in rest.
+    ("core-data", ["database::", "folder_platform_check::"]),
     ("rest", []),
 ]
 
