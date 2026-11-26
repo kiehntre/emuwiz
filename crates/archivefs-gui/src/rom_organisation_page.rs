@@ -2526,11 +2526,21 @@ pub(crate) fn show_rom_organisation_page_with_busy(
     show_rom_organisation_page_with_options(ui, state, async_busy, canonical_only, false)
 }
 
+/// Shown wherever Organise & Export refuses a mode or scope change because a
+/// preview, apply or other organisation job is running.
+pub(crate) const ORGANISATION_BUSY_NOTICE: &str = "Organise & Export is busy with a preview or apply. Its mode and scope stay as they are until that has finished.";
+
 pub(crate) fn show_quick_rename_page_with_busy(
     ui: &mut egui::Ui,
     state: &mut RomOrganisationPageState,
     async_busy: bool,
 ) -> Option<RomOrganisationPageAction> {
+    // Quick Rename is reached from several routes; a running job keeps the
+    // mode it started with, so the switch to Rename waits for it here.
+    if async_busy && !state.uses_scope() {
+        ui.label(ORGANISATION_BUSY_NOTICE);
+        return None;
+    }
     state.ensure_mode(OrganisationMode::RenameInPlace);
     state.restrict_quick_rename_approvals();
     show_rom_organisation_page_with_options(ui, state, async_busy, true, true)

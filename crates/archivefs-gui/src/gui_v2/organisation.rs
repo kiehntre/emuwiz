@@ -18,8 +18,6 @@ use crate::{
 };
 use eframe::egui::{self, RichText};
 
-use archivefs_core::dat::rom_organisation::OrganisationMode;
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum OrganisationView {
     #[default]
@@ -38,6 +36,8 @@ pub(super) enum OrganisationView {
 pub(super) struct OrganisationState {
     pub(super) r2: super::r2_rename::State,
     pub(super) view: OrganisationView,
+    /// Why a mode or scope change was refused while a job runs (job card).
+    pub(super) busy_notice: Option<String>,
     pub(super) frontend_export: crate::publisher_profile_page::PublisherProfilePageState,
     /// MAME merged reconstruction: preview, publish and Undo run as
     /// background jobs owned by the panel.
@@ -49,6 +49,7 @@ impl Default for OrganisationState {
     fn default() -> Self {
         Self {
             view: OrganisationView::Landing,
+            busy_notice: None,
             r2: Default::default(),
             frontend_export: Default::default(),
             mame_reconstruction: Default::default(),
@@ -657,9 +658,7 @@ impl App {
                     // The novice "Rename verified games" intent is a real
                     // projection of the existing DAT-backed rename engine,
                     // not a generic move workflow with a friendlier label.
-                    self.canonical_organisation
-                        .set_mode(OrganisationMode::RenameInPlace);
-                    self.organisation.view = OrganisationView::VerifiedGames;
+                    self.open_rename_verified_games();
                 }
                 Some(destination) => {
                     self.playing_library.set_destination(destination);
@@ -717,6 +716,9 @@ impl App {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             if super::job_card::show(ui, job, true).cancel {
                 job.request_cancel();
+            }
+            if let Some(notice) = &self.organisation.busy_notice {
+                ui.label(notice);
             }
         });
     }
