@@ -41,6 +41,14 @@ pub(super) fn platform_scope(library: &Library, names: &BTreeSet<String>) -> Org
 impl App {
     /// Opens Rename verified games with this scope.
     pub(super) fn open_bulk_rename(&mut self, scope: OrganisationScope) {
+        // A running preview or apply keeps the mode and scope it started with.
+        if self.canonical_organisation_job.is_some() {
+            self.library_selection.notice = Some(
+                "Organise & Export is busy. Rename the selection when the current job has finished."
+                    .into(),
+            );
+            return;
+        }
         self.canonical_organisation
             .ensure_mode(OrganisationMode::RenameInPlace);
         self.canonical_organisation.set_scope(Some(scope));

@@ -518,9 +518,30 @@ impl RomOrganisationPageState {
         self.mode == OrganisationMode::RenameInPlace
     }
 
+    /// Changing the mode discards everything built for the previous one: the
+    /// preview, its approvals and confirmation, and the file list (a scoped
+    /// rename lists only its scope's files). The next preview starts afresh:
+    /// Move and link modes walk the configured source folders, Rename walks
+    /// its chosen scope. The chosen scope is kept and applies to Rename only.
     pub(crate) fn set_mode(&mut self, mode: OrganisationMode) {
+        let changed = self.mode != mode;
         self.mode = mode;
         self.plan = None;
+        if changed {
+            self.sources.clear();
+            self.source_scan_incomplete.clear();
+            self.not_on_disk.clear();
+            self.other_filesystems.clear();
+            self.saved_checks.clear();
+            self.name_choices.clear();
+            self.sources_scanned = false;
+            self.plan_page = 0;
+            self.include_hidden_rows = false;
+            self.pending_apply = None;
+            self.confirm_text.clear();
+            self.approved.clear();
+            self.persist_approved_set();
+        }
     }
 
     pub(crate) fn ensure_mode(&mut self, mode: OrganisationMode) {
@@ -2832,19 +2853,28 @@ fn show_rom_organisation_page_with_options(
         ui.add_space(8.0);
         widgets::card(ui, |ui| {
             ui.label(egui::RichText::new("Organisation mode").strong());
-            for mode in [
-                OrganisationMode::RenameInPlace,
-                OrganisationMode::MoveRealFile,
-                OrganisationMode::BuildLinkedLibrary,
-                OrganisationMode::OrganiseSymlinkOnly,
-            ] {
-                let selected = state.mode == mode;
-                if ui
-                    .radio(selected, organisation_mode_plain_label(mode))
-                    .clicked()
-                {
-                    state.set_mode(mode);
+            // A running preview or apply belongs to the mode it started in.
+            ui.add_enabled_ui(!async_busy, |ui| {
+                for mode in [
+                    OrganisationMode::RenameInPlace,
+                    OrganisationMode::MoveRealFile,
+                    OrganisationMode::BuildLinkedLibrary,
+                    OrganisationMode::OrganiseSymlinkOnly,
+                ] {
+                    let selected = state.mode == mode;
+                    if ui
+                        .radio(selected, organisation_mode_plain_label(mode))
+                        .clicked()
+                    {
+                        state.set_mode(mode);
+                    }
                 }
+            });
+            if let (false, Some(scope)) = (state.uses_scope(), state.scope.as_ref()) {
+                ui.label(format!(
+                    "This mode previews every configured source folder. The chosen scope ({}) applies to Rename only.",
+                    scope.label()
+                ));
             }
             ui.label(
                 egui::RichText::new(organisation_mode_plain_explanation(state.mode))
@@ -2873,6 +2903,11 @@ fn show_rom_organisation_page_with_options(
                 page_action = Some(RomOrganisationPageAction::Rescan);
             }
             let scope_ready = !state.uses_scope() || state.scope.is_some();
+            if !scope_ready && !canonical_only {
+                ui.label(
+                    "Rename in place needs a chosen scope: use Organise & Export, Rename verified games, in EmuWiz Blue.",
+                );
+            }
             if widgets::action_button(
                 ui,
                 if async_busy {
@@ -5826,6 +5861,10 @@ pub(crate) mod scope;
 #[cfg(test)]
 #[path = "rom_organisation_page_d2_tests.rs"]
 mod d2_tests;
+
+#[cfg(test)]
+#[path = "rom_organisation_page_mode_switch_tests.rs"]
+mod mode_switch_tests;
 
 #[cfg(test)]
 #[path = "rom_organisation_page_bench_tests.rs"]
