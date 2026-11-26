@@ -315,7 +315,7 @@ impl State {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let context = ui.ctx().clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = plan_on_worker(&set, &destination, &writer, &worker_cancel);
             let _ = tx.send(Event::Planned(result));
             context.request_repaint();
@@ -340,7 +340,7 @@ impl State {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let context = ui.ctx().clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let notify = |progress| {
                 let _ = tx.send(Event::Progress(progress));
                 context.request_repaint();

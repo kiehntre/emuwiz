@@ -54,7 +54,7 @@ impl State {
             target: self.requested.clone(),
             receiver: rx,
         });
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let r = f();
             let _ = tx.send(r);
             ctx.request_repaint();

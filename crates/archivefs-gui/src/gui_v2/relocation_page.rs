@@ -99,7 +99,7 @@ impl State {
         let ctx = ctx.clone();
         self.busy = true;
         self.rx = Some(rx);
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let _ = tx.send(job());
             ctx.request_repaint();
         });

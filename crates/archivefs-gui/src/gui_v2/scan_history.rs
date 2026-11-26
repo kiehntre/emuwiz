@@ -71,7 +71,7 @@ impl ScanHistoryState {
         let (sender, receiver) = mpsc::channel();
         self.loading = Some(receiver);
         let context = context.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let _ = sender.send(load(&database));
             context.request_repaint();
         });

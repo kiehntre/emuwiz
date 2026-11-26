@@ -73,7 +73,7 @@ impl PlatformAliasesState {
             let (sender, receiver) = mpsc::channel();
             let context = context.clone();
             let path = database.clone();
-            std::thread::spawn(move || {
+            crate::gui_v2::backend::spawn_worker(move || {
                 let _ = sender.send(Self::read(&path));
                 context.request_repaint();
             });
@@ -155,7 +155,7 @@ impl PlatformAliasesState {
         let (sender, receiver) = mpsc::channel();
         let context = context.clone();
         let worker = action.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let _ =
                 sender.send(apply_alias_action_at(&database, &worker).map_err(|e| e.to_string()));
             context.request_repaint();

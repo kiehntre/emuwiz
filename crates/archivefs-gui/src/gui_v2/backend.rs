@@ -443,6 +443,55 @@ pub(super) struct Backend {
     /// test can read the exact command the App sent. Never set in production.
     raw: Option<Sender<(u64, Command)>>,
     pub rx: Receiver<Event>,
+    /// The worker thread, owned so a test fixture can stop and join it (see
+    /// `Drop` below) instead of leaking work into the next test. Production
+    /// never joins: closing the window must not wait for a running job.
+    #[cfg_attr(not(test), allow(dead_code))]
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Starts a GUI v2 background worker thread. In the application this is
+/// exactly `std::thread::spawn`. In tests the worker also inherits the calling
+/// test's own data directory (`archivefs_core::test_environment::
+/// isolate_test_data`), so work a test starts reads and writes that test's
+/// library database - never one another test left in the shared test home.
+pub(crate) fn spawn_worker<F, T>(work: F) -> std::thread::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    #[cfg(test)]
+    let data_scope = archivefs_core::test_environment::current_test_data_scope();
+    std::thread::spawn(move || {
+        #[cfg(test)]
+        archivefs_core::test_environment::enter_test_data_scope(data_scope);
+        work()
+    })
+}
+
+/// Test teardown: a dropped fixture stops its worker deterministically.
+/// Queued commands that never started are discarded, the wake channel is
+/// closed so the worker's loop ends, and the drop waits for the one command
+/// already running (if any) to finish, so no work outlives its test.
+#[cfg(test)]
+impl Drop for Backend {
+    fn drop(&mut self) {
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        {
+            let mut queues = self
+                .queues
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queues.recovery.clear();
+            queues.ordinary.clear();
+        }
+        self.wake = mpsc::channel().0;
+        // A panic inside a command was already turned into an answer; a panic
+        // here would only repeat it while the test is unwinding.
+        let _ = worker.join();
+    }
 }
 
 impl Backend {
@@ -451,7 +500,7 @@ impl Backend {
         let (answers, rx) = mpsc::channel();
         let queues = Arc::new(std::sync::Mutex::new(Queues::default()));
         let worker_queues = Arc::clone(&queues);
-        std::thread::spawn(move || {
+        let worker = spawn_worker(move || {
             while tokens.recv().is_ok() {
                 // One token was sent per queued command, so there is always
                 // something to take; recovery work is taken first.
@@ -482,6 +531,7 @@ impl Backend {
             wake,
             raw: None,
             rx,
+            worker: Some(worker),
         }
     }
     /// A backend whose "worker" is the test: every command goes straight to
@@ -494,6 +544,7 @@ impl Backend {
             wake,
             raw: Some(requests),
             rx,
+            worker: None,
         }
     }
     /// A backend whose worker is gone: every command is refused before it can
@@ -507,6 +558,7 @@ impl Backend {
             wake,
             raw: None,
             rx,
+            worker: None,
         }
     }
     pub fn send(&self, id: u64, command: Command) -> Result<(), String> {

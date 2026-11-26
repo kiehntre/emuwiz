@@ -186,7 +186,7 @@ impl State {
             let context = context.clone();
             let (sender, receiver) = mpsc::channel();
             self.receiver = Some(receiver);
-            std::thread::spawn(move || {
+            crate::gui_v2::backend::spawn_worker(move || {
                 let result = read_game(&game);
                 let _ = sender.send(result);
                 context.request_repaint();

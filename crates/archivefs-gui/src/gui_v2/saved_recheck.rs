@@ -161,7 +161,7 @@ impl State {
         self.receiver = Some(receiver);
         self.cancel = Some(cancel.clone());
         self.stage = stage;
-        std::thread::spawn(move || job(sender, cancel));
+        crate::gui_v2::backend::spawn_worker(move || job(sender, cancel));
     }
 
     /// Lists what needs checking again, with `list` run on a worker.

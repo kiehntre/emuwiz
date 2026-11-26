@@ -53,6 +53,10 @@ pub(super) fn archive(id: i64, title: &str, platform: Option<&str>) -> Persisted
 }
 
 pub(super) fn fixture(context: &egui::Context) -> App {
+    // Each test gets its own library database location, and the Backend
+    // worker started below inherits it: no test can depend on, or disturb, a
+    // library database another test in this process created.
+    archivefs_core::test_environment::isolate_test_data();
     readable_style(context);
     App {
         router: Router::default(),

@@ -420,6 +420,103 @@ pub fn private_home_for_fixtures() -> PathBuf {
     home
 }
 
+/// One test's own library database directory, inside this process's private
+/// tree.
+///
+/// The process-level isolation above gives every test in a binary the *same*
+/// private `$HOME`, so a test could pass or fail depending on whether an
+/// earlier test happened to create the library database there. A test -
+/// normally through its GUI fixture - calls [`isolate_test_data`]; from then
+/// on [`crate::default_database_path`] on that thread, and on worker threads
+/// it hands the scope to with [`enter_test_data_scope`], resolves inside this
+/// directory. It is removed when the last holder (the test thread or one of
+/// its workers) drops it.
+///
+/// Deliberately only the library database: undo seals, rename journals and
+/// writer records are resolved through `$HOME`, process-level stores and their
+/// own threads, and one transaction's evidence must never be split between
+/// two directories. Those stay in the process tree, as before.
+pub struct TestDataScope {
+    data_dir: PathBuf,
+}
+
+impl TestDataScope {
+    /// The directory this scope resolves the data directory to.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+}
+
+impl Drop for TestDataScope {
+    fn drop(&mut self) {
+        // Only ever a real directory inside this process's private tree.
+        if is_real_directory(&self.data_dir)
+            && isolated_root().is_some_and(|root| self.data_dir.starts_with(root))
+        {
+            let _ = std::fs::remove_dir_all(&self.data_dir);
+        }
+    }
+}
+
+thread_local! {
+    static TEST_DATA_SCOPE: std::cell::RefCell<Option<std::sync::Arc<TestDataScope>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Gives the calling test thread its own (initially absent) library database.
+/// Idempotent within one test: a second call (a "fresh app after a restart" in
+/// the same test) returns the same scope, so that test still sees its own
+/// database. `None` when this process is not isolated (the deliberate
+/// real-machine opt-in, used by child processes that bring their own profile):
+/// nothing changes for them.
+pub fn isolate_test_data() -> Option<std::sync::Arc<TestDataScope>> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if let Some(scope) = current_test_data_scope() {
+        return Some(scope);
+    }
+    let root = isolated_root()?;
+    let parent = root.join("per-test-data");
+    std::fs::create_dir_all(&parent).expect("create the per-test data parent");
+    assert!(
+        is_real_directory(&parent),
+        "{parent:?} must not be a symlink"
+    );
+    let data_dir = parent.join(
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_string(),
+    );
+    std::fs::create_dir(&data_dir).expect("create a per-test data directory exclusively");
+    let scope = std::sync::Arc::new(TestDataScope { data_dir });
+    TEST_DATA_SCOPE.with(|slot| *slot.borrow_mut() = Some(scope.clone()));
+    Some(scope)
+}
+
+/// The calling thread's data scope, if any: what a component that starts a
+/// worker thread hands to [`enter_test_data_scope`] on that thread.
+pub fn current_test_data_scope() -> Option<std::sync::Arc<TestDataScope>> {
+    // `try_with`: during thread teardown the slot may already be gone.
+    TEST_DATA_SCOPE
+        .try_with(|slot| slot.borrow().clone())
+        .ok()
+        .flatten()
+}
+
+/// Makes the calling (worker) thread resolve data exactly like the test thread
+/// that created `scope`, for the rest of this thread's life. `None` is a no-op.
+pub fn enter_test_data_scope(scope: Option<std::sync::Arc<TestDataScope>>) {
+    if let Some(scope) = scope {
+        TEST_DATA_SCOPE.with(|slot| *slot.borrow_mut() = Some(scope));
+    }
+}
+
+/// For [`crate::default_database_path`]: the active scope's directory.
+pub(crate) fn scoped_database_dir() -> Option<PathBuf> {
+    TEST_DATA_SCOPE
+        .try_with(|slot| slot.borrow().as_ref().map(|scope| scope.data_dir.clone()))
+        .ok()
+        .flatten()
+}
+
 /// This binary's test environment trees belonging to process `pid` (any
 /// start), beside this process's own tree. For a parent that re-executed this
 /// test binary as a child: the child's tree name is not predictable, but it
@@ -694,6 +791,42 @@ mod tests {
             !try_lock(&lock),
             "the owner lock must be held for the process lifetime"
         );
+    }
+
+    #[test]
+    fn a_test_database_scope_is_private_to_its_test_and_shared_with_its_workers() {
+        let Some(root) = isolated() else { return };
+        let process_database = crate::default_database_path().unwrap();
+        let process_data = crate::app_dirs::data_dir().unwrap();
+        let scope = isolate_test_data().unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&scope, &isolate_test_data().unwrap()),
+            "idempotent"
+        );
+        let scoped = crate::default_database_path().unwrap();
+        assert_eq!(scoped, scope.data_dir().join("library.sqlite3"));
+        assert!(scoped.starts_with(root) && scoped != process_database);
+        // Everything else stays in the process tree (see `TestDataScope`).
+        assert_eq!(crate::app_dirs::data_dir().unwrap(), process_data);
+        // Another test thread gets its own; a worker handed the scope shares it.
+        let other = std::thread::spawn(|| isolate_test_data().unwrap().data_dir().to_path_buf())
+            .join()
+            .unwrap();
+        assert_ne!(other, scope.data_dir());
+        assert!(!other.exists(), "a finished test's scope is removed");
+        let handed = current_test_data_scope();
+        let seen = std::thread::spawn(move || {
+            enter_test_data_scope(handed);
+            crate::default_database_path().unwrap()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(seen, scoped);
+        // A thread without a scope still resolves the process tree.
+        let plain = std::thread::spawn(|| crate::default_database_path().unwrap())
+            .join()
+            .unwrap();
+        assert_eq!(plain, process_database);
     }
 
     #[test]

@@ -290,7 +290,7 @@ impl State {
         self.phase = Phase::Working("Preparing the preview. Nothing is moved yet.");
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = (|| {
                 let config = archivefs_core::Config::load_default().map_err(|e| e.to_string())?;
                 let roots = config.source_folders.clone();
@@ -360,7 +360,7 @@ impl State {
         self.phase = Phase::Working("Moving the approved games. Each move is journalled.");
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let (report, transactions, records) = apply_plans(&plans, &folders);
             let _ = sender.send(Message::Applied(Box::new(report), transactions, records));
         });
@@ -375,7 +375,7 @@ impl State {
         self.phase = Phase::Working("Finishing interrupted folder moves. Nothing new is moved.");
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let mut report = Report::default();
             match archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir() {
                 Ok(journal) => settle_folder_moves(&journal, &mut report),
