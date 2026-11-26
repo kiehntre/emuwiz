@@ -1428,6 +1428,7 @@ impl App {
         if self.canonical_organisation_job.is_some() {
             return;
         }
+        self.organisation.busy_notice = None;
         self.canonical_organisation_generation =
             self.canonical_organisation_generation.wrapping_add(1);
         let generation = self.canonical_organisation_generation;

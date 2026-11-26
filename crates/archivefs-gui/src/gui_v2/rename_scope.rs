@@ -39,8 +39,38 @@ pub(super) fn platform_scope(library: &Library, names: &BTreeSet<String>) -> Org
 }
 
 impl App {
+    /// The one check every Blue entry point makes before changing the
+    /// Organise & Export mode or scope: while a preview, apply or other
+    /// organisation job runs, the page keeps the mode and scope that job
+    /// started with, and the job card says why.
+    pub(super) fn organisation_may_change(&mut self) -> bool {
+        if self.canonical_organisation_job.is_none() {
+            self.organisation.busy_notice = None;
+            return true;
+        }
+        self.organisation.busy_notice =
+            Some(crate::rom_organisation_page::ORGANISATION_BUSY_NOTICE.into());
+        false
+    }
+
+    /// The landing page's "Rename verified games".
+    pub(super) fn open_rename_verified_games(&mut self) {
+        if self.organisation_may_change() {
+            self.canonical_organisation
+                .set_mode(OrganisationMode::RenameInPlace);
+        }
+        self.organisation.view = super::organisation::OrganisationView::VerifiedGames;
+    }
+
     /// Opens Rename verified games with this scope.
     pub(super) fn open_bulk_rename(&mut self, scope: OrganisationScope) {
+        if !self.organisation_may_change() {
+            self.library_selection.notice = Some(
+                "Organise & Export is busy. Rename the selection when the current job has finished."
+                    .into(),
+            );
+            return;
+        }
         self.canonical_organisation
             .ensure_mode(OrganisationMode::RenameInPlace);
         self.canonical_organisation.set_scope(Some(scope));
@@ -135,7 +165,9 @@ impl App {
                 }
             });
         });
-        if let Some(scope) = chosen {
+        if let Some(scope) = chosen
+            && self.organisation_may_change()
+        {
             self.canonical_organisation.set_scope(Some(scope));
         }
     }

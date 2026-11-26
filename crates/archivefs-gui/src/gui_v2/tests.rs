@@ -27,6 +27,8 @@ use archivefs_core::persistent_state_inventory::{
 use page_reachability::{scroll_to_text, visible_text};
 use std::{fs, path::Path, sync::atomic::Ordering};
 
+#[path = "tests/library_rename_busy.rs"]
+mod library_rename_busy;
 #[path = "tests/mame_health.rs"]
 mod mame_health_gui;
 
