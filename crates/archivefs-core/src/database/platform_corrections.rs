@@ -681,6 +681,14 @@ fn apply_one(
 ) -> Result<ReceiptRecord> {
     let id = candidate.archive_id;
     let previous_result = result_row(conn, id, &candidate.identity.source.source_id)?;
+    // The result save clears this game's re-check note for the catalogue;
+    // Undo puts it back.
+    let previous_recheck = ResultRow::read_from(
+        conn,
+        "dat_recheck_attempts",
+        "archive_id = ?1 AND dat_source_id = ?2",
+        &[&id, &candidate.identity.source.source_id],
+    )?;
     let retired = conn
         .execute(
             "UPDATE platform_assignments SET is_current = 0 WHERE id = ?1 AND archive_id = ?2 AND is_current = 1",
@@ -733,6 +741,7 @@ fn apply_one(
             },
         ),
         previous_result,
+        previous_recheck,
         applied_result_id: applied_result.id,
         applied_result_digest: applied_result.digest(),
         undone: false,
@@ -1029,6 +1038,19 @@ fn undo_one(conn: &Connection, record: &ReceiptRecord) -> Result<()> {
         }
         Some(previous) => previous.restore(conn)?,
     }
+    if let Some(recheck) = &record.previous_recheck {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM dat_recheck_attempts WHERE archive_id = ?1 AND dat_source_id = ?2",
+                params![record.archive_id, recheck_source(recheck)],
+                |row| row.get(0),
+            )
+            .map_err(|error| db_error("failed to read a re-check note", error))?;
+        // A newer note is never overwritten.
+        if exists == 0 {
+            recheck.insert_into(conn, "dat_recheck_attempts")?;
+        }
+    }
     Ok(())
 }
 
@@ -1107,10 +1129,17 @@ impl ResultRow {
         filter: &str,
         args: &[&dyn rusqlite::ToSql],
     ) -> Result<Option<Self>> {
+        Self::read_from(conn, "library_dat_identities", filter, args)
+    }
+
+    fn read_from(
+        conn: &Connection,
+        table: &str,
+        filter: &str,
+        args: &[&dyn rusqlite::ToSql],
+    ) -> Result<Option<Self>> {
         let mut stmt = conn
-            .prepare(&format!(
-                "SELECT * FROM library_dat_identities WHERE {filter}"
-            ))
+            .prepare(&format!("SELECT * FROM {table} WHERE {filter}"))
             .map_err(|error| db_error("failed to read a verification result", error))?;
         let columns: Vec<String> = stmt
             .column_names()
@@ -1144,8 +1173,7 @@ impl ResultRow {
         .map_err(|error| db_error("failed to read a verification result", error))
     }
 
-    /// Puts this row back exactly (same id, every column).
-    fn restore(&self, conn: &Connection) -> Result<()> {
+    fn sql_values(&self) -> Result<Vec<SqlValue>> {
         let mut values = Vec::new();
         for value in &self.values {
             values.push(match value.first().map(String::as_str) {
@@ -1167,6 +1195,31 @@ impl ResultRow {
                 _ => return Err(malformed()),
             });
         }
+        Ok(values)
+    }
+
+    /// Inserts this row into `table` again, every column as it was.
+    fn insert_into(&self, conn: &Connection, table: &str) -> Result<()> {
+        let values = self.sql_values()?;
+        let columns: Vec<String> = self.columns.iter().map(|c| format!("\"{c}\"")).collect();
+        let marks: Vec<String> = (1..=values.len()).map(|i| format!("?{i}")).collect();
+        let args: Vec<&dyn rusqlite::ToSql> =
+            values.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+        conn.execute(
+            &format!(
+                "INSERT INTO {table}({}) VALUES({})",
+                columns.join(","),
+                marks.join(",")
+            ),
+            args.as_slice(),
+        )
+        .map_err(|error| db_error("failed to restore a re-check note", error))?;
+        Ok(())
+    }
+
+    /// Puts this row back exactly (same id, every column).
+    fn restore(&self, conn: &Connection) -> Result<()> {
+        let values = self.sql_values()?;
         let assignments: Vec<String> = self
             .columns
             .iter()
@@ -1191,6 +1244,14 @@ impl ResultRow {
         }
         Ok(())
     }
+}
+
+fn recheck_source(row: &ResultRow) -> String {
+    row.columns
+        .iter()
+        .position(|c| c == "dat_source_id")
+        .and_then(|i| row.values[i].get(1).cloned())
+        .unwrap_or_default()
 }
 
 fn result_row(conn: &Connection, archive_id: i64, source_id: &str) -> Result<Option<ResultRow>> {
@@ -1233,6 +1294,8 @@ struct ReceiptRecord {
     applied_platform: String,
     fingerprint: Option<FingerprintRecord>,
     previous_result: Option<ResultRow>,
+    #[serde(default)]
+    previous_recheck: Option<ResultRow>,
     applied_result_id: i64,
     applied_result_digest: String,
     undone: bool,

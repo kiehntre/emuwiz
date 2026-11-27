@@ -131,6 +131,7 @@ impl Library {
             ("platform_assignments", "id"),
             ("library_dat_identities", "id"),
             ("scan_fingerprints", "relative_path"),
+            ("dat_recheck_attempts", "archive_id"),
         ] {
             let mut stmt = self
                 .db
@@ -405,6 +406,15 @@ fn undo_restores_the_previous_result_exactly() {
              INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at) \
              VALUES(1,'SNES','folder_alias',1,'2026-01-04'); \
              UPDATE scan_fingerprints SET platform = 'SNES' WHERE source_folder_id = 1;",
+        )
+        .unwrap();
+    // ...and a re-check note for this catalogue.
+    lib.db
+        .connection
+        .execute(
+            "INSERT INTO dat_recheck_attempts(archive_id,dat_source_id,archive_path,attempted_at,reason,catalogue_sha256) \
+             VALUES(1,'nes',CAST('x' AS BLOB),'2026-01-05','unreadable',NULL)",
+            [],
         )
         .unwrap();
     let before = lib.state();
