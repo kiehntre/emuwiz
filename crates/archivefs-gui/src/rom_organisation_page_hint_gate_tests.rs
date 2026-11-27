@@ -532,12 +532,15 @@ fn link_modes_fall_back_to_the_file_name_and_file_modes_keep_the_choice() {
         );
         assert_eq!(bulk_name(mode, &none), None, "{mode:?}");
     }
-    for mode in [
-        OrganisationMode::RenameInPlace,
-        OrganisationMode::MoveRealFile,
-    ] {
-        assert_eq!(bulk_name(mode, &romm), romm.name, "{mode:?}");
-    }
+    // Verified Rename (owner 2026-11-26): a RomM title is never the
+    // destination either; the row is still blocked with the hint.
+    assert_eq!(bulk_name(OrganisationMode::RenameInPlace, &romm), None);
+    assert_eq!(
+        bulk_name(OrganisationMode::RenameInPlace, &dat).as_deref(),
+        Some("Verified One (USA).nes")
+    );
+    // Move keeps the choice; the row is then blocked unless verified.
+    assert_eq!(bulk_name(OrganisationMode::MoveRealFile, &romm), romm.name);
 }
 
 #[test]

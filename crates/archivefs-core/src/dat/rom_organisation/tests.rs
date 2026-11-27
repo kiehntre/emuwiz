@@ -399,6 +399,53 @@ fn case_only_destination_is_a_conflict() {
     assert_eq!(plan.entries[0].status, OrganisationStatus::Conflict);
 }
 
+/// Stage B (owner 2026-11-26): a rename that only changes the case of a
+/// file's own name is not a conflict with that file. (Run on a
+/// case-sensitive temporary folder; on a case-insensitive one the live
+/// folder would hold only one name and the rename is still judged by name.)
+#[test]
+fn a_case_only_rename_does_not_conflict_with_its_own_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("psp");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("tetris dx (world).iso"), b"rom").unwrap();
+    let mut cand = candidate(
+        &folder,
+        "tetris dx (world).iso",
+        resolved("PSP", PlatformIdentitySource::Romm),
+    );
+    cand.canonical_name = Some("Tetris DX (World).iso".to_string());
+    let plan = plan_for(dir.path(), OrganisationMode::RenameInPlace, &[cand], 1);
+    assert_eq!(
+        plan.entries[0].status,
+        OrganisationStatus::Suggested,
+        "{:?}",
+        plan.entries[0].reason
+    );
+    assert_eq!(
+        plan.entries[0].destination_path,
+        folder.join("Tetris DX (World).iso")
+    );
+}
+
+/// A different file that differs only by case is still a conflict.
+#[test]
+fn a_genuine_case_sibling_is_still_a_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("psp");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("tetris dx (world).iso"), b"rom").unwrap();
+    std::fs::write(folder.join("TETRIS DX (WORLD).iso"), b"another file").unwrap();
+    let mut cand = candidate(
+        &folder,
+        "tetris dx (world).iso",
+        resolved("PSP", PlatformIdentitySource::Romm),
+    );
+    cand.canonical_name = Some("Tetris DX (World).iso".to_string());
+    let plan = plan_for(dir.path(), OrganisationMode::RenameInPlace, &[cand], 1);
+    assert_eq!(plan.entries[0].status, OrganisationStatus::Conflict);
+}
+
 #[test]
 fn two_plans_targeting_one_destination_are_conflicts() {
     let dir = tempfile::tempdir().unwrap();

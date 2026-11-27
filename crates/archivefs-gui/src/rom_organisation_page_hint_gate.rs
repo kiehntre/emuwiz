@@ -32,14 +32,19 @@ pub(crate) const UNVERIFIED_LINK_HINT_REASON: &str = "Not used for this link: th
 /// link name, so it is not the original file name either.
 pub(crate) const UNSAFE_LINK_FALLBACK_REASON: &str = "No link made in bulk: this file's own name cannot be used as a link name as it is (it had to be changed to be safe), and there is no verified catalogue name to use instead. Rename the file itself first, or check it against a catalogue.";
 
-/// The name a bulk run may give this file or link (owner rules 2026-11-22):
-/// a verified catalogue name always. In a link mode any other name (a RomM
-/// title, or none) falls back to the file's own name (`None`), so the game
-/// still gets its link and no unverified title is used. In Rename and Move
-/// the chosen name is kept here and the row is then blocked by
-/// [`block_unverified_names`] unless it is verified.
+/// The name a bulk run may give this file or link (owner rules 2026-11-22,
+/// 2026-11-26): a verified catalogue name always. In a link mode any other
+/// name (a RomM title, or none) falls back to the file's own name (`None`),
+/// so the game still gets its link and no unverified title is used. In
+/// verified Rename the same fallback keeps a RomM title out of the
+/// destination, so it can never become an actionable name or a conflict;
+/// [`block_unverified_names`] still blocks the row with the hint, shown from
+/// the row's name choice. In Move the chosen name is kept here and the row
+/// is then blocked unless it is verified.
 pub(crate) fn bulk_name(mode: OrganisationMode, choice: &NameChoice) -> Option<String> {
-    if is_link_mode(mode) && !name_is_verified(Some(choice)) {
+    if (is_link_mode(mode) || mode == OrganisationMode::RenameInPlace)
+        && !name_is_verified(Some(choice))
+    {
         None
     } else {
         choice.name.clone()
@@ -161,9 +166,24 @@ pub(crate) fn block_unverified_names(
     let mut blocked = 0;
     let plan_mode = plan.mode;
     for entry in &mut plan.entries {
-        if entry.status == OrganisationStatus::Suggested
-            && gives_a_new_name(entry)
-            && !name_is_verified(choices.get(&entry.source_path))
+        // Verified Rename planned a RomM row under its own name (no
+        // destination, no conflict): it is still a hint the person must
+        // verify, never "already correctly named".
+        let romm_hint_kept_own_name = plan_mode == OrganisationMode::RenameInPlace
+            && matches!(
+                entry.status,
+                OrganisationStatus::Suggested | OrganisationStatus::AlreadyOrganised
+            )
+            && choices.get(&entry.source_path).is_some_and(|choice| {
+                choice.source == NameSource::Romm
+                    && choice.name.as_deref().is_some_and(|title| {
+                        own_name(entry.mode, &entry.source_path).as_deref() != Some(title)
+                    })
+            });
+        if romm_hint_kept_own_name
+            || (entry.status == OrganisationStatus::Suggested
+                && gives_a_new_name(entry)
+                && !name_is_verified(choices.get(&entry.source_path)))
         {
             let choice = choices.get(&entry.source_path);
             let from_romm = matches!(choice.map(|c| &c.source), Some(NameSource::Romm));
