@@ -3700,6 +3700,15 @@ fn show_plan(
         .iter()
         .filter(|entry| state.shows(entry))
         .collect();
+    // Verified Rename: each row's status is its result group, from the same
+    // classification as the counts and filters (owner 2026-11-26).
+    let row_groups: Option<std::collections::HashMap<PathBuf, scope::RenameGroup>> =
+        state.uses_scope().then(|| {
+            entries
+                .iter()
+                .map(|entry| (entry.source_path.clone(), state.group_of(entry)))
+                .collect()
+        });
 
     // Both pages show the filter (D2): rows it hides are never out of sight
     // without saying so.
@@ -3811,11 +3820,19 @@ fn show_plan(
                     ui,
                     if quick_mame {
                         "MAME tools"
+                    } else if let Some(group) =
+                        row_groups.as_ref().and_then(|g| g.get(&entry.source_path))
+                    {
+                        group.label()
                     } else {
                         entry.status.label()
                     },
                     if quick_mame {
                         widgets::StatusTone::Pending
+                    } else if let Some(group) =
+                        row_groups.as_ref().and_then(|g| g.get(&entry.source_path))
+                    {
+                        scope_group_tone(*group, 1)
                     } else {
                         status_tone(entry.status)
                     },
@@ -3871,7 +3888,13 @@ fn show_plan(
                             show_name_choice(ui, name_choices.get(&entry.source_path));
                             ui.label(format!("Identity: Verified by {}", entry.platform_source));
                         }
-                        ui.label(format!("Status: {}", entry.status.label()));
+                        ui.label(format!(
+                            "Status: {}",
+                            row_groups
+                                .as_ref()
+                                .and_then(|g| g.get(&entry.source_path))
+                                .map_or(entry.status.label(), |group| group.label())
+                        ));
                         ui.label(undo_availability(entry.status));
                         if let Some(reason) = &entry.reason {
                             ui.label(
@@ -5952,7 +5975,8 @@ mod tests {
         assert_eq!(state.hidden_approved(), 2);
         state.set_group_filter(Some(G::Ready));
         assert_eq!(state.hidden_approved(), 0);
-        // The page renders the six groups with these counts.
+        // The page renders the six groups with these counts (all rows shown).
+        state.set_group_filter(None);
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -5963,6 +5987,42 @@ mod tests {
         assert!(rendered_text_contains(&output, "Destination conflict: 1"));
         assert!(rendered_text_contains(&output, "Safety or file blocker: 1"));
         assert!(rendered_text_contains(&output, "Ready to rename (2)"));
+        // Each row's status chip is its group (exact text: the badges and
+        // filters carry a count), never the plan status.
+        fn exact(output: &egui::FullOutput, needle: &str) -> bool {
+            fn walk(shape: &egui::Shape, needle: &str) -> bool {
+                match shape {
+                    // A badge may draw its tone glyph first ("· Label").
+                    egui::Shape::Text(t) => {
+                        let text = t.galley.text();
+                        text == needle
+                            || text.strip_suffix(needle).is_some_and(|glyph| {
+                                glyph.chars().count() <= 2 && glyph.ends_with(' ')
+                            })
+                    }
+                    egui::Shape::Vec(v) => v.iter().any(|s| walk(s, needle)),
+                    _ => false,
+                }
+            }
+            output.shapes.iter().any(|c| walk(&c.shape, needle))
+        }
+        for group in [
+            G::NoCatalogueMatch,
+            G::NeedsVerification,
+            G::Conflict,
+            G::Blocked,
+        ] {
+            assert!(exact(&output, group.label()), "{group:?} row chip");
+        }
+        for status in [
+            OrganisationStatus::Conflict,
+            OrganisationStatus::Unsupported,
+        ] {
+            assert!(
+                !exact(&output, status.label()),
+                "{status:?} plan label on a row"
+            );
+        }
     }
 
     #[test]
@@ -6179,6 +6239,9 @@ mod hint_gate_runtime_tests;
 #[path = "rom_organisation_page_undo_tests.rs"]
 mod undo_tests;
 
+#[cfg(test)]
+#[path = "rom_organisation_page_real_db_preview_tests.rs"]
+mod real_db_preview_tests;
 #[cfg(test)]
 #[path = "rom_organisation_page_zip_policy_tests.rs"]
 mod zip_policy_tests;

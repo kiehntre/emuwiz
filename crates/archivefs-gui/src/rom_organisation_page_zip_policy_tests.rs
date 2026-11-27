@@ -498,13 +498,19 @@ fn b6_rehearsal_on_copied_gbc_files() {
     let root = PathBuf::from(std::env::var("EMUWIZ_B6_ROOT").expect("EMUWIZ_B6_ROOT"));
     let dat = PathBuf::from(std::env::var("EMUWIZ_B6_DAT").expect("EMUWIZ_B6_DAT"));
     let out = PathBuf::from(std::env::var("EMUWIZ_B6_OUT").expect("EMUWIZ_B6_OUT"));
-    // Review C3: fail closed unless the profile is a scratch one too.
-    for var in ["EMUWIZ_DATA_HOME", "EMUWIZ_CONFIG_HOME", "HOME"] {
-        let value = std::env::var(var).unwrap_or_else(|_| panic!("{var} must be set to scratch"));
-        let real = Path::new(&value).canonicalize().unwrap();
+    // Review C3: fail closed unless this is an isolated test process. The
+    // crate's pre-main hook gives every test binary a private HOME and removes
+    // EMUWIZ_DATA_HOME / EMUWIZ_CONFIG_HOME, so the data and config paths
+    // resolve inside its isolated root, never a real profile.
+    let isolated =
+        archivefs_core::test_environment::isolated_root().expect("not an isolated test process");
+    for (what, path) in [
+        ("database", archivefs_core::default_database_path().unwrap()),
+        ("config", archivefs_core::default_config_path().unwrap()),
+    ] {
         assert!(
-            real.starts_with("/tmp/claude-1000/"),
-            "{var} is not a scratch path"
+            path.starts_with(isolated),
+            "{what} outside the isolated root"
         );
     }
     for path in [&root, &dat, &out] {
