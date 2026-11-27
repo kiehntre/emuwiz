@@ -283,7 +283,7 @@ fn saved_checks_map_to_honest_groups() {
 }
 
 #[test]
-fn rows_fall_into_the_five_groups() {
+fn rows_fall_into_the_six_groups() {
     use archivefs_core::dat::rom_organisation::{
         NEEDS_VERIFICATION_REASON, OrganisationPlanEntry, OrganisationStatus,
     };
@@ -380,8 +380,14 @@ fn rows_fall_into_the_five_groups() {
         group(S::Blocked, Some("save"), SavedCheck::Other),
         RenameGroup::Blocked
     );
+    // Owner 2026-11-26: a destination conflict is its own group, separate
+    // from safety or file blockers.
     assert_eq!(
         group(S::Conflict, None, SavedCheck::Other),
+        RenameGroup::Conflict
+    );
+    assert_eq!(
+        group(S::Unsupported, None, SavedCheck::Other),
         RenameGroup::Blocked
     );
 }

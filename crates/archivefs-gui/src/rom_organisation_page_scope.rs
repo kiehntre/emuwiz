@@ -520,33 +520,39 @@ pub(crate) fn evidence_candidates(
     Some(Ok(out))
 }
 
-/// How one preview row is presented, in the owner's five groups. Display
-/// only: Apply decides from the plan and live checks, never from this.
+/// How one preview row is presented, in the owner's six groups (2026-11-26):
+/// the one classification shared by the summary counts, the filters, the row
+/// status and selection eligibility (only Ready rows can be selected; Ready
+/// is exactly the plan's Suggested status). Display only: Apply decides from
+/// the plan and live checks, never from this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum RenameGroup {
     Ready,
     AlreadyCorrect,
     NeedsVerification,
     NoCatalogueMatch,
+    Conflict,
     Blocked,
 }
 
 impl RenameGroup {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::Ready => "Verified and ready to rename",
+            Self::Ready => "Ready to rename",
             Self::AlreadyCorrect => "Already correctly named",
             Self::NeedsVerification => "Needs verification",
             Self::NoCatalogueMatch => "No reliable catalogue match",
-            Self::Blocked => "Blocked by a safety or file problem",
+            Self::Conflict => "Destination conflict",
+            Self::Blocked => "Safety or file blocker",
         }
     }
 
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::Ready,
         Self::AlreadyCorrect,
         Self::NeedsVerification,
         Self::NoCatalogueMatch,
+        Self::Conflict,
         Self::Blocked,
     ];
 }
@@ -600,7 +606,8 @@ pub(crate) fn rename_group(
         // it has no verified name for the archive itself.
         OrganisationStatus::AlreadyOrganised if verified => RenameGroup::AlreadyCorrect,
         OrganisationStatus::AlreadyOrganised => unverified(saved_check),
-        OrganisationStatus::Conflict | OrganisationStatus::Unsupported => RenameGroup::Blocked,
+        OrganisationStatus::Conflict => RenameGroup::Conflict,
+        OrganisationStatus::Unsupported => RenameGroup::Blocked,
         OrganisationStatus::Blocked => {
             if entry.reason.as_deref() == Some(NEEDS_VERIFICATION_REASON) {
                 RenameGroup::NeedsVerification
