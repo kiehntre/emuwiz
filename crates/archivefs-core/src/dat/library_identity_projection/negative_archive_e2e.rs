@@ -15,6 +15,8 @@ fn same_system(members: &[(&str, &[u8])]) -> Fixture {
         xml.replace("<name>Fixture</name>", "<name>Nintendo - Game Boy</name>"),
     )
     .unwrap();
+    // The catalogue now names Game Boy, so it is configured for Game Boy.
+    fx.catalogue_system = "Game Boy".into();
     fx.database
         .assign_platform(fx.archive_id(), Some("Game Boy"), "test")
         .unwrap();

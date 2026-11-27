@@ -302,6 +302,7 @@ fn summary(state: State) -> LibraryDatIdentitySummary {
             source_revision: Some("2026".into()),
             catalogue_sha256: None,
             author: None,
+            configured_platform: None,
             catalogue_names: vec![],
             dat_path: "/dats/a.dat".into(),
         },
@@ -783,7 +784,9 @@ fn provenance_spoof_from_a_real_dat_cannot_invent_author_or_verified_rows() {
         )
         .replace("<author>No-Intro</author>", "");
     std::fs::write(dat, xml).unwrap();
-    dat_exact_tests::audit_and_save(&fixture);
+    // The injected header names no system, so the person configured the
+    // catalogue for the games' system; the header text is still stored as-is.
+    dat_exact_tests::audit_and_save_as(&fixture, Some("Game Boy Color"));
     let database = archivefs_core::Database::open_read_only(&fixture.db).unwrap();
     let saved = database
         .library_dat_identity_summary_for_item(1, "165", None, None, true)

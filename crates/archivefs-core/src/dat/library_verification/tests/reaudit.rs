@@ -1505,6 +1505,95 @@ mod first_matching {
         f
     }
 
+    /// Owner report 2026-11-26: one catalogue of a system's set that lists
+    /// none of the library's formats (Amiga "Bitstream" lists only .raw)
+    /// stopped the whole first-time run. It is now read as "not listed in
+    /// this format" and the run goes on; nothing is saved from it.
+    #[test]
+    fn a_catalogue_listing_none_of_the_files_formats_never_stops_the_run() {
+        let f = Fixture::new();
+        f.add(4, "game.gb", Some(b"gb"), Some("Game Boy"));
+        f.add(5, "tape.tap", Some(b"tape"), Some("ZX Spectrum"));
+        f.sized();
+        let sha = |content: &[u8]| -> String {
+            Sha1::digest(content)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        let header = |name: &str| {
+            format!(
+                "<header><name>{name}</name><description>{name}</description><version>1</version><author>No-Intro</author><homepage>No-Intro</homepage><url>https://www.no-intro.org</url></header>"
+            )
+        };
+        let mut registry = DatSourceRegistry::default();
+        for (id, name, rom) in [
+            (
+                "gb-other",
+                "Nintendo - Game Boy",
+                format!("<rom name=\"x.sgb\" size=\"3\" sha1=\"{}\"/>", sha(b"sgb")),
+            ),
+            (
+                "gb-match",
+                "Nintendo - Game Boy",
+                format!("<rom name=\"Game.gb\" size=\"2\" sha1=\"{}\"/>", sha(b"gb")),
+            ),
+            (
+                "spectrum-other",
+                "Sinclair ZX Spectrum - Games - [TZX]",
+                format!("<rom name=\"x.tzx\" size=\"3\" sha1=\"{}\"/>", sha(b"tzx")),
+            ),
+        ] {
+            let path = f.dir.path().join(format!("{id}.dat"));
+            std::fs::write(
+                &path,
+                format!(
+                    "<datafile>{}<game name=\"G\">{rom}</game></datafile>",
+                    header(name)
+                ),
+            )
+            .unwrap();
+            let mut entry = DatSourceEntry::new(id.into(), id.into(), path, DatSourceKind::File);
+            let platform = if id.starts_with("gb") {
+                "Game Boy"
+            } else {
+                "ZX Spectrum"
+            };
+            entry.set_platform_by_person(Some(platform.into()));
+            validated(&mut entry);
+            registry.add(entry).unwrap();
+        }
+        let inputs = inputs_for(&registry, &f);
+        let plan = plan_with(&f.db, inputs);
+        let set = group(&plan, "catalogue-set:Game Boy");
+        assert_eq!(set.pool.len(), 2);
+        let report = run_with(
+            &f.db,
+            inputs,
+            &plan.plan,
+            10,
+            &AtomicBool::new(false),
+            &|_| {},
+        );
+        assert!(report.stopped.is_none(), "{:?}", report.stopped);
+        assert_eq!(report.not_reached, 0);
+        assert_eq!(report.verified, 1, "{:#?}", report.not_checked);
+        assert!(
+            f.saved_rows()
+                .contains(&(4, "gb-match".into(), "verified_single_match".into())),
+            "{:?}",
+            f.saved_rows()
+        );
+        // The Spectrum tape is in no installed catalogue's format: reported,
+        // nothing saved, and the run still finished.
+        assert!(f.saved_rows().iter().all(|(id, _, _)| *id != 5));
+        assert!(
+            report.not_checked.iter().any(|note| note.archive_id == 5),
+            "{:#?}",
+            report.not_checked
+        );
+    }
+
     #[test]
     fn plans_only_unchecked_games_on_a_system_with_exactly_one_catalogue() {
         let f = library();

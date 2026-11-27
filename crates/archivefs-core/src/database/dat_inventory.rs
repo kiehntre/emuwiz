@@ -3,7 +3,7 @@
 use super::*;
 
 pub(super) fn replace_inventory(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     dat_source_id: &str,
     source_revision: Option<&str>,
     ecosystem: Option<crate::dat::model::DatEcosystem>,

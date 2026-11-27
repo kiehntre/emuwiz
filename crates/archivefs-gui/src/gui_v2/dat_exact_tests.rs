@@ -144,6 +144,16 @@ pub(super) fn fixture(exact: &[String]) -> Fixture {
              VALUES(?1,1,?2,?3,?2,'direct_game_image',?4,?4,?5,'now','now','now','now')",
             rusqlite::params![index as i64 + 1, name.as_bytes(), roms.join(name).as_os_str().as_bytes(), name, bytes.len() as i64],
         ).unwrap();
+        // The system a scan gives a `.gbc` file, recorded as the extension
+        // detector records it: a result is saved only for a game on a system
+        // the catalogue speaks for (owner policy 2026-11-26). `unlisted.gbc`
+        // keeps no system, so its "not in this catalogue" says nothing.
+        if name != "unlisted.gbc" {
+            connection.execute(
+                "INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at) VALUES(?1,'Game Boy Color','registry_detector',1,'now')",
+                [index as i64 + 1],
+            ).unwrap();
+        }
     }
     drop(connection);
     Fixture {
@@ -155,6 +165,12 @@ pub(super) fn fixture(exact: &[String]) -> Fixture {
 }
 
 pub(super) fn audit_and_save(fixture: &Fixture) {
+    audit_and_save_as(fixture, None);
+}
+
+/// [`audit_and_save`] with the catalogue configured for `platform`, as a
+/// person sets it on the DAT page.
+pub(super) fn audit_and_save_as(fixture: &Fixture, platform: Option<&str>) {
     let request = DatAuditRequest {
         source_id: SOURCE.into(),
         source_display_name: "No-Intro: Nintendo - Game Boy Color".into(),
@@ -163,7 +179,7 @@ pub(super) fn audit_and_save(fixture: &Fixture) {
         scan_root: fixture.roms.clone(),
         limits: Default::default(),
         policy: None,
-        platform: None,
+        platform: platform.map(str::to_string),
     };
     let outcome = run_dat_audit_with_cache(
         &request,
@@ -250,8 +266,9 @@ fn only_a_single_exact_match_verifies_a_game() {
     for (file, label) in [
         ("ambiguous.gbc", "Ambiguous match"),
         ("probable.gbc", "Possible match"),
-        // The fixture's files have no platform, so "not in this catalogue"
-        // is not evidence about them (`negative_dat_result_applies`).
+        // The fixture leaves `unlisted.gbc` with no system (a scan would put
+        // it on GBC), so "not in this catalogue" is not evidence about it
+        // (`negative_dat_result_applies`).
         ("unlisted.gbc", "Unknown platform"),
     ] {
         let game = library
@@ -323,7 +340,8 @@ fn corrupt_zip_is_not_checked_in_library_and_has_no_definitive_attention_negativ
     ).unwrap();
     connection
         .execute_batch(
-            "INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at)
+            "UPDATE platform_assignments SET is_current = 0;
+         INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at)
          SELECT id,'Game Boy Color','manual',1,'now' FROM archives;",
         )
         .unwrap();
@@ -506,7 +524,7 @@ fn saved_dat_status_is_visible_even_with_scan_identity_reports() {
 #[test]
 fn details_show_loaded_dat_results_without_opening_review_identity_first() {
     let fixture = fixture(&names(1));
-    rusqlite::Connection::open(&fixture.db).unwrap().execute("INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at) SELECT id,'Game Boy Color','manual',1,'now' FROM archives",[]).unwrap();
+    rusqlite::Connection::open(&fixture.db).unwrap().execute_batch("UPDATE platform_assignments SET is_current = 0; INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at) SELECT id,'Game Boy Color','manual',1,'now' FROM archives").unwrap();
     audit_and_save(&fixture);
     let ctx = eframe::egui::Context::default();
     let mut app = super::tests::fixture(&ctx);

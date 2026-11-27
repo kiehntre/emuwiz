@@ -804,6 +804,7 @@ mod tests {
                 source_revision: Some("rev".into()),
                 catalogue_sha256: None,
                 author: None,
+                configured_platform: None,
                 catalogue_names: vec![],
                 dat_path: "x".into(),
             },

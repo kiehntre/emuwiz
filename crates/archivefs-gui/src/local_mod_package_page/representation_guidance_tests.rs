@@ -76,6 +76,7 @@ fn summary() -> LibraryDatIdentitySummary {
             source_revision: Some("1".into()),
             catalogue_sha256: None,
             author: None,
+            configured_platform: None,
             catalogue_names: vec![],
             dat_path: "unused fixture provenance".into(),
         },

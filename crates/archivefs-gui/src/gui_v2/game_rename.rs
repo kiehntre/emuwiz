@@ -44,6 +44,85 @@ pub(super) struct State {
     pub(super) romm_queued: std::collections::VecDeque<super::romm_title::RommTitleAction>,
     /// The rename just applied, for the RomM title update.
     renamed: Option<super::romm_title::RommTitleAction>,
+    /// The file's current name when the card opened: the verified name
+    /// replaces it only while the person has not typed anything else.
+    opened_with: String,
+    /// The verified catalogue name being looked up for the open game.
+    suggestion: Option<std::sync::mpsc::Receiver<Option<Suggestion>>>,
+    /// The catalogue the pre-filled name came from, shown under the field.
+    pub(super) suggested_from: Option<String>,
+    /// Test seam: the configured catalogues (default: the person's). With
+    /// the database test seam set and this unset, nothing is looked up.
+    catalogues: Option<
+        std::collections::HashMap<
+            String,
+            archivefs_core::dat::configured_catalogues::ConfiguredCatalogue,
+        >,
+    >,
+}
+
+/// The verified name proposed for a game and the catalogue it came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Suggestion {
+    pub stem: String,
+    pub catalogue: String,
+}
+
+/// The name (without extension; the file's own extension always stays) that
+/// the verified catalogue gives this file, or `None` when there is no
+/// trustworthy verified name.
+///
+/// This is bulk Rename's own rule ([`crate::rom_organisation_page::choose_name`])
+/// with RomM titles left out, so single-game and bulk Rename always agree:
+/// today a loose file whose catalogue file name has the same extension. An
+/// archive matched through a file inside it keeps its name here exactly as
+/// it does in bulk Rename; the owner's archive policy (2026-11-26) changes
+/// that shared rule for both at once (Stage B).
+pub(super) fn suggested_stem(
+    dat: archivefs_core::VerifiedDatName,
+    source: &std::path::Path,
+) -> Option<Suggestion> {
+    use crate::rom_organisation_page::{NameSource, choose_name};
+    let choice = choose_name(dat, None, source);
+    let NameSource::VerifiedDat { catalogue } = choice.source else {
+        return None;
+    };
+    let name = choice.name?;
+    // A catalogue name naming a folder is never a file name here.
+    if name.contains(['/', '\\']) {
+        return None;
+    }
+    let stem = std::path::Path::new(&name).file_stem()?.to_string_lossy();
+    let stem = stem.trim();
+    let safe = !stem.is_empty() && !stem.starts_with('.') && !stem.chars().any(char::is_control);
+    safe.then(|| Suggestion {
+        stem: stem.to_owned(),
+        catalogue,
+    })
+}
+
+/// Looks up the verified catalogue name on the worker: read-only, no
+/// matching or hashing of the game.
+fn suggest_now(
+    database: &std::path::Path,
+    archive_id: i64,
+    source: &std::path::Path,
+    catalogues: Option<
+        std::collections::HashMap<
+            String,
+            archivefs_core::dat::configured_catalogues::ConfiguredCatalogue,
+        >,
+    >,
+) -> Option<Suggestion> {
+    let catalogues = match catalogues {
+        Some(catalogues) => catalogues,
+        None => ReauditCatalogues::load_default().ok()?.configured(),
+    };
+    let dat = archivefs_core::Database::open_read_only(database)
+        .ok()?
+        .verified_dat_name_for_archive(archive_id, &catalogues)
+        .ok()?;
+    suggested_stem(dat, source)
 }
 
 /// A running re-check: its Activity job and the worker's answer.
@@ -100,10 +179,52 @@ impl State {
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_default();
+        self.opened_with = self.typed.clone();
+        self.suggested_from = None;
         self.preview = None;
         self.outcome = None;
         self.recheck_line = None;
         self.romm_line = None;
+        self.suggestion = None;
+        // Tests that set the library seam but no catalogues never read the
+        // person's catalogue settings.
+        if self.paths.is_some() && self.catalogues.is_none() {
+            return;
+        }
+        let Ok(database) = self.database_path() else {
+            return;
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (id, source, catalogues) = (
+            game.archive.id,
+            game.archive.absolute_path.clone(),
+            self.catalogues.clone(),
+        );
+        std::thread::spawn(move || {
+            let _ = sender.send(suggest_now(&database, id, &source, catalogues));
+        });
+        self.suggestion = Some(receiver);
+    }
+
+    /// Takes the verified name once it has been looked up. It fills the
+    /// field only when the person has not changed the name yet.
+    pub(super) fn poll_suggestion(&mut self) {
+        let Some(receiver) = &self.suggestion else {
+            return;
+        };
+        let found = match receiver.try_recv() {
+            Ok(found) => found,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.suggestion = None;
+        if let Some(found) = found
+            && self.typed == self.opened_with
+            && self.preview.is_none()
+        {
+            self.typed = found.stem;
+            self.suggested_from = Some(found.catalogue);
+        }
     }
 
     fn close(&mut self) {
@@ -111,6 +232,7 @@ impl State {
             generation: self.generation,
             paths: self.paths.take(),
             saves: self.saves.take(),
+            catalogues: self.catalogues.take(),
             recheck: self.recheck.take(),
             queued: std::mem::take(&mut self.queued),
             romm: self.romm.take(),
@@ -303,6 +425,11 @@ impl App {
         if !self.game_rename.is_open_for(game.archive.id) {
             return;
         }
+        self.game_rename.poll_suggestion();
+        if self.game_rename.suggestion.is_some() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
+        }
         ui.add_space(theme::SPACE_MD);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(theme::section_title("Rename this game's file"));
@@ -317,6 +444,15 @@ impl App {
             );
             if edit.changed() {
                 self.game_rename.preview = None;
+                self.game_rename.suggested_from = None;
+            }
+            if let Some(catalogue) = &self.game_rename.suggested_from {
+                ui.label(
+                    RichText::new(format!(
+                        "Filled in with the verified name from the catalogue \"{catalogue}\". Preview before renaming."
+                    ))
+                    .color(theme::muted(ui)),
+                );
             }
             let mut renamed = false;
             ui.horizontal(|ui| {

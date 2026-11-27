@@ -765,6 +765,41 @@ impl VerificationPreview {
         self.scope.eligible.keys().map(PathBuf::as_path)
     }
 
+    /// Whether this catalogue simply lists none of the selected files'
+    /// formats: nothing is eligible and every exclusion is a format or
+    /// support-file reason. Such a catalogue reads nothing and saves nothing,
+    /// but it is not a failure, so a run over several catalogues continues.
+    /// Any other reason (a missing or unreadable file, an ambiguous path)
+    /// keeps the run's ordinary refusal.
+    pub fn lists_none_of_these_formats(&self) -> bool {
+        self.scope.eligible.is_empty()
+            && !self.exclusions.is_empty()
+            && self.exclusions.iter().all(|exclusion| {
+                matches!(
+                    exclusion.reason.as_str(),
+                    NOT_IN_CATALOGUE_FORMATS | "Unrelated support file"
+                )
+            })
+    }
+
+    /// The honest result of [`Self::lists_none_of_these_formats`]: the
+    /// catalogue is confirmed unchanged and every selected game is reported
+    /// not checked with its reason. Nothing is read or saved.
+    fn nothing_to_read(&self, cancel: &AtomicBool) -> Result<VerificationTotals, String> {
+        self.validate_inputs(cancel)?;
+        Ok(VerificationTotals {
+            catalogue: format!(
+                "{} · version {}",
+                self.catalogue_name,
+                self.version.as_deref().unwrap_or("not stated")
+            ),
+            catalogue_sha256: self.sha256.clone(),
+            unchecked: self.exclusions.clone(),
+            not_checked: self.selected_games,
+            ..Default::default()
+        })
+    }
+
     fn validate_inputs(&self, cancel: &AtomicBool) -> Result<(), String> {
         if cancel.load(Ordering::Relaxed) {
             return Err("Cancelled. No verification results saved.".into());
@@ -791,6 +826,9 @@ impl VerificationPreview {
         cancel: &AtomicBool,
         progress: &dyn Fn(DatAuditProgress),
     ) -> Result<VerificationTotals, String> {
+        if self.lists_none_of_these_formats() {
+            return self.nothing_to_read(cancel);
+        }
         let evaluated =
             self.evaluate(trusted, cancel, progress, AuditCacheConfig::Disabled, true)?;
         self.persist(evaluated)
@@ -810,6 +848,9 @@ impl VerificationPreview {
             &super::library_identity_summary::PersistedLibraryDatIdentity,
         ) -> bool,
     ) -> Result<VerificationTotals, String> {
+        if self.lists_none_of_these_formats() {
+            return self.nothing_to_read(cancel);
+        }
         let evaluated =
             self.evaluate(trusted, cancel, progress, AuditCacheConfig::Disabled, true)?;
         for path in self.scope.eligible.keys() {
@@ -842,6 +883,7 @@ impl VerificationPreview {
             || saved.unassociated != 0
             || saved.ambiguous != 0
             || saved.negative_platform_unproven_skipped != 0
+            || saved.platform_refused != 0
         {
             // The transaction has committed. A whole-system or one-game
             // check reports that as an error, as it always has. A bounded
@@ -851,10 +893,17 @@ impl VerificationPreview {
                 return Err(format!("Verification save was incomplete: {saved:?}"));
             }
             totals.save_withheld = Some(format!(
-                "Some results in this set were not saved ({} refused, {} not tied to one library row, {} negative results that do not apply to the game's system)",
+                "Some results in this set were not saved ({} refused, {} not tied to one library row, {} negative results that do not apply to the game's system, {} results refused for the game's system{})",
                 usize::from(saved.refused.is_some()),
                 saved.unassociated + saved.ambiguous,
-                saved.negative_platform_unproven_skipped
+                saved.negative_platform_unproven_skipped,
+                saved.platform_refused,
+                saved
+                    .platform_refusals
+                    .reasons()
+                    .into_iter()
+                    .map(|(count, reason)| format!("; {count}: {reason}"))
+                    .collect::<String>()
             ));
         }
         totals.saved = saved.inserted + saved.updated;
@@ -878,6 +927,14 @@ impl VerificationPreview {
         cancel: &AtomicBool,
         hash_cache: &Path,
     ) -> Result<Screened, String> {
+        if self.lists_none_of_these_formats() {
+            let totals = self.nothing_to_read(cancel)?;
+            return Ok(Screened {
+                findings: Vec::new(),
+                unchecked: totals.unchecked,
+                member_hits: BTreeSet::new(),
+            });
+        }
         let evaluated = self.evaluate(
             trusted,
             cancel,

@@ -1696,3 +1696,43 @@ mod reaudit;
 
 // S1: the verified catalogue name Organise may propose.
 mod dat_names;
+
+/// Apostrophes, quotes, spaces, punctuation and non-ASCII letters are ordinary
+/// archive member name characters: the member is checked and the archive
+/// verified (owner report 2026-11-26: 653 library ZIPs, e.g. NES "'89 ...").
+#[test]
+fn archive_members_with_legitimate_punctuation_and_unicode_names_verify() {
+    for member in [
+        "inner.tap",
+        "it's.tap",
+        "'89 Game (Japan).tap",
+        "\"Quoted\".tap",
+        "a b c.tap",
+        "Ünïcødé ゲーム.tap",
+        "x,y;z&(1)[a]!.tap",
+    ] {
+        let f = Fixture::new();
+        f.zip("z.zip", member, b"matching synthetic tape");
+        f.add(4, "z.zip", None, Some("ZX Spectrum"));
+        let t = f.run();
+        assert_eq!(
+            (t.verified, t.no_match, t.not_checked),
+            (1, 0, 0),
+            "{member:?}: {:?}",
+            t.unchecked
+        );
+    }
+}
+
+/// A member name that is not safe stays unverified: the fix accepts ordinary
+/// characters only, never a path that leaves the archive or a control byte.
+#[test]
+fn archive_members_with_unsafe_names_still_do_not_verify() {
+    for member in ["../up.tap", "dir\\back.tap", "ctl\u{1b}.tap"] {
+        let f = Fixture::new();
+        f.zip("z.zip", member, b"matching synthetic tape");
+        f.add(4, "z.zip", None, Some("ZX Spectrum"));
+        let t = f.run();
+        assert_eq!(t.verified, 0, "{member:?}");
+    }
+}

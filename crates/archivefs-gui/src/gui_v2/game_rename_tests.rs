@@ -140,3 +140,251 @@ fn a_finished_recheck_is_reported_and_reloads_the_library() {
     );
     assert!(!app.game_rename.reload_pending);
 }
+
+/// The library's games, as the Game Details page holds them.
+fn games(database: &Path) -> Vec<super::super::library::Game> {
+    archivefs_core::Database::open_read_only(database)
+        .unwrap()
+        .load_archives()
+        .unwrap()
+        .into_iter()
+        .map(super::super::library::Game::from_archive)
+        .collect()
+}
+
+fn found(stem: &str) -> Option<super::Suggestion> {
+    Some(super::Suggestion {
+        stem: stem.into(),
+        catalogue: "no-intro-nes".into(),
+    })
+}
+
+/// The card opened for `game` with its lookup still running; the returned
+/// sender answers it.
+fn opened_waiting(
+    card: &mut State,
+    game: &super::super::library::Game,
+) -> std::sync::mpsc::Sender<Option<super::Suggestion>> {
+    card.open(game);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    card.suggestion = Some(receiver);
+    sender
+}
+
+#[test]
+fn the_verified_name_fills_an_untouched_field_and_is_labelled() {
+    let temp = tempfile::tempdir().unwrap();
+    let (database, _game, _id) = library(temp.path());
+    let mut card = state(temp.path(), database.clone());
+    let game = &games(&database)[0];
+    let answer = opened_waiting(&mut card, game);
+    assert_eq!(card.typed, "Old");
+    card.poll_suggestion();
+    assert_eq!(card.typed, "Old", "nothing changes while the lookup runs");
+    answer.send(found("Zelda (USA)")).unwrap();
+    card.poll_suggestion();
+    assert_eq!(card.typed, "Zelda (USA)");
+    assert_eq!(card.suggested_from.as_deref(), Some("no-intro-nes"));
+    // The file's own extension stays: the preview names Zelda (USA).nes.
+    card.preview_now(&game.archive.absolute_path);
+    match &card.preview {
+        Some(Ok(preview)) => assert_eq!(
+            preview.destination.file_name().unwrap().to_string_lossy(),
+            "Zelda (USA).nes"
+        ),
+        other => panic!("{:?}", other.as_ref().map(|r| r.as_ref().err())),
+    }
+}
+
+#[test]
+fn a_name_typed_while_the_lookup_runs_is_never_replaced() {
+    let temp = tempfile::tempdir().unwrap();
+    let (database, _game, _id) = library(temp.path());
+    let mut card = state(temp.path(), database.clone());
+    let answer = opened_waiting(&mut card, &games(&database)[0]);
+    card.typed = "My Own Name".into();
+    answer.send(found("Zelda (USA)")).unwrap();
+    card.poll_suggestion();
+    assert_eq!(card.typed, "My Own Name");
+    assert_eq!(card.suggested_from, None);
+    assert!(
+        card.suggestion.is_none(),
+        "the answer was taken and dropped"
+    );
+}
+
+#[test]
+fn an_answer_for_a_game_no_longer_open_is_ignored() {
+    let temp = tempfile::tempdir().unwrap();
+    let (database, game_path, _id) = library(temp.path());
+    // A second game in the same library.
+    let other = game_path.with_file_name("Second.nes");
+    std::fs::write(&other, b"NES\x1a second").unwrap();
+    {
+        let mut db = archivefs_core::Database::open_or_create(&database).unwrap();
+        let root = temp.path().join("games");
+        let folder = db.list_source_folders().unwrap()[0].id;
+        let archive = archivefs_core::Archive::from_path_in_root(&other, &root).unwrap();
+        db.upsert_archive(folder, &root, &archive).unwrap();
+    }
+    let all = games(&database);
+    let first = all
+        .iter()
+        .find(|g| g.archive.absolute_path == game_path)
+        .unwrap();
+    let second = all
+        .iter()
+        .find(|g| g.archive.absolute_path == other)
+        .unwrap();
+    let mut card = state(temp.path(), database.clone());
+    let first_answer = opened_waiting(&mut card, first);
+    card.open(second);
+    // The first game's lookup finishes after the switch.
+    let _ = first_answer.send(found("First Game (USA)"));
+    card.poll_suggestion();
+    assert_eq!(card.typed, "Second");
+    assert_eq!(card.suggested_from, None);
+    assert!(card.is_open_for(second.archive.id));
+}
+
+#[test]
+fn no_trustworthy_name_leaves_the_current_one() {
+    let temp = tempfile::tempdir().unwrap();
+    let (database, _game, _id) = library(temp.path());
+    let mut card = state(temp.path(), database.clone());
+    let answer = opened_waiting(&mut card, &games(&database)[0]);
+    answer.send(None).unwrap();
+    card.poll_suggestion();
+    assert_eq!(card.typed, "Old");
+    assert_eq!(card.suggested_from, None);
+    // A lookup whose worker went away also leaves it.
+    let answer = opened_waiting(&mut card, &games(&database)[0]);
+    drop(answer);
+    card.poll_suggestion();
+    assert_eq!(card.typed, "Old");
+    assert!(card.suggestion.is_none());
+}
+
+/// Owner request 2026-11-26 (Check Games C4): the rename field starts with
+/// the verified catalogue name, keeping the file's own extension.
+mod verified_name_prefill {
+    use super::super::{Suggestion, suggested_stem};
+    use archivefs_core::VerifiedDatName as V;
+    use std::path::Path;
+
+    fn usable(rom: &str, game: &str, member: bool) -> V {
+        V::Usable {
+            rom_name: rom.into(),
+            game_name: game.into(),
+            dat_source_id: "no-intro-gbc".into(),
+            through_archive_member: member,
+        }
+    }
+
+    fn stem(dat: V, source: &str) -> Option<String> {
+        suggested_stem(dat, Path::new(source)).map(|s| s.stem)
+    }
+
+    #[test]
+    fn a_loose_file_takes_the_catalogue_file_name() {
+        assert_eq!(
+            suggested_stem(
+                usable(
+                    "Ecco the Dolphin (USA).gbc",
+                    "Ecco the Dolphin (USA)",
+                    false
+                ),
+                Path::new("/g/ecco.GBC"),
+            ),
+            Some(Suggestion {
+                stem: "Ecco the Dolphin (USA)".into(),
+                catalogue: "no-intro-gbc".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn archives_and_other_extensions_follow_bulk_rename_and_keep_their_name() {
+        // Matched through the .gbc inside: bulk Rename keeps the archive's
+        // name today, so the card does too (shared rule; Stage B changes both).
+        assert_eq!(
+            stem(
+                usable("Ecco Jr. (USA).gbc", "Ecco Jr. (USA)", true),
+                "/g/ecco.zip"
+            ),
+            None
+        );
+        // A loose file whose catalogue entry has another extension.
+        assert_eq!(
+            stem(
+                usable("Game (Europe).bin", "Game (Europe)", false),
+                "/g/game.md"
+            ),
+            None
+        );
+        // Agreement with bulk Rename, case by case.
+        for (dat, source) in [
+            (
+                usable(
+                    "Ecco the Dolphin (USA).gbc",
+                    "Ecco the Dolphin (USA)",
+                    false,
+                ),
+                "/g/e.gbc",
+            ),
+            (
+                usable("Ecco Jr. (USA).gbc", "Ecco Jr. (USA)", true),
+                "/g/e.zip",
+            ),
+            (
+                usable("Game (Europe).bin", "Game (Europe)", false),
+                "/g/game.md",
+            ),
+        ] {
+            let bulk =
+                crate::rom_organisation_page::choose_name(dat.clone(), None, Path::new(source))
+                    .name
+                    .map(|name| {
+                        Path::new(&name)
+                            .file_stem()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned()
+                    });
+            assert_eq!(stem(dat, source), bulk, "{source}");
+        }
+    }
+
+    #[test]
+    fn no_verified_name_or_an_unsafe_one_leaves_the_current_name() {
+        assert_eq!(stem(V::None, "/g/x.gbc"), None);
+        assert_eq!(stem(V::NotUsable("stale".into()), "/g/x.gbc"), None);
+        // What core returns when catalogues disagree or name several
+        // entries (core test `the_rule_refuses_ambiguity_disagreement_and_missing_names`).
+        assert_eq!(
+            stem(
+                V::NotUsable("the catalogues disagree on this game's name".into()),
+                "/g/x.gbc"
+            ),
+            None
+        );
+        assert_eq!(
+            stem(
+                V::NotUsable("a catalogue check found more than one possible match".into()),
+                "/g/x.gbc"
+            ),
+            None
+        );
+        assert_eq!(stem(usable("a\\b.gbc", "a\\b", false), "/g/x.gbc"), None);
+        assert_eq!(
+            stem(usable("ctl\u{1b}.gbc", "ctl\u{1b}", false), "/g/x.gbc"),
+            None
+        );
+        assert_eq!(stem(usable(" .gbc", " ", false), "/g/x.gbc"), None);
+        assert_eq!(stem(usable("a/b.gbc", "a/b", false), "/g/x.gbc"), None);
+        assert_eq!(
+            stem(usable(".hidden.gbc", ".hidden", false), "/g/x.gbc"),
+            None
+        );
+    }
+}

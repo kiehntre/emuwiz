@@ -1143,7 +1143,17 @@ fn is_nested_name(raw: &[u8]) -> bool {
     NESTED_ARCHIVE_EXTENSIONS.contains(&extension.as_slice())
 }
 
+/// The member name as people and the rest of EmuWiz read it. A valid UTF-8
+/// name without control characters is kept exactly (apostrophes, quotes and
+/// non-ASCII letters are ordinary name characters, as for 7z, RAR and LHA).
+/// Anything else is escaped byte by byte, which keeps it visibly different
+/// and refused by the member-name safety checks.
 fn display_name(raw: &[u8]) -> String {
+    if let Ok(name) = std::str::from_utf8(raw)
+        && !name.chars().any(char::is_control)
+    {
+        return name.to_owned();
+    }
     let mut display = String::new();
     for byte in raw {
         for escaped in byte.escape_ascii() {
@@ -1351,6 +1361,23 @@ mod tests {
         let outcome = verify(&path, ArchiveLimits::default());
         assert_eq!(outcome.members[0].member_name_raw, b"bad\xff.rom");
         assert_eq!(outcome.members[0].member_name_display, "bad\\xff.rom");
+    }
+
+    #[test]
+    fn legitimate_member_names_are_displayed_exactly_and_unsafe_bytes_escaped() {
+        for name in [
+            "it's.rom",
+            "'89 Game (Japan).rom",
+            "\"Quoted\".rom",
+            "a b c.rom",
+            "Ünïcødé ゲーム.rom",
+            "x,y;z&(1)[a]!.rom",
+        ] {
+            assert_eq!(display_name(name.as_bytes()), name);
+        }
+        assert_eq!(display_name(b"bad\xff.rom"), "bad\\xff.rom");
+        assert_eq!(display_name(b"tab\tname.rom"), "tab\\tname.rom");
+        assert_eq!(display_name(b"esc\x1b[31m.rom"), "esc\\x1b[31m.rom");
     }
 
     #[test]

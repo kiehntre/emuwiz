@@ -630,7 +630,10 @@ fn operation_projection_uses_receipt_and_only_fresh_preview_offers_undo() {
 
 /// A saved pre-proof DAT row, the same shape `dat_evidence_history_tests.rs`
 /// stores (`LEGACY_FACTS`).
-const GATE_FACTS: &str = r#"{"verification_state":{"state":"verified_single_match","algorithm":"sha1"},"source":{"source_id":"158","source_name":"Fixture","ecosystem":"no_intro","variant":"unknown","source_revision":"1","author":null,"catalogue_names":["Fixture"],"dat_path":"/nowhere/158.dat"},"canonical":{"canonical_dat_name":"Game","canonical_rom_name":"Game.gba","region":null,"revision":null},"hash_evidence":{"matched_algorithm":"sha1","matched_value":"aa","available_algorithms":["SHA-1"]},"ambiguous_candidates":[],"candidate_provenance":[],"matched_entries":[],"audited_hashes":{"size_bytes":4,"crc32":null,"md5":null,"sha1":"aa","sha256":null},"audited_at":"2026-10-08T00:50:48Z","completeness":"exhaustive"}"#;
+/// The catalogue is configured for the imported games' system (ZX Spectrum,
+/// from the import); its header names none. No assignment is changed, so the
+/// Undo gate is exercised by the evidence rows alone.
+const GATE_FACTS: &str = r#"{"verification_state":{"state":"verified_single_match","algorithm":"sha1"},"source":{"source_id":"158","source_name":"Fixture","ecosystem":"no_intro","variant":"unknown","source_revision":"1","author":null,"configured_platform":"ZX Spectrum","catalogue_names":["Fixture"],"dat_path":"/nowhere/158.dat"},"canonical":{"canonical_dat_name":"Game","canonical_rom_name":"Game.gba","region":null,"revision":null},"hash_evidence":{"matched_algorithm":"sha1","matched_value":"aa","available_algorithms":["SHA-1"]},"ambiguous_candidates":[],"candidate_provenance":[],"matched_entries":[],"audited_hashes":{"size_bytes":4,"crc32":null,"md5":null,"sha1":"aa","sha256":null},"audited_at":"2026-10-08T00:50:48Z","completeness":"exhaustive"}"#;
 
 fn gate_identity(sha1: &str) -> crate::dat::library_identity_summary::PersistedLibraryDatIdentity {
     let mut value: serde_json::Value = serde_json::from_str(GATE_FACTS).unwrap();

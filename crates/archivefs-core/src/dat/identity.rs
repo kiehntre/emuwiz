@@ -420,6 +420,225 @@ pub fn negative_dat_result_applies(
     }
 }
 
+/// Whether an exact-match algorithm label is strong enough to identify a
+/// game's system: every matched file confirmed by SHA-256 or SHA-1. MD5
+/// alone (for any file of the match) is not; CRC32 never reaches an exact
+/// label. Labels are the audit's own (`"SHA-1"`, `"SHA-256/SHA-1"`, ...).
+pub fn identifies_by_strong_hash(algorithm: &str) -> bool {
+    !algorithm.is_empty()
+        && algorithm
+            .split('/')
+            .all(|part| matches!(part, "SHA-256" | "SHA-1"))
+}
+
+/// Why a result was not saved for a game ([`dat_result_platform_refusal`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlatformRefusal {
+    /// The game has no system, and this result did not give it one: it is
+    /// not a single exact SHA-256/SHA-1 match, or this save route (Check
+    /// Games) never identifies systems.
+    NoSystem,
+    /// The game has no system, and the catalogue names several systems, so
+    /// it cannot say which one is the game's.
+    NoSystemSeveralSystems,
+    /// The catalogue is for another system than the game's.
+    OtherSystem,
+    /// An unassigned arcade catalogue, for a game not on an arcade system.
+    NotArcade,
+    /// The catalogue's assigned system and its header disagree.
+    CatalogueContradicts,
+    /// Nothing maps the catalogue to a system: assign it one.
+    CatalogueUnassigned,
+    /// A "no match" from a catalogue whose header is not for the game's system.
+    NoMatchNotForSystem,
+}
+
+impl PlatformRefusal {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::NoSystem => {
+                "the game has no system and this result did not give it one (that needs a single exact SHA-256 or SHA-1 match from a complete check with no conflicting evidence, saved from DAT Management)"
+            }
+            Self::NoSystemSeveralSystems => {
+                "the game has no system and the catalogue names several, so it cannot say which"
+            }
+            Self::OtherSystem => "the catalogue is for another system than the game's",
+            Self::NotArcade => {
+                "an arcade catalogue's result, for a game that is not on an arcade system"
+            }
+            Self::CatalogueContradicts => "the catalogue's assigned system and its header disagree",
+            Self::CatalogueUnassigned => "the catalogue is not assigned to any system",
+            Self::NoMatchNotForSystem => {
+                "a \"no match\" from a catalogue whose header is not for the game's system"
+            }
+        }
+    }
+}
+
+/// The systems an unassigned MAME arcade or FBNeo catalogue speaks for.
+pub const ARCADE_MACHINE_SYSTEMS: &[&str] = &["Arcade", "NeoGeo", "NeoGeo64"];
+
+/// Whether a saved result is strong enough to identify a game's system
+/// automatically (owner policy 2026-11-26): a single verified catalogue
+/// game, matched on SHA-256 or SHA-1 for every file, with no other
+/// candidate, from a complete run. Several files of one game (an archive's
+/// members, a disc's tracks) are one game; files of different games are
+/// not. MD5-only, CRC, filename-only, partial and ambiguous results never
+/// identify a system (they still verify a game whose system is known).
+pub fn identifies_system(
+    persisted: &super::library_identity_summary::PersistedLibraryDatIdentity,
+) -> bool {
+    use super::library_identity_summary::{DatAuditCompleteness, DatVerificationState as State};
+    let State::VerifiedSingleMatch { algorithm } = &persisted.verification_state else {
+        return false;
+    };
+    let mut games = persisted
+        .matched_entries
+        .iter()
+        .map(|entry| &entry.game_name);
+    let one_game = games
+        .next()
+        .is_some_and(|first| games.all(|other| other == first));
+    identifies_by_strong_hash(algorithm)
+        && one_game
+        && persisted.ambiguous_candidates.is_empty()
+        && persisted.completeness == DatAuditCompleteness::Exhaustive
+}
+
+/// Which system(s) a catalogue speaks for, from what a saved result records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogueSystems {
+    /// One system: from its header, or assigned when it was configured.
+    One(String),
+    /// A header that deliberately names several systems (no system was
+    /// assigned): it speaks for each of them.
+    Several(Vec<String>),
+    /// A MAME arcade or FBNeo catalogue with no assigned system: it names
+    /// arcade machines, so it speaks for the arcade systems
+    /// ([`ARCADE_MACHINE_SYSTEMS`]) and nothing else. A MAME software list
+    /// is per system and needs its system assigned; unassigned, it is
+    /// [`CatalogueSystems::Unmapped`].
+    ArcadeMachines,
+    /// The assigned system and the header disagree.
+    Disagreeing,
+    /// Nothing maps the catalogue to a system.
+    Unmapped,
+}
+
+/// The systems a saved result's catalogue speaks for.
+pub fn catalogue_systems(
+    source: &super::library_identity_summary::DatSourceProvenance,
+) -> CatalogueSystems {
+    let same = |a: &str, b: &str| a == b || equivalent_platform_ids(b).contains(&a);
+    let header = dat_platform_from_catalogue_names(&source.catalogue_names, source.ecosystem);
+    let assigned = source
+        .configured_platform
+        .as_deref()
+        .and_then(crate::canonical_platform_for_alias);
+    match (assigned, header) {
+        (Some(assigned), DatPlatformIdentity::Resolved { platform, .. }) => {
+            if same(assigned, &platform) {
+                CatalogueSystems::One(platform)
+            } else {
+                CatalogueSystems::Disagreeing
+            }
+        }
+        (Some(assigned), DatPlatformIdentity::Ambiguous { candidates }) => {
+            if candidates.iter().any(|c| same(assigned, &c.platform)) {
+                CatalogueSystems::One(assigned.to_owned())
+            } else {
+                CatalogueSystems::Disagreeing
+            }
+        }
+        (Some(assigned), DatPlatformIdentity::Unknown) => {
+            CatalogueSystems::One(assigned.to_owned())
+        }
+        (None, DatPlatformIdentity::Resolved { platform, .. }) => CatalogueSystems::One(platform),
+        (None, DatPlatformIdentity::Ambiguous { candidates }) => {
+            let mut systems: Vec<String> = candidates.into_iter().map(|c| c.platform).collect();
+            systems.sort();
+            systems.dedup();
+            CatalogueSystems::Several(systems)
+        }
+        (None, DatPlatformIdentity::Unknown) => {
+            if matches!(
+                source.ecosystem,
+                Some(DatEcosystem::MAMEArcade | DatEcosystem::FBNeo)
+            ) {
+                CatalogueSystems::ArcadeMachines
+            } else {
+                CatalogueSystems::Unmapped
+            }
+        }
+    }
+}
+
+/// Why a DAT result may not be saved for an item on `item_platform`, or
+/// `None` when it may. Applied on every save of a DAT identity row (owner
+/// policy 2026-11-26):
+///
+/// * a known system the catalogue speaks for (see [`catalogue_systems`]):
+///   saved; a "no match" additionally needs the header itself to name that
+///   system ([`negative_dat_result_applies`]);
+/// * a known system the catalogue does not speak for, a catalogue whose
+///   assigned system and header disagree, or one nothing maps to a system:
+///   refused, match or not. An unassigned MAME arcade or FBNeo catalogue
+///   speaks only for the arcade systems; a MAME software list needs its
+///   system assigned;
+/// * no known system: refused. A game's system is identified only by the
+///   identity-and-platform save, which assigns it from this same result
+///   ([`identifies_system`]) in the same transaction just before the row is
+///   written, and fails the whole save if that row is not written (see
+///   `Database::persist_library_dat_identities_and_platforms_from_audit`).
+pub fn dat_result_platform_refusal(
+    persisted: &super::library_identity_summary::PersistedLibraryDatIdentity,
+    item_platform: Option<&str>,
+) -> Option<PlatformRefusal> {
+    let Some(item) = item_platform.and_then(crate::canonical_platform_for_alias) else {
+        // Say what is wrong with the catalogue first: a game with no system
+        // can only get one from a catalogue for exactly one system.
+        return Some(match catalogue_systems(&persisted.source) {
+            CatalogueSystems::Unmapped => PlatformRefusal::CatalogueUnassigned,
+            CatalogueSystems::Disagreeing => PlatformRefusal::CatalogueContradicts,
+            CatalogueSystems::Several(_) => PlatformRefusal::NoSystemSeveralSystems,
+            CatalogueSystems::ArcadeMachines => PlatformRefusal::NotArcade,
+            CatalogueSystems::One(_) => PlatformRefusal::NoSystem,
+        });
+    };
+    let speaks_for =
+        |platform: &str| platform == item || equivalent_platform_ids(platform).contains(&item);
+    match catalogue_systems(&persisted.source) {
+        CatalogueSystems::One(platform) if !speaks_for(&platform) => {
+            return Some(PlatformRefusal::OtherSystem);
+        }
+        CatalogueSystems::Several(systems) if !systems.iter().any(|s| speaks_for(s)) => {
+            return Some(PlatformRefusal::OtherSystem);
+        }
+        CatalogueSystems::ArcadeMachines
+            if !ARCADE_MACHINE_SYSTEMS.iter().any(|s| speaks_for(s)) =>
+        {
+            return Some(PlatformRefusal::NotArcade);
+        }
+        CatalogueSystems::Disagreeing => {
+            return Some(PlatformRefusal::CatalogueContradicts);
+        }
+        CatalogueSystems::Unmapped => {
+            return Some(PlatformRefusal::CatalogueUnassigned);
+        }
+        _ => {}
+    }
+    if !persisted.carries_identity()
+        && !negative_dat_result_applies(
+            &persisted.source.catalogue_names,
+            persisted.source.ecosystem,
+            item_platform,
+        )
+    {
+        return Some(PlatformRefusal::NoMatchNotForSystem);
+    }
+    None
+}
+
 /// Evidence from one piece of header/software-list text: the whole string
 /// first, then each conservatively split segment. `carries_machine_key`
 /// attaches `text` itself as the [`DatPlatformEvidence::machine_key`] of every
