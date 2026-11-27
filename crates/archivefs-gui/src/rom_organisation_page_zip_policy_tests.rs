@@ -102,6 +102,10 @@ fn library() -> Library {
     zip(&root.join("zeta.zip"), &[("z.gbc", b"zeta rom")]);
     // An unrelated file already holds the name zeta.zip would take.
     std::fs::write(root.join("Zeta (USA).zip"), b"someone else's file").unwrap();
+    // A loose verified file, and an unknown file a RomM hint would call by
+    // the same game's name (the RomM conflict test).
+    std::fs::write(root.join("gamma.gbc"), b"gamma rom").unwrap();
+    std::fs::write(root.join("hinted.gbc"), b"not in the catalogue").unwrap();
 
     let dat = dir.path().join("gbc.dat");
     let mut body = format!(
@@ -190,6 +194,11 @@ struct Proposal {
 
 /// What bulk Rename proposes from the saved checks, as `evidence_candidates` does.
 fn propose(lib: &Library) -> Proposal {
+    propose_with_romm(lib, &HashMap::new())
+}
+
+/// As [`propose`], with RomM titles for some files (display hints only).
+fn propose_with_romm(lib: &Library, romm: &HashMap<PathBuf, String>) -> Proposal {
     let ids: Vec<i64> = lib.ids.values().copied().collect();
     let evidence = lib
         .db
@@ -205,7 +214,7 @@ fn propose(lib: &Library) -> Proposal {
         let dat = found
             .map(|e| e.name.clone())
             .unwrap_or(archivefs_core::VerifiedDatName::None);
-        let choice = choose_name(dat, None, path);
+        let choice = choose_name(dat, romm.get(path).cloned(), path);
         if let (Some(found), NameSource::VerifiedDat { .. }) = (found, &choice.source)
             && let Some(sha1) = &found.raw_sha1
         {
@@ -416,4 +425,47 @@ fn other_containers_and_romm_never_name_an_archive() {
     // A verified ZIP wins over a RomM title.
     let zip = choose_name(member(), Some("Other.zip".into()), Path::new("/r/l.zip"));
     assert_eq!(zip.name.as_deref(), Some("Lemmings (1991).zip"));
+}
+
+/// Owner 2026-11-26: "Unverified RomM metadata must not become a proposed
+/// actionable filename or create misleading destination conflicts in
+/// verified Rename mode." A RomM hint naming an unknown file after a verified
+/// game proposes nothing, and the verified file still renames.
+#[test]
+fn a_romm_hint_never_takes_a_name_or_blocks_a_verified_rename() {
+    let lib = library();
+    let hinted = lib.root.join("hinted.gbc");
+    let romm = HashMap::from([(hinted.clone(), "Gamma (USA)".to_string())]);
+    let proposal = propose_with_romm(&lib, &romm);
+    let choice = &proposal.choices[&hinted];
+    assert_eq!(choice.source, NameSource::Romm, "{choice:?}");
+    assert!(!hint_gate::name_is_verified(Some(choice)));
+    let candidate = proposal
+        .candidates
+        .iter()
+        .find(|c| c.source_path == hinted)
+        .unwrap();
+    assert_eq!(
+        candidate.canonical_name, None,
+        "a hint is never an actionable name"
+    );
+
+    let plan = plan(&lib, &proposal);
+    let gamma = entry(&plan, "gamma.gbc");
+    assert_eq!(
+        gamma.status,
+        OrganisationStatus::Suggested,
+        "{:?}",
+        gamma.reason
+    );
+    assert_eq!(gamma.destination_path, lib.root.join("Gamma (USA).gbc"));
+    let hint = entry(&plan, "hinted.gbc");
+    assert_ne!(hint.status, OrganisationStatus::Suggested);
+    assert_ne!(
+        hint.status,
+        OrganisationStatus::Conflict,
+        "{:?}",
+        hint.reason
+    );
+    assert_ne!(hint.destination_path, lib.root.join("Gamma (USA).gbc"));
 }
