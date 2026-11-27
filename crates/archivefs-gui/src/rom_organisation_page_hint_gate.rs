@@ -143,7 +143,7 @@ pub(crate) fn unverified_name_label(entry: &OrganisationPlanEntry) -> Option<&'s
 
 /// A row may rename in bulk only when its name is a verified catalogue name.
 /// No recorded choice counts as unverified (fail closed).
-fn name_is_verified(choice: Option<&NameChoice>) -> bool {
+pub(crate) fn name_is_verified(choice: Option<&NameChoice>) -> bool {
     matches!(
         choice.map(|choice| &choice.source),
         Some(NameSource::VerifiedDat { .. })

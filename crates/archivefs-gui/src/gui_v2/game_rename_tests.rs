@@ -305,12 +305,20 @@ mod verified_name_prefill {
 
     #[test]
     fn archives_and_other_extensions_follow_bulk_rename_and_keep_their_name() {
-        // Matched through the .gbc inside: bulk Rename keeps the archive's
-        // name today, so the card does too (shared rule; Stage B changes both).
+        // A ZIP holding one exactly verified game takes the game's name
+        // (owner zip rule 2026-11-26), in bulk Rename and here alike.
         assert_eq!(
             stem(
                 usable("Ecco Jr. (USA).gbc", "Ecco Jr. (USA)", true),
                 "/g/ecco.zip"
+            ),
+            Some("Ecco Jr. (USA)".into())
+        );
+        // Other containers keep their name.
+        assert_eq!(
+            stem(
+                usable("Ecco Jr. (USA).gbc", "Ecco Jr. (USA)", true),
+                "/g/ecco.7z"
             ),
             None
         );
@@ -335,6 +343,10 @@ mod verified_name_prefill {
             (
                 usable("Ecco Jr. (USA).gbc", "Ecco Jr. (USA)", true),
                 "/g/e.zip",
+            ),
+            (
+                usable("Ecco Jr. (USA).gbc", "Ecco Jr. (USA)", true),
+                "/g/e.7z",
             ),
             (
                 usable("Game (Europe).bin", "Game (Europe)", false),

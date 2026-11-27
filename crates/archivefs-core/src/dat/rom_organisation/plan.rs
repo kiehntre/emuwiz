@@ -743,7 +743,10 @@ fn detect_collisions_with(
         if entries[index].destination_path.as_os_str().is_empty() {
             continue;
         }
-        if entries[index].status == OrganisationStatus::AlreadyOrganised {
+        // Only a row that would change a file is checked against the live
+        // folder: a held-back row (needs verification, blocked, unsupported)
+        // keeps its own reason, never a conflict it cannot cause.
+        if entries[index].status != OrganisationStatus::Suggested {
             continue;
         }
         // Linked-library destinations are classified by their exact object
@@ -821,9 +824,13 @@ fn detect_collisions_with(
                 })
             });
         if let Some(names) = names {
+            let own = own_name_in(&entries[index], parent);
             let collision = names
                 .get(&file_name.to_ascii_lowercase())
-                .is_some_and(|same| same.iter().any(|name| *name != file_name));
+                .is_some_and(|same| {
+                    same.iter()
+                        .any(|name| *name != file_name && Some(name) != own.as_ref())
+                });
             if collision {
                 mark_conflict(
                     entries,
@@ -894,7 +901,10 @@ pub(crate) fn detect_collisions_pairwise(
         if entries[index].destination_path.as_os_str().is_empty() {
             continue;
         }
-        if entries[index].status == OrganisationStatus::AlreadyOrganised {
+        // Only a row that would change a file is checked against the live
+        // folder: a held-back row (needs verification, blocked, unsupported)
+        // keeps its own reason, never a conflict it cannot cause.
+        if entries[index].status != OrganisationStatus::Suggested {
             continue;
         }
         // Linked-library destinations are classified by their exact object
@@ -955,9 +965,12 @@ pub(crate) fn detect_collisions_pairwise(
             continue;
         }
         if let Ok(dir_entries) = std::fs::read_dir(parent) {
+            let own = own_name_in(&entries[index], parent);
             let collision = dir_entries.flatten().any(|dir_entry| {
                 let name = dir_entry.file_name().to_string_lossy().into_owned();
-                name.eq_ignore_ascii_case(&file_name) && name != file_name
+                name.eq_ignore_ascii_case(&file_name)
+                    && name != file_name
+                    && Some(&name) != own.as_ref()
             });
             if collision {
                 mark_conflict(
@@ -970,6 +983,16 @@ pub(crate) fn detect_collisions_pairwise(
     }
 
     let _ = master_root;
+}
+
+/// The source file's own name when it sits in `folder`: a case-only rename
+/// (`Futago-Jima` → `Futago-jima`) must not conflict with the file itself.
+/// Another file that differs only by case still does.
+fn own_name_in(entry: &OrganisationPlanEntry, folder: &Path) -> Option<String> {
+    (entry.source_path.parent() == Some(folder))
+        .then(|| entry.source_path.file_name())
+        .flatten()
+        .map(|name| name.to_string_lossy().into_owned())
 }
 
 fn mark_conflict(entries: &mut [OrganisationPlanEntry], index: usize, reason: &str) {

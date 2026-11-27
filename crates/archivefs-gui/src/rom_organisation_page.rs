@@ -2155,10 +2155,34 @@ pub(crate) fn undo_availability(status: OrganisationStatus) -> &'static str {
     }
 }
 
+/// A file name that is itself an archive (a nested container).
+fn is_container_name(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .as_deref(),
+        Some("zip" | "7z" | "rar")
+    )
+}
+
+/// Shown with every archive renamed by its verified game name.
+pub(crate) const ARCHIVE_RENAME_NOTE: &str = "The archive holds one verified game (every game file in it matched that one game exactly), so it takes the game's catalogue name. Only the archive's own name changes; nothing inside it is touched.";
+
 /// The owner's rule (S1, 2026-11-16): a verified catalogue name wins; RomM is
 /// the fallback; otherwise the file keeps its name. A catalogue name is used
-/// only when it names a file of the same kind (same extension): a match made
-/// through an archive member never renames the archive here.
+/// only when it names a file of the same kind (same extension).
+///
+/// Archives (owner decision 2026-11-26): an outer ZIP is renamed to the
+/// verified catalogue *game* name, keeping its own extension, when its saved
+/// check matched it through its members. That provenance is recorded only
+/// when the check read the whole archive and every member is safe and is the
+/// same single, exactly matched game (a one-file game, or a complete
+/// multi-file set; never a partial set, several games, ambiguity or a nested
+/// archive: `library_identity_projection::parent_representative_member`).
+/// Weak evidence and RomM never rename an archive, and the contents are
+/// never touched: only the outer file's name changes. Other containers
+/// (7z, RAR) keep their name. This is the one rule for single-game Rename,
+/// bulk Rename, preview and Apply.
 pub(crate) fn choose_name(
     dat: archivefs_core::VerifiedDatName,
     romm: Option<String>,
@@ -2171,17 +2195,51 @@ pub(crate) fn choose_name(
     };
     let mut skipped_archive = false;
     let dat_refusal = match dat {
+        V::Usable {
+            through_archive_member: true,
+            game_name,
+            dat_source_id,
+            rom_name,
+        } if extension(source).as_deref() == Some("zip")
+            && !is_container_name(Path::new(&rom_name)) =>
+        {
+            // The source's own extension text, as written (".zip" or ".ZIP").
+            let own = source
+                .extension()
+                .map(|e| e.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let note = romm.as_ref().map(|romm| {
+                format!("RomM suggests '{romm}'; the verified catalogue name is used instead")
+            });
+            return NameChoice {
+                name: Some(format!("{game_name}.{own}")),
+                source: NameSource::VerifiedDat {
+                    catalogue: dat_source_id,
+                },
+                note: Some(match note {
+                    Some(romm) => format!("{ARCHIVE_RENAME_NOTE} {romm}"),
+                    None => ARCHIVE_RENAME_NOTE.to_string(),
+                }),
+                skipped_archive: false,
+            };
+        }
         // Recorded provenance, not an extension guess: a member's name never
-        // renames its archive, even when the member is itself a .zip.
+        // renames a 7z or RAR archive.
         V::Usable {
             through_archive_member: true,
             rom_name,
             ..
         } => {
             skipped_archive = true;
-            Some(format!(
-                "the catalogue matched '{rom_name}', a file inside this archive; archives are not renamed with an inner file's name"
-            ))
+            Some(if is_container_name(Path::new(&rom_name)) {
+                format!(
+                    "the catalogue matched '{rom_name}', an archive inside this archive; an archive is never renamed after an archive it holds"
+                )
+            } else {
+                format!(
+                    "the catalogue matched '{rom_name}', a file inside this archive; only ZIP archives are renamed with their verified game's name"
+                )
+            })
         }
         V::Usable {
             rom_name,
@@ -4938,19 +4996,25 @@ mod tests {
             generation: 1,
             entries,
         };
+        // disk.zip holds one verified game, so it takes the game's name
+        // (owner zip rule 2026-11-26): a verified change, not a RomM fallback
+        // and not a skipped archive.
         assert_eq!(
             name_counts(&plan, &choices),
             NameCounts {
-                dat_changes: 1,
+                dat_changes: 2,
                 dat_already_correct: 1,
-                romm_fallbacks: 2,
-                archives_skipped: 1
+                romm_fallbacks: 1,
+                archives_skipped: 0
             }
         );
     }
 
+    /// Owner zip rule 2026-11-26: a match through a member renames a ZIP to
+    /// the verified game's name (never the member's name); a 7z or RAR, or a
+    /// ZIP whose matched member is itself an archive, keeps its name.
     #[test]
-    fn a_match_through_an_archive_member_never_renames_the_archive() {
+    fn a_match_through_an_archive_member_renames_only_a_zip_and_only_by_game() {
         use archivefs_core::VerifiedDatName as V;
         let member = || V::Usable {
             rom_name: "Lemmings (1991).adf".into(),
@@ -4960,6 +5024,34 @@ mod tests {
         };
         let zip = Path::new("/roms/amiga/lemmings.zip");
         let choice = choose_name(member(), None, zip);
+        assert_eq!(
+            (choice.name.as_deref(), &choice.source),
+            (
+                Some("Lemmings (1991).zip"),
+                &NameSource::VerifiedDat {
+                    catalogue: "tosec-amiga".into()
+                }
+            )
+        );
+        assert!(!choice.skipped_archive);
+        assert!(
+            choice
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("nothing inside it is touched"))
+        );
+        // The verified name wins over RomM, which is only mentioned.
+        let with_romm = choose_name(member(), Some("Lemmings.zip".into()), zip);
+        assert_eq!(with_romm.name.as_deref(), Some("Lemmings (1991).zip"));
+        assert!(
+            with_romm
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("RomM suggests"))
+        );
+        // A 7z keeps its name; RomM is its fallback as before.
+        let seven = Path::new("/roms/amiga/lemmings.7z");
+        let choice = choose_name(member(), None, seven);
         assert_eq!((choice.name, choice.source), (None, NameSource::Original));
         assert!(
             choice
@@ -4968,10 +5060,10 @@ mod tests {
                 .is_some_and(|n| n.contains("file inside this archive"))
         );
         assert!(choice.skipped_archive);
-        let with_romm = choose_name(member(), Some("Lemmings.zip".into()), zip);
+        let with_romm = choose_name(member(), Some("Lemmings.7z".into()), seven);
         assert_eq!(
             (with_romm.name.as_deref(), with_romm.source),
-            (Some("Lemmings.zip"), NameSource::Romm)
+            (Some("Lemmings.7z"), NameSource::Romm)
         );
         // Even an inner .zip never renames the outer .zip.
         let inner_zip = V::Usable {
@@ -4980,9 +5072,14 @@ mod tests {
             dat_source_id: "x".into(),
             through_archive_member: true,
         };
-        assert_eq!(
-            choose_name(inner_zip, None, zip).source,
-            NameSource::Original
+        let nested = choose_name(inner_zip, None, zip);
+        assert_eq!(nested.source, NameSource::Original);
+        assert!(nested.skipped_archive);
+        assert!(
+            nested
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("an archive inside this archive"))
         );
         // A loose file of another kind is refused but is not an archive.
         let other_kind = V::Usable {
@@ -5894,3 +5991,7 @@ mod hint_gate_runtime_tests;
 #[cfg(test)]
 #[path = "rom_organisation_page_undo_tests.rs"]
 mod undo_tests;
+
+#[cfg(test)]
+#[path = "rom_organisation_page_zip_policy_tests.rs"]
+mod zip_policy_tests;
