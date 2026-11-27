@@ -37,10 +37,16 @@ fn separate_test_processes_get_separate_trees() {
     // so two concurrently running test binaries (or two runs, even with the
     // same pid in different PID namespaces) can never share mutable state.
     let name = root.file_name().unwrap().to_string_lossy().into_owned();
+    // <exe>-<pid>-<start hex>-<n>: the pid segment is exactly this process's.
+    let mut segments = name.rsplitn(4, '-');
+    let (attempt, start, pid) = (segments.next(), segments.next(), segments.next());
+    assert!(attempt.is_some_and(|n| n.parse::<u32>().is_ok()), "{name}");
     assert!(
-        name.contains(&format!("-{}-", std::process::id())),
+        start.is_some_and(|s| u128::from_str_radix(s, 16).is_ok()),
         "{name}"
     );
+    assert_eq!(pid, Some(std::process::id().to_string().as_str()), "{name}");
+    assert!(segments.next().is_some_and(|exe| !exe.is_empty()), "{name}");
     let mut lock_name = root.file_name().unwrap().to_os_string();
     lock_name.push(".lock");
     let lock = std::fs::File::open(root.with_file_name(lock_name)).unwrap();

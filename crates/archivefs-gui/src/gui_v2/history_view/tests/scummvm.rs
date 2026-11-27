@@ -65,6 +65,8 @@ fn scummvm_native_blue_cheats_opens_the_trainer_controls_without_a_generic_adapt
 
 #[test]
 fn scummvm_fresh_blue_history_and_exact_game_scope_reload_receipts() {
+    // The apply below and the App's reload must share one library database.
+    archivefs_core::test_environment::isolate_test_data();
     // A real catalogue already owns its application-data directory. The
     // transaction intentionally refuses to invent missing managed-root parents.
     let data = archivefs_core::app_dirs::data_dir().unwrap();

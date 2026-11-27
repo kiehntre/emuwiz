@@ -479,6 +479,13 @@ impl Drop for Backend {
         let Some(worker) = self.worker.take() else {
             return;
         };
+        if std::thread::panicking() {
+            // The test already failed. A command it left running (for
+            // example one blocked on a gate the test never released) may
+            // never finish, so joining could hang the whole binary instead of
+            // reporting the failure: detach, as the shipped app does.
+            return;
+        }
         {
             let mut queues = self
                 .queues

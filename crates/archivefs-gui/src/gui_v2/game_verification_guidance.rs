@@ -177,6 +177,10 @@ impl State {
     /// sleeping, no timeout.
     #[cfg(test)]
     pub(super) fn finish_for_test(&mut self) {
+        assert!(
+            self.receiver.is_some() || self.result.is_some(),
+            "no verification guidance was started for this frame"
+        );
         if let Some(receiver) = self.receiver.take() {
             self.result = Some(receiver.recv().unwrap_or_else(|_| unavailable()));
         }
