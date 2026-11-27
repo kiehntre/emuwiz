@@ -266,6 +266,12 @@ pub fn default_database_path() -> Result<PathBuf> {
     // Resolve through the runtime app-directory policy so explicit and XDG
     // alternate roots are honored. The pure `resolve_database_path` helper
     // below remains the legacy/default-path test seam.
+    // Test builds only: a test that asked for its own library database uses
+    // it (see `test_environment::isolate_test_data`).
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(scoped) = crate::test_environment::scoped_database_dir() {
+        return Ok(scoped.join("library.sqlite3"));
+    }
     Ok(crate::app_dirs::data_dir()?.join("library.sqlite3"))
 }
 

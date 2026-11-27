@@ -168,7 +168,7 @@ impl HealthPage {
             cancel,
             receiver,
         });
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let id = work.id;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 worker::run(work, &worker_cancel, &mut |p| {
@@ -255,7 +255,7 @@ impl HealthPage {
         let work = report.clone();
         let (sender, receiver) = mpsc::channel();
         self.export = Some((report, receiver));
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = work.analysis.set_results.iter().find(|s| s.name == name)
                 .ok_or_else(|| "The selected set is not in this report.".to_string())
                 .and_then(|set| {
@@ -325,7 +325,7 @@ impl HealthPage {
                 cancel,
                 receiver,
             });
-            std::thread::spawn(move || {
+            crate::gui_v2::backend::spawn_worker(move || {
                 let unchanged = work.catalogue.source.still_matches()
                     && work.inspection.sources_unchanged(&worker_cancel);
                 let _ = sender.send(unchanged);

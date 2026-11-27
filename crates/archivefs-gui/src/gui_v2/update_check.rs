@@ -1,5 +1,6 @@
 //! Blue port of eba83521's EmuWiz checker adapter. Session-local, explicit
 //! checks only. The existing HTTPS transport is constructed on the worker.
+use crate::gui_v2::backend::SpawnWorkerThread as _;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use crate::ui::{components as widgets, theme};
@@ -46,7 +47,7 @@ impl UpdateCheckState {
         let (sender, receiver) = mpsc::channel();
         match std::thread::Builder::new()
             .name("emuwiz-update-check".into())
-            .spawn(move || {
+            .spawn_worker_thread(move || {
                 let result = checker();
                 let _ = sender.send(result);
                 ctx.request_repaint();

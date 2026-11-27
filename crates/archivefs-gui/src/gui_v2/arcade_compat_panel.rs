@@ -401,7 +401,7 @@ impl State {
         let (sender, receiver) = mpsc::channel();
         let request = inputs.request();
         let worker_cancel = Arc::clone(&cancel);
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let _ = sender.send(run_arcade_compat_check(&request, &worker_cancel));
         });
         self.running = Some(Running {

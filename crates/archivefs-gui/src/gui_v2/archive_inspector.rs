@@ -349,7 +349,7 @@ impl ArchiveInspectorPageState {
         let worker_target = target.clone();
         let (sender, receiver) = mpsc::channel();
         let repaint = ctx.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = inspect_path(&worker_target.path).map(|mut inspection| {
                 if inspection.format == ArchiveFormat::Zip && inspection.physical_zip_listing {
                     inspection.dat_markers = dat_markers(&worker_target, &inspection.report);

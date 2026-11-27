@@ -47,7 +47,7 @@ impl Panel {
         let (tx, receiver) = mpsc::channel();
         self.job = Some(receiver);
         let ctx = ctx.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let facts = std::panic::catch_unwind(|| {
                 let roots = AmigaProfileDiscoveryRoots::from_environment();
                 let mut facts =

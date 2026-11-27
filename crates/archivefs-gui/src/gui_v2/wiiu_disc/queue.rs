@@ -313,7 +313,7 @@ impl Controller {
     fn request_snapshot(&mut self, ctx: &egui::Context) {
         self.snapshot_requested = true;
         let (tx, dir, ctx) = (self.tx.clone(), self.dir.clone(), ctx.clone());
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = Self::queue_dir(&dir)
                 .and_then(|root| DurableConversionQueue::inspect(&root).map_err(|e| e.to_string()));
             let _ = tx.send(Msg::Snapshot(result));
@@ -331,7 +331,7 @@ impl Controller {
         let generation = self.generation;
         self.plans.insert(path.to_path_buf(), (generation, None));
         let (tx, ctx, path) = (self.tx.clone(), ctx.clone(), path.to_path_buf());
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let destination = path.with_extension(match direction {
                 WiiUConversionDirection::WudToWux => "wux",
                 WiiUConversionDirection::WuxToWud => "wud",
@@ -363,7 +363,7 @@ impl Controller {
         if spawn {
             let (tx, dir, ctx) = (self.tx.clone(), self.dir.clone(), ctx.clone());
             let (inbox, cancel) = (self.inbox.clone(), self.cancel.clone());
-            std::thread::spawn(move || worker(dir, tx, ctx, inbox, cancel));
+            crate::gui_v2::backend::spawn_worker(move || worker(dir, tx, ctx, inbox, cancel));
         }
     }
 }

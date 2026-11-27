@@ -155,6 +155,8 @@ fn blue_large_library_measurement() {
     );
     const N: usize = 130_000;
     let temp = tempfile::tempdir().unwrap();
+    // The seeded database and the App's workers must be the same one.
+    archivefs_core::test_environment::isolate_test_data();
     let path = archivefs_core::default_database_path().unwrap();
     assert!(path.starts_with(archivefs_core::test_environment::isolated_root().unwrap()));
     assert!(!path.exists(), "fresh private benchmark database required");

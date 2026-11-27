@@ -190,7 +190,7 @@ impl App {
             .queue(title, super::Route::Section(super::Section::Games), false);
         self.activity.start(job);
         let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let _ = sender.send(run(action));
         });
         self.game_rename.romm = Some(RommTitleJob {

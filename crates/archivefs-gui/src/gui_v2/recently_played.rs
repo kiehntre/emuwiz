@@ -21,6 +21,7 @@
 //! The file read, the Library path index and the existence checks for
 //! unmatched entries run on a worker thread, never during paint.
 
+use crate::gui_v2::backend::SpawnWorkerThread as _;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -410,7 +411,7 @@ impl State {
         let ctx = ctx.clone();
         let spawned = std::thread::Builder::new()
             .name("emuwiz-recently-played".into())
-            .spawn(move || {
+            .spawn_worker_thread(move || {
                 let _ = sender.send(load(library));
                 ctx.request_repaint();
             });

@@ -120,7 +120,7 @@ impl Panel {
         let (tx, rx) = mpsc::channel();
         self.job = Some(rx);
         let ctx = ctx.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = std::panic::catch_unwind(|| inspect(source, previous, path))
                 .unwrap_or_else(|_| {
                     Err("Media inspection worker stopped; no files were changed.".into())

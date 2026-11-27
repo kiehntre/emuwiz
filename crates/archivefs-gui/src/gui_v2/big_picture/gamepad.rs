@@ -11,6 +11,8 @@
 //! and never grabbed, so emulators see the controller as usual.
 
 use super::nav::{Button, Control, Direction, PadEvent};
+#[cfg(target_os = "linux")]
+use crate::gui_v2::backend::SpawnWorkerThread as _;
 
 const STICK_ON: f32 = 0.55;
 const STICK_OFF: f32 = 0.35;
@@ -735,7 +737,7 @@ mod linux {
             };
             let started = std::thread::Builder::new()
                 .name("emuwiz-gamepad".into())
-                .spawn(move || worker.run());
+                .spawn_worker_thread(move || worker.run());
             if let Err(error) = started {
                 log::warn!("Big Picture: controller reader did not start: {error}");
                 *status.lock().unwrap_or_else(|e| e.into_inner()) = PadStatus::Unsupported;

@@ -289,7 +289,7 @@ impl NativeWorkflows {
             let (sender, receiver) = mpsc::channel();
             self.collection.scope_job = Some(receiver);
             self.collection.refusal = None;
-            std::thread::spawn(move || {
+            crate::gui_v2::backend::spawn_worker(move || {
                 let result = archivefs_core::default_config_path()
                     .map_err(|error| error.to_string())
                     .and_then(|config| {

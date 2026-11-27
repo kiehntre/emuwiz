@@ -37,7 +37,7 @@ impl State {
         let (sender, receiver) = mpsc::channel();
         self.scan = Scan::Scanning(receiver);
         let context = context.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = Vita3kProfileDiscoveryRoots::from_environment()
                 .map_err(|error| error.to_string())
                 .map(|roots| scan_vita3k_installed_titles(&roots));

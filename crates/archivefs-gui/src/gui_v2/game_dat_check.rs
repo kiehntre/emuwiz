@@ -274,7 +274,7 @@ impl State {
         };
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = load().map(|inputs| {
                 let rows = list_installed_catalogues(inputs.inventory.inputs());
                 let matches = header_matches(&inputs);
@@ -302,7 +302,7 @@ impl State {
         self.stage = Stage::Previewing;
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = resolve_catalogue(&choice, inputs.inventory.inputs())
                 .map_err(|e| e.to_string())
                 .and_then(|resolved| {
@@ -348,7 +348,7 @@ impl State {
         self.cancel = Some(cancel.clone());
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let progress = sender.clone();
             let result = preview.execute(&trusted, &cancel, &|p| {
                 let _ = progress.send(Message::Progress(progress_text(p)));

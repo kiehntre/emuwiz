@@ -194,7 +194,7 @@ impl State {
         let worker_cancel = cancel.clone();
         let ctx = ctx.clone();
         self.job = Some(Job { cancel, receiver });
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 reconcile(&request, &worker_cancel, &mut |progress| {
                     let _ = sender.try_send(Message::Progress(progress));

@@ -73,7 +73,7 @@ impl State {
         self.task = Some(receiver);
         self.result = None;
         let context = context.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let outcome = cache_path().and_then(|path| {
                 let provider = ModDbProvider::new()
                     .with_cache_path(path)

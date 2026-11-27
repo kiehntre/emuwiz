@@ -186,7 +186,7 @@ impl Pinning {
         let (sender, receiver) = mpsc::channel();
         self.pending = Some(receiver);
         let context = context.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let _ = sender.send(work());
             context.request_repaint();
         });

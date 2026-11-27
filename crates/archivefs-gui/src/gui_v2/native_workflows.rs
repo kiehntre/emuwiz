@@ -1956,7 +1956,7 @@ impl NativeWorkflows {
             SavedSourceHistory::NotStarted => {
                 let (sender, receiver) = mpsc::channel();
                 let repaint = context.clone();
-                std::thread::spawn(move || {
+                crate::gui_v2::backend::spawn_worker(move || {
                     let _ = sender.send(load_saved_source_views());
                     repaint.request_repaint();
                 });
@@ -2337,7 +2337,7 @@ impl NativeWorkflows {
             RemoteSourceProbeRequest::new(&path).with_provenance("configured EmuWiz source path");
         let (sender, receiver) = mpsc::channel();
         self.remote_probe_jobs.insert(path, receiver);
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = archivefs_core::remote_source_health::probe_remote_source(&request);
             let _ = sender.send(result);
             context.request_repaint();
@@ -2931,7 +2931,7 @@ impl NativeWorkflows {
         };
         let database = snapshot.database_path.clone();
         let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let cancel = std::sync::atomic::AtomicBool::new(false);
             let message = crate::multidisc_launch_view::run_disc_recheck(
                 &database, &config, &recheck, &cancel,

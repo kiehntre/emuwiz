@@ -212,7 +212,7 @@ impl State {
         let (sender, receiver) = mpsc::channel();
         self.job = Some(receiver);
         let ctx = ctx.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let _ = sender.send(work());
             ctx.request_repaint();
         });

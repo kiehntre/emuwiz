@@ -180,7 +180,7 @@ impl Panel {
         });
         self.error = None;
         let ctx = ctx.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inspect(action)))
                 .unwrap_or_else(|_| {
                     Err("Contents reader stopped; no contents conclusion is available.".into())

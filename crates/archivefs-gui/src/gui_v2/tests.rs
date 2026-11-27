@@ -52,7 +52,32 @@ pub(super) fn archive(id: i64, title: &str, platform: Option<&str>) -> Persisted
     }
 }
 
+/// The calling test's own, empty library database, created through the
+/// production path inside the test's private scope (see `fixture`). A game
+/// shown from the library implies one exists, so tests of Game Details
+/// establish it rather than depend on another test creating it.
+pub(super) fn own_library_database() -> std::path::PathBuf {
+    let scope = archivefs_core::test_environment::isolate_test_data()
+        .expect("an isolated test environment");
+    let path = archivefs_core::default_database_path().unwrap();
+    assert!(path.starts_with(scope.data_dir()), "{path:?}");
+    archivefs_core::Database::open_or_create(&path).unwrap();
+    path
+}
+
+/// Renders one frame so the open game's verification-guidance worker starts,
+/// then waits for its answer. Game Details lays out differently for each
+/// answer, so a test that measures that layout must not race the worker.
+pub(super) fn settle_verification_guidance(context: &egui::Context, app: &mut App, size: [f32; 2]) {
+    frame(context, app, size);
+    app.review.verification_guidance.finish_for_test();
+}
+
 pub(super) fn fixture(context: &egui::Context) -> App {
+    // Each test gets its own library database location, and the Backend
+    // worker started below inherits it: no test can depend on, or disturb, a
+    // library database another test in this process created.
+    archivefs_core::test_environment::isolate_test_data();
     readable_style(context);
     App {
         router: Router::default(),
@@ -5062,6 +5087,8 @@ fn gui_v2_selected_saturn_game_shows_read_only_disc_manifest_boundary() {
         Some("Saturn"),
     )]));
     app.router.current = Route::Game(9);
+    own_library_database();
+    settle_verification_guidance(&context, &mut app, [1280.0, 1600.0]);
 
     let closed = scrolled_text(&context, &mut app, [1280.0, 1600.0]);
     assert!(closed.iter().any(|value| value == "Disc & ROM evidence"));

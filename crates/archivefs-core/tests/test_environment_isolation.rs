@@ -32,11 +32,29 @@ fn separate_test_processes_get_separate_trees() {
     let Some(root) = archivefs_core::test_environment::isolated_root() else {
         return;
     };
-    // The tree is keyed by executable and pid, so two concurrently running test
-    // binaries (or two runs) can never share mutable state.
+    // The tree is keyed by executable, pid, start time and an exclusive
+    // counter, and owned through a lock this process holds for its lifetime,
+    // so two concurrently running test binaries (or two runs, even with the
+    // same pid in different PID namespaces) can never share mutable state.
     let name = root.file_name().unwrap().to_string_lossy().into_owned();
+    // <exe>-<pid>-<start hex>-<n>: the pid segment is exactly this process's.
+    let mut segments = name.rsplitn(4, '-');
+    let (attempt, start, pid) = (segments.next(), segments.next(), segments.next());
+    assert!(attempt.is_some_and(|n| n.parse::<u32>().is_ok()), "{name}");
     assert!(
-        name.ends_with(&format!("-{}", std::process::id())),
+        start.is_some_and(|s| u128::from_str_radix(s, 16).is_ok()),
         "{name}"
+    );
+    assert_eq!(pid, Some(std::process::id().to_string().as_str()), "{name}");
+    assert!(segments.next().is_some_and(|exe| !exe.is_empty()), "{name}");
+    let mut lock_name = root.file_name().unwrap().to_os_string();
+    lock_name.push(".lock");
+    let lock = std::fs::File::open(root.with_file_name(lock_name)).unwrap();
+    use std::os::fd::AsRawFd;
+    // SAFETY: flock on a descriptor owned by this function.
+    let taken = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    assert!(
+        !taken,
+        "the owner lock on {name} must be held by this process"
     );
 }

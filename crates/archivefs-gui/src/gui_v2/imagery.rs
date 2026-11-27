@@ -11,6 +11,7 @@ use super::{
     library::Library,
     media_sources::{MediaIndex, Source},
 };
+use crate::gui_v2::backend::SpawnWorkerThread as _;
 use crate::ui::{
     components::EMUWIZ_MASCOT_BADGE_PNG,
     platform_artwork::{
@@ -92,7 +93,7 @@ impl Imagery {
             let directory = archivefs_core::platform_artwork::default_platform_artwork_root().ok();
             std::thread::Builder::new()
                 .name("emuwiz-v2-platform-art".into())
-                .spawn(move || {
+                .spawn_worker_thread(move || {
                     while let Ok(job) = jobs.recv() {
                         let image = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             if job.asset_id == MASCOT {

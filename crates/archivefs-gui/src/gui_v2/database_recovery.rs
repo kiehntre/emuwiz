@@ -209,7 +209,7 @@ impl State {
     ) {
         let (tx, rx) = mpsc::channel();
         self.job = Some(Job { kind, receiver: rx });
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = f();
             let _ = tx.send(result);
             ctx.request_repaint();

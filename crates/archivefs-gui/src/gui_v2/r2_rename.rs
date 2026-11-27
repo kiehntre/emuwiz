@@ -87,7 +87,7 @@ impl State {
             selection_tag: self.selection_tag.clone(),
         });
         let ctx = ctx.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_|Err("Safety worker stopped unexpectedly. Preserve the workspace; refresh durable state before retrying.".into()));
             let _ = tx.send(result);
             ctx.request_repaint();

@@ -292,7 +292,7 @@ impl Artwork {
             let index_answers = index_answers.clone();
             let context = context.clone();
             let trim_root = cache.clone();
-            std::thread::spawn(move || {
+            crate::gui_v2::backend::spawn_worker(move || {
                 while let Ok(mut request) = index_rx.recv() {
                     // A rescan can supersede a queued index. Only build the newest.
                     // A superseded request's trim is kept, never dropped.
@@ -339,7 +339,7 @@ impl Artwork {
             let answers = answers.clone();
             let context = context.clone();
             let health = health.clone();
-            std::thread::spawn(move || {
+            crate::gui_v2::backend::spawn_worker(move || {
                 let transport = TimedTransport::default();
                 loop {
                     let request = {
@@ -553,7 +553,7 @@ impl Artwork {
         if self.trim_pending && self.index.is_some() {
             self.trim_pending = false;
             let root = self.cache.clone();
-            std::thread::spawn(move || {
+            crate::gui_v2::backend::spawn_worker(move || {
                 if let Ok(root) = root.map(Ok).unwrap_or_else(thumbnail::cache_root) {
                     thumbnail::trim_cache(&root);
                 }

@@ -230,7 +230,7 @@ impl State {
         let (sender, receiver) = mpsc::channel();
         self.worker = Some(receiver);
         let context = context.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let _ = sender.send(load(&history_root, &backup_root));
             context.request_repaint();
         });

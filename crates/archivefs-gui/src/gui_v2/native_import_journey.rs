@@ -200,7 +200,7 @@ impl Journey {
                 let ctx = ui.ctx().clone();
                 let (tx, rx) = mpsc::channel();
                 self.job = Some(rx);
-                std::thread::spawn(move || {
+                crate::gui_v2::backend::spawn_worker(move || {
                     let result = archivefs_core::default_config_path()
                         .map_err(|e| e.to_string())
                         .and_then(|cfg| {

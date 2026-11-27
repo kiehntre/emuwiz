@@ -236,7 +236,7 @@ impl State {
         let sources = self.sources.clone();
         let cancel = self.cancel.clone();
         let progress = self.progress.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = run(root, database.clone(), sources, &cancel, &mut |n, total| {
                 if let Ok(mut p) = progress.lock() {
                     *p = (n, total);

@@ -195,7 +195,9 @@ pub(super) struct ManagedChild {
     stdout: File,
     stderr: File,
     pub reaped: Arc<AtomicBool>,
-    pub isolation_root: Option<PathBuf>,
+    /// Where the child reports its own test environment tree when this
+    /// binary runs isolated (see `test_environment::child_tree_report`).
+    pub child_tree_report: Option<PathBuf>,
 }
 
 pub(super) struct Output {
@@ -206,21 +208,16 @@ pub(super) struct Output {
 
 impl ManagedChild {
     pub fn spawn(command: &mut Command) -> io::Result<Self> {
-        // These children re-execute this test binary. Its existing isolation
-        // constructor uses a sibling <binary>-<pid> tree. A killed child cannot
-        // run that constructor's exit handler, so its parent must own cleanup.
+        // These children re-execute this test binary. Its isolation
+        // constructor creates a sibling tree and reports exactly which one. A
+        // killed child cannot run that constructor's exit handler, so its
+        // parent must own cleanup (proven safe by the tree's owner lock, see
+        // test_environment).
         assert_eq!(command.get_program(), std::env::current_exe()?.as_os_str());
-        let isolation = crate::test_environment::isolated_root().map(|root| {
-            let suffix = format!("-{}", std::process::id());
-            let prefix = root
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .strip_suffix(&suffix)
-                .expect("test isolation root includes the parent PID");
-            (root.parent().unwrap().to_path_buf(), prefix.to_owned())
-        });
+        let child_tree_report = crate::test_environment::child_tree_report();
+        if let Some(report) = &child_tree_report {
+            command.env(crate::test_environment::REPORT_ROOT_ENVIRONMENT, report);
+        }
         let stdout = tempfile::tempfile()?;
         let stderr = tempfile::tempfile()?;
         command
@@ -228,14 +225,12 @@ impl ManagedChild {
             .stdout(Stdio::from(stdout.try_clone()?))
             .stderr(Stdio::from(stderr.try_clone()?));
         let child = command.spawn()?;
-        let isolation_root =
-            isolation.map(|(parent, prefix)| parent.join(format!("{prefix}-{}", child.id())));
         Ok(Self {
             child,
             stdout,
             stderr,
             reaped: Arc::new(AtomicBool::new(false)),
-            isolation_root,
+            child_tree_report,
         })
     }
 
@@ -280,17 +275,17 @@ impl ManagedChild {
         }
     }
 
+    /// Called only once the child is reaped, so its owner lock is released.
     fn clear_isolation(&self) -> io::Result<()> {
-        let Some(root) = &self.isolation_root else {
+        let Some(report) = &self.child_tree_report else {
             return Ok(());
         };
-        match std::fs::symlink_metadata(root) {
-            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
-                std::fs::remove_dir_all(root)
-            }
-            Ok(_) => Err(io::Error::other("unexpected child isolation root")),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
+        crate::test_environment::clear_abandoned_test_environments();
+        match crate::test_environment::reported_child_tree(report) {
+            Some(tree) if std::fs::symlink_metadata(&tree).is_ok() => Err(io::Error::other(
+                format!("child isolation tree survived its reaped owner: {tree:?}"),
+            )),
+            _ => Ok(()),
         }
     }
 }

@@ -381,7 +381,7 @@ impl MountsState {
         let (sender, receiver) = mpsc::channel();
         self.loading = Some(receiver);
         let context = context.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let _ = sender.send((workers.load)());
             context.request_repaint();
         });
@@ -404,7 +404,7 @@ impl MountsState {
                 let (sender, receiver) = mpsc::channel();
                 let stop = Arc::new(AtomicBool::new(false));
                 let worker_stop = Arc::clone(&stop);
-                std::thread::spawn(move || {
+                crate::gui_v2::backend::spawn_worker(move || {
                     (workers.mount_all)(items, &worker_stop, &mut |event| {
                         let _ = sender.send(event);
                         repaint.request_repaint();
@@ -424,7 +424,7 @@ impl MountsState {
                 let (sender, receiver) = mpsc::channel();
                 let stop = Arc::new(AtomicBool::new(false));
                 let worker_stop = Arc::clone(&stop);
-                std::thread::spawn(move || {
+                crate::gui_v2::backend::spawn_worker(move || {
                     (workers.unmount_all)(items, cleanup, &worker_stop, &mut |event| {
                         let _ = sender.send(event);
                         repaint.request_repaint();
@@ -446,7 +446,7 @@ impl MountsState {
             } => {
                 let (sender, receiver) = mpsc::channel();
                 let worker_path = path.clone();
-                std::thread::spawn(move || {
+                crate::gui_v2::backend::spawn_worker(move || {
                     let _ = sender.send((workers.single)(action, worker_path, cleanup));
                     repaint.request_repaint();
                 });

@@ -266,7 +266,7 @@ impl State {
         self.worker = Some(receiver);
         self.result = None;
         self.page = 0;
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = inspect(&reference, &inventory, root, &cancel);
             let _ = sender.send(result);
         });

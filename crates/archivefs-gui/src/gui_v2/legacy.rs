@@ -51,7 +51,7 @@ pub(super) fn open(section: Section, path: Option<&Path>) -> Result<(), String> 
         .spawn()
         .map_err(|error| error.to_string())?;
     // Reap the deliberate new window without occupying an application worker.
-    std::thread::spawn(move || {
+    crate::gui_v2::backend::spawn_worker(move || {
         let _ = child.wait();
     });
     Ok(())

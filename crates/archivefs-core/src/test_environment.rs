@@ -15,8 +15,14 @@
 //! debug builds contain none of it.
 //!
 //! * `HOME` and `XDG_RUNTIME_DIR` are set to directories under
-//!   `<target>/<profile>/emuwiz-test-env/<exe>-<pid>` (beside the test binary,
-//!   not under `/tmp`, which sandbox-visibility logic treats as host-only).
+//!   `<target>/<profile>/emuwiz-test-env/<exe>-<pid>-<start>-<n>` (beside the
+//!   test binary, not under `/tmp`, which sandbox-visibility logic treats as
+//!   host-only). The pid alone is not unique: test processes in different PID
+//!   namespaces (containers, sandboxes) that share one build directory can have
+//!   the same pid at the same time. Each tree is therefore owned through a
+//!   sibling `<name>.lock` that its process holds locked (`flock`) for its whole
+//!   life; a tree is only ever removed by its owner, or by a later process that
+//!   has proven the owner gone by taking that lock.
 //! * `XDG_{CONFIG,DATA,CACHE,STATE}_HOME` and `EMUWIZ_DATA_HOME` /
 //!   `EMUWIZ_CONFIG_HOME` are removed, so an inherited override cannot point a
 //!   test back at real data and everything resolves under the private `$HOME`
@@ -41,6 +47,12 @@ pub const REAL_ENVIRONMENT_OPT_IN: &str = "EMUWIZ_TEST_REAL_ENVIRONMENT";
 /// is the parent's [`isolated_root`]. The child adopts it without creating,
 /// clearing or removing anything; the parent still owns and removes the tree.
 pub const ADOPT_ENVIRONMENT: &str = "EMUWIZ_TEST_ADOPT_ENVIRONMENT";
+
+/// Set by a parent that re-executes this test binary (see
+/// [`child_tree_report`]): the child writes the path of the tree it created
+/// into this (new) file, so the parent knows exactly which tree was its
+/// child's, whatever pids other PID namespaces are using.
+pub const REPORT_ROOT_ENVIRONMENT: &str = "EMUWIZ_TEST_REPORT_ROOT";
 
 /// Files in the real home that no test may change. Relative to the real home.
 const SENTINELS: &[&str] = &[
@@ -68,6 +80,12 @@ struct Isolation {
     root: PathBuf,
     /// False for an adopted tree, which only its creating process may remove.
     owned: bool,
+    /// The locked `<root>.lock` proving this process owns `root`; held (never
+    /// read) until exit. `None` for an adopted tree.
+    _owner_lock: Option<std::fs::File>,
+    /// The process that created the tree. A forked child that never exec'd
+    /// inherits the exit hook, but must never remove its parent's live tree.
+    owner_pid: u32,
     real_home: Option<PathBuf>,
     sentinels: Vec<(PathBuf, Option<(u64, std::time::SystemTime)>)>,
 }
@@ -115,6 +133,12 @@ fn drop_cargo_loader_path() {
 /// [`install_test_environment!`] guarantees that by running it before `main`.
 pub fn isolate_process_environment() {
     ISOLATION.get_or_init(|| {
+        // Taken first, on every path (owned, adopted or real-machine), so it
+        // can never pass on to this process's own children.
+        let report = std::env::var_os(REPORT_ROOT_ENVIRONMENT);
+        // SAFETY: the one-time init runs from the pre-`main` constructor,
+        // single-threaded.
+        unsafe { std::env::remove_var(REPORT_ROOT_ENVIRONMENT) };
         if std::env::var_os(REAL_ENVIRONMENT_OPT_IN).is_some_and(|value| value == "1") {
             return None;
         }
@@ -139,6 +163,8 @@ pub fn isolate_process_environment() {
             return Some(Isolation {
                 root: adopted,
                 owned: false,
+                _owner_lock: None,
+                owner_pid: std::process::id(),
                 real_home,
                 sentinels: Vec::new(),
             });
@@ -174,20 +200,19 @@ pub fn isolate_process_environment() {
                     .map(|profile_dir| profile_dir.join("emuwiz-test-env"))
             })
             .unwrap_or_else(|| std::env::temp_dir().join("emuwiz-test-env"));
-        let root = base.join(format!("{exe}-{}", std::process::id()));
         // The shared parent must be a real directory we can create, never a
-        // symlink someone planted; the per-process root is then created
-        // *exclusively* (after clearing a stale tree left by an earlier process
-        // that happened to have this pid), so we never adopt a pre-existing path.
+        // symlink someone planted. Trees abandoned by processes that died
+        // without running their exit hook are cleared first, but only after
+        // their owner lock proves the owner gone; a live tree - whatever its
+        // pid, in whatever PID namespace - is never touched.
         std::fs::create_dir_all(&base).expect("create the test environment parent");
         assert!(is_real_directory(&base), "{base:?} must not be a symlink");
-        if std::fs::symlink_metadata(&root).is_ok() {
-            // `remove_dir_all` does not follow symlinks, so a planted link is
-            // removed itself, not its target.
-            std::fs::remove_dir_all(&root).expect("clear a stale test environment");
-        }
-        std::fs::create_dir(&root).expect("create the test environment root exclusively");
-        assert!(is_real_directory(&root), "{root:?} must not be a symlink");
+        prune_abandoned_trees(&base);
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let (root, owner_lock) = claim_unique_root(&base, &exe, std::process::id(), started);
         let home = root.join("home");
         let dirs = [
             ("HOME", home.clone()),
@@ -219,9 +244,14 @@ pub fn isolate_process_environment() {
             std::env::remove_var(crate::app_dirs::CONFIG_ROOT_OVERRIDE_ENV);
             libc::atexit(finish_isolation);
         }
+        if let Some(report) = &report {
+            report_root_to_parent(&root, Path::new(report));
+        }
         Some(Isolation {
             root,
             owned: true,
+            _owner_lock: Some(owner_lock),
+            owner_pid: std::process::id(),
             real_home,
             sentinels,
         })
@@ -232,7 +262,7 @@ extern "C" fn finish_isolation() {
     let Some(Some(isolation)) = ISOLATION.get() else {
         return;
     };
-    if !isolation.owned {
+    if !isolation.owned || isolation.owner_pid != std::process::id() {
         return;
     }
     for (path, before) in &isolation.sentinels {
@@ -256,6 +286,169 @@ extern "C" fn finish_isolation() {
             .is_some_and(|name| name == "emuwiz-test-env")
     {
         let _ = std::fs::remove_dir_all(&isolation.root);
+        // Still holding the lock: nobody else can be acting on this name.
+        let _ = std::fs::remove_file(owner_lock_path(&isolation.root));
+    }
+}
+
+/// `<base>/<name>.lock` for the tree `<base>/<name>`.
+fn owner_lock_path(root: &Path) -> PathBuf {
+    let mut name = root.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    root.with_file_name(name)
+}
+
+/// Whether the open `file` is still the file at `path` (same device and
+/// inode, not following a final symlink): a lock on an unlinked or replaced
+/// file proves nothing about the name.
+fn still_named(file: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::symlink_metadata(path)) {
+        (Ok(open), Ok(named)) => {
+            named.file_type().is_file() && open.dev() == named.dev() && open.ino() == named.ino()
+        }
+        _ => false,
+    }
+}
+
+/// `Ok(true)` when this process now holds the lock, `Ok(false)` when another
+/// open file description holds it (a live owner), and an error when the
+/// filesystem cannot lock at all: that proves nothing either way.
+fn try_lock(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `flock` on a descriptor this function borrows for the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+/// Child side of [`REPORT_ROOT_ENVIRONMENT`]: publish the created tree's path
+/// at the parent's report name atomically (written beside it, then hard-linked
+/// into place, which never replaces anything), so the parent sees either no
+/// report or the whole path. Runs in the constructor, so it never panics.
+fn report_root_to_parent(root: &Path, report: &Path) {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut partial = report.as_os_str().to_os_string();
+    partial.push(format!(".{}.partial", std::process::id()));
+    let partial = PathBuf::from(partial);
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&partial)
+        .and_then(|mut file| file.write_all(root.as_os_str().as_bytes()));
+    match written.and_then(|()| std::fs::hard_link(&partial, report)) {
+        Ok(()) => {}
+        // Already reported (never replaced).
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => eprintln!(
+            "test environment: could not report this child's tree {root:?} to its parent at {report:?}: {error}"
+        ),
+    }
+    let _ = std::fs::remove_file(&partial);
+}
+
+/// Creates and locks a fresh `<name>.lock`, then the tree `<name>`, with a
+/// name no other process can hold: `<exe>-<pid>-<started>-<n>`, where the
+/// lock file is created exclusively. The lock is taken *before* the tree
+/// exists, so a pruner can never see an unlocked tree that is about to be used.
+fn claim_unique_root(base: &Path, exe: &str, pid: u32, started: u128) -> (PathBuf, std::fs::File) {
+    use std::os::unix::fs::OpenOptionsExt;
+    for attempt in 0..1024u32 {
+        let root = base.join(format!("{exe}-{pid}-{started:x}-{attempt}"));
+        let lock_path = owner_lock_path(&root);
+        let lock = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&lock_path)
+        {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create the test environment lock {lock_path:?}: {error}"),
+        };
+        // A pruner may have taken (and unlinked) the brand-new lock between
+        // the create and this flock; then the name is not ours: try the next.
+        match try_lock(&lock) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                let _ = std::fs::remove_file(&lock_path);
+                panic!(
+                    "the test environment needs flock(2) locks under {base:?}, \
+                     which this filesystem refused: {error}"
+                );
+            }
+        }
+        if !still_named(&lock, &lock_path) {
+            continue;
+        }
+        match std::fs::create_dir(&root) {
+            Ok(()) => {
+                assert!(is_real_directory(&root), "{root:?} must not be a symlink");
+                return (root, lock);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Something already sits at a name whose lock we just
+                // created: never adopt it. Give the name back, try the next.
+                let _ = std::fs::remove_file(&lock_path);
+            }
+            Err(error) => panic!("create the test environment root {root:?}: {error}"),
+        }
+    }
+    panic!("no free test environment name under {base:?}");
+}
+
+/// Removes trees whose owner is proven gone: their `<name>.lock` is a regular
+/// file (never a symlink) that this process can lock, and is still the file
+/// at that name. A held lock means a live owner, in any PID namespace, and the
+/// tree is left alone; so is anything without a lock (for example trees from
+/// older test binaries), which cannot be proven abandoned.
+fn prune_abandoned_trees(base: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let lock_path = entry.path();
+        let Some(stem) = lock_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".lock"))
+        else {
+            continue;
+        };
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let Ok(lock) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(&lock_path)
+        else {
+            continue;
+        };
+        if !matches!(try_lock(&lock), Ok(true)) || !still_named(&lock, &lock_path) {
+            continue;
+        }
+        let root = base.join(stem);
+        if is_real_directory(&root) {
+            let _ = std::fs::remove_dir_all(&root);
+        } else if std::fs::symlink_metadata(&root).is_ok() {
+            // A planted link (or file) is removed itself, never its target.
+            let _ = std::fs::remove_file(&root);
+        }
+        let _ = std::fs::remove_file(&lock_path);
     }
 }
 
@@ -296,6 +489,158 @@ pub fn private_home_for_fixtures() -> PathBuf {
         "HOME {home:?} is outside the isolated tree {root:?}"
     );
     home
+}
+
+/// One test's own library database directory, inside this process's private
+/// tree.
+///
+/// The process-level isolation above gives every test in a binary the *same*
+/// private `$HOME`, so a test could pass or fail depending on whether an
+/// earlier test happened to create the library database there. A test -
+/// normally through its GUI fixture - calls [`isolate_test_data`]; from then
+/// on [`crate::default_database_path`] on that thread, and on worker threads
+/// it hands the scope to with [`enter_test_data_scope`], resolves inside this
+/// directory. It is removed when the last holder (the test thread or one of
+/// its workers) drops it.
+///
+/// Deliberately only the library database: undo seals, rename journals and
+/// writer records are resolved through `$HOME`, process-level stores and their
+/// own threads, and one transaction's evidence must never be split between
+/// two directories. Those stay in the process tree, as before.
+pub struct TestDataScope {
+    data_dir: PathBuf,
+}
+
+impl TestDataScope {
+    /// The directory this scope resolves the data directory to.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+}
+
+impl Drop for TestDataScope {
+    fn drop(&mut self) {
+        // Only ever a real directory inside this process's private tree.
+        if is_real_directory(&self.data_dir)
+            && isolated_root().is_some_and(|root| self.data_dir.starts_with(root))
+        {
+            let _ = std::fs::remove_dir_all(&self.data_dir);
+        }
+    }
+}
+
+thread_local! {
+    static TEST_DATA_SCOPE: std::cell::RefCell<Option<std::sync::Arc<TestDataScope>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Gives the calling test thread its own (initially absent) library database.
+/// Idempotent within one test: a second call (a "fresh app after a restart" in
+/// the same test) returns the same scope, so that test still sees its own
+/// database. `None` when this process is not isolated (the deliberate
+/// real-machine opt-in, used by child processes that bring their own profile):
+/// nothing changes for them.
+pub fn isolate_test_data() -> Option<std::sync::Arc<TestDataScope>> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if let Some(scope) = current_test_data_scope() {
+        return Some(scope);
+    }
+    let root = isolated_root()?;
+    assert!(
+        !RESOLVED_UNSCOPED.with(std::cell::Cell::get),
+        "this test resolved the library database before isolate_test_data(); \
+         call isolate_test_data() (or fixture()) first so it reads what it wrote"
+    );
+    let parent = root.join("per-test-data");
+    std::fs::create_dir_all(&parent).expect("create the per-test data parent");
+    assert!(
+        is_real_directory(&parent),
+        "{parent:?} must not be a symlink"
+    );
+    let data_dir = parent.join(
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_string(),
+    );
+    std::fs::create_dir(&data_dir).expect("create a per-test data directory exclusively");
+    let scope = std::sync::Arc::new(TestDataScope { data_dir });
+    TEST_DATA_SCOPE.with(|slot| *slot.borrow_mut() = Some(scope.clone()));
+    Some(scope)
+}
+
+/// The calling thread's data scope, if any: what a component that starts a
+/// worker thread hands to [`enter_test_data_scope`] on that thread.
+pub fn current_test_data_scope() -> Option<std::sync::Arc<TestDataScope>> {
+    // `try_with`: during thread teardown the slot may already be gone.
+    TEST_DATA_SCOPE
+        .try_with(|slot| slot.borrow().clone())
+        .ok()
+        .flatten()
+}
+
+/// Makes the calling (worker) thread resolve data exactly like the test thread
+/// that created `scope`, for the rest of this thread's life. `None` is a no-op.
+pub fn enter_test_data_scope(scope: Option<std::sync::Arc<TestDataScope>>) {
+    if let Some(scope) = scope {
+        TEST_DATA_SCOPE.with(|slot| *slot.borrow_mut() = Some(scope));
+    }
+}
+
+/// For [`crate::default_database_path`]: the active scope's directory.
+pub(crate) fn scoped_database_dir() -> Option<PathBuf> {
+    let scoped = TEST_DATA_SCOPE
+        .try_with(|slot| slot.borrow().as_ref().map(|scope| scope.data_dir.clone()))
+        .ok()
+        .flatten();
+    if scoped.is_none() {
+        let _ = RESOLVED_UNSCOPED.try_with(|flag| flag.set(true));
+    }
+    scoped
+}
+
+thread_local! {
+    /// This thread resolved the library database before it had a scope. A
+    /// test that then isolates would read a different database than it
+    /// wrote, so [`isolate_test_data`] refuses that order.
+    static RESOLVED_UNSCOPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// For a parent about to re-execute this test binary: a fresh path, inside
+/// this process's own tree, to pass to the child as
+/// [`REPORT_ROOT_ENVIRONMENT`]. `None` when this process is not isolated.
+pub fn child_tree_report() -> Option<PathBuf> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let reports = isolated_root()?.join("child-tree-reports");
+    std::fs::create_dir_all(&reports).ok()?;
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(reports.join(n.to_string()))
+}
+
+/// The tree a re-executed child reported through `report` (see
+/// [`child_tree_report`]), accepted only when it names a sibling of this
+/// process's own tree. `None` when the child never reached its constructor.
+pub fn reported_child_tree(report: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = std::fs::read(report).ok()?;
+    let tree = PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
+    let base = isolated_root()?.parent()?;
+    // Reports are published atomically, so anything else was not written by
+    // a child of this binary: never act on it (and never panic, since this
+    // runs from a fixture's drop, possibly while unwinding).
+    let valid = tree.parent() == Some(base) && tree.file_name().is_some();
+    if !valid {
+        eprintln!("test environment: ignored an invalid child tree report {report:?}: {tree:?}");
+    }
+    valid.then_some(tree)
+}
+
+/// Removes every test environment tree beside this process's own whose owner
+/// is proven gone (its owner lock can be taken). For a parent that killed or
+/// reaped a re-executed child, whose exit hook may not have run. A live
+/// tree, in any PID namespace, is never touched.
+pub fn clear_abandoned_test_environments() {
+    if let Some(base) = isolated_root().and_then(Path::parent) {
+        prune_abandoned_trees(base);
+    }
 }
 
 /// Variables that are removed so they cannot redirect a test to real data.
@@ -450,6 +795,155 @@ mod tests {
             .map(|home| stat(&home.join(".local/share/archivefs/rom_organisation_approvals.json")));
         assert_eq!(before, after);
         std::fs::remove_file(&sidecar).unwrap();
+    }
+
+    fn scratch_base(name: &str) -> PathBuf {
+        let base = isolated_root()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("ownership-{name}"))
+            .join("emuwiz-test-env");
+        let _ = std::fs::remove_dir_all(base.parent().unwrap());
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[test]
+    fn the_same_pid_in_two_pid_namespaces_gets_two_distinct_live_trees() {
+        let base = scratch_base("same-pid");
+        // Two processes that both see themselves as pid 2, started together.
+        let (first, first_lock) = claim_unique_root(&base, "suite", 2, 7);
+        let (second, second_lock) = claim_unique_root(&base, "suite", 2, 7);
+        assert_ne!(first, second);
+        std::fs::write(first.join("live.txt"), "first").unwrap();
+        // The second process's start-up clean-up must not touch the first.
+        prune_abandoned_trees(&base);
+        assert_eq!(
+            std::fs::read_to_string(first.join("live.txt")).unwrap(),
+            "first"
+        );
+        assert!(is_real_directory(&second));
+        drop((first_lock, second_lock));
+        std::fs::remove_dir_all(base.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn only_a_tree_whose_owner_is_gone_is_pruned() {
+        let base = scratch_base("abandoned");
+        let (live, live_lock) = claim_unique_root(&base, "suite", 10, 1);
+        let (dead, dead_lock) = claim_unique_root(&base, "suite", 11, 1);
+        std::fs::write(dead.join("left-behind.txt"), "x").unwrap();
+        drop(dead_lock); // the owner died without its exit hook
+        prune_abandoned_trees(&base);
+        assert!(is_real_directory(&live));
+        assert!(owner_lock_path(&live).exists());
+        assert!(!dead.exists(), "{dead:?} should have been pruned");
+        assert!(!owner_lock_path(&dead).exists());
+        drop(live_lock);
+        std::fs::remove_dir_all(base.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn trees_without_a_provable_owner_lock_are_left_alone() {
+        let base = scratch_base("unprovable");
+        // A tree from an older test binary (no lock), and a planted symlink
+        // lock pointing at an unlocked file elsewhere.
+        let legacy = base.join("suite-42");
+        std::fs::create_dir_all(legacy.join("home")).unwrap();
+        let elsewhere = base.parent().unwrap().join("elsewhere.lock");
+        std::fs::write(&elsewhere, "").unwrap();
+        let planted = base.join("suite-43");
+        std::fs::create_dir_all(&planted).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, base.join("suite-43.lock")).unwrap();
+        prune_abandoned_trees(&base);
+        assert!(is_real_directory(&legacy.join("home")));
+        assert!(is_real_directory(&planted));
+        assert!(elsewhere.exists());
+        std::fs::remove_dir_all(base.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn this_process_holds_the_lock_on_its_own_tree() {
+        let Some(root) = isolated() else { return };
+        let Some(Some(isolation)) = ISOLATION.get() else {
+            return;
+        };
+        if !isolation.owned {
+            return;
+        }
+        let lock = std::fs::File::open(owner_lock_path(root)).unwrap();
+        assert!(
+            !try_lock(&lock).expect("this filesystem supports flock"),
+            "the owner lock must be held for the process lifetime"
+        );
+    }
+
+    #[test]
+    fn resolving_the_database_before_isolating_is_refused_loudly() {
+        if isolated().is_none() {
+            return;
+        }
+        // A fresh thread, like a fresh test: it seeds the process database,
+        // then isolates; it would then read a database it never wrote.
+        let refused = std::thread::spawn(|| {
+            let _ = crate::default_database_path();
+            isolate_test_data()
+        })
+        .join();
+        assert!(
+            refused.is_err(),
+            "the resolve-then-isolate order must panic"
+        );
+        // The supported order works on another fresh thread.
+        let scoped = std::thread::spawn(|| {
+            let scope = isolate_test_data().unwrap();
+            crate::default_database_path()
+                .unwrap()
+                .starts_with(scope.data_dir())
+        })
+        .join()
+        .unwrap();
+        assert!(scoped);
+    }
+
+    #[test]
+    fn a_test_database_scope_is_private_to_its_test_and_shared_with_its_workers() {
+        let Some(root) = isolated() else { return };
+        // Resolved on a thread without a scope (this thread must isolate
+        // before it resolves anything: see the refusal test).
+        let process_database = std::thread::spawn(|| crate::default_database_path().unwrap())
+            .join()
+            .unwrap();
+        let process_data = crate::app_dirs::data_dir().unwrap();
+        let scope = isolate_test_data().unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&scope, &isolate_test_data().unwrap()),
+            "idempotent"
+        );
+        let scoped = crate::default_database_path().unwrap();
+        assert_eq!(scoped, scope.data_dir().join("library.sqlite3"));
+        assert!(scoped.starts_with(root) && scoped != process_database);
+        // Everything else stays in the process tree (see `TestDataScope`).
+        assert_eq!(crate::app_dirs::data_dir().unwrap(), process_data);
+        // Another test thread gets its own; a worker handed the scope shares it.
+        let other = std::thread::spawn(|| isolate_test_data().unwrap().data_dir().to_path_buf())
+            .join()
+            .unwrap();
+        assert_ne!(other, scope.data_dir());
+        assert!(!other.exists(), "a finished test's scope is removed");
+        let handed = current_test_data_scope();
+        let seen = std::thread::spawn(move || {
+            enter_test_data_scope(handed);
+            crate::default_database_path().unwrap()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(seen, scoped);
+        // A thread without a scope still resolves the process tree.
+        let plain = std::thread::spawn(|| crate::default_database_path().unwrap())
+            .join()
+            .unwrap();
+        assert_eq!(plain, process_database);
     }
 
     #[test]

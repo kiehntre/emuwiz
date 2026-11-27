@@ -88,7 +88,7 @@ impl State {
             key: self.key.clone(),
             receiver: rx,
         });
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = inspection::inspect(request).map(|readiness| Observed {
                 readiness,
                 checked_at: Instant::now(),
