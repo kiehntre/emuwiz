@@ -706,6 +706,11 @@ fn recheck(
     if path.as_deref() != Some(candidate.path.as_bytes()) {
         return Ok(Err("the game is no longer at the previewed path".into()));
     }
+    if !candidate.identity.disc_members_unchanged() {
+        return Ok(Err(
+            "a file of this disc changed since the preview, so it is not the disc the catalogue matched".into(),
+        ));
+    }
     if candidate.file.is_none() || FileBinding::read(Path::new(&candidate.path)) != candidate.file {
         return Ok(Err(
             "the game file changed since the preview, so it is not the file the catalogue matched"
@@ -753,8 +758,8 @@ fn content_still_matches(
     let (expected_sha256, expected_sha1) = (hashes.sha256.as_deref(), hashes.sha1.as_deref());
     // A disc checked as a whole: every recorded disc file must still be the
     // file that was hashed (the sheet alone is not the disc).
-    if !candidate.identity.disc_members_unchanged() {
-        return Err("a file of this disc changed since the preview, so it is not the disc the catalogue matched".into());
+    if let Some(why) = candidate.identity.disc_files_state().reason() {
+        return Err(format!("{why}; nothing was corrected for this game"));
     }
     if expected_sha256.is_none() && expected_sha1.is_none() {
         return Err("the check did not record a SHA-1 or SHA-256 of this file, so it cannot be compared again".into());

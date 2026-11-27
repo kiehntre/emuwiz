@@ -1264,3 +1264,46 @@ fn a_disc_whose_track_changed_is_refused() {
     );
     assert_eq!(lib.state(), before);
 }
+
+/// Review 3 N3: a receipt whose earlier system is not older than the
+/// applied one (only an edited receipt can say that) is not used.
+#[test]
+fn a_receipt_with_its_systems_out_of_order_is_not_used() {
+    let mut lib = Library::new();
+    let game = lib.game(1, "SNES", "folder_alias");
+    let preview = lib.preview(vec![exact(&game, "SHA-1")]);
+    let receipt_path = lib
+        .db
+        .apply_platform_corrections(&preview, &[1], WhenSomeChanged::RefuseAll)
+        .unwrap()
+        .receipt_path
+        .unwrap();
+    // A later, retired system row for the same game, so the record's
+    // "previous" row exists but is newer than the applied one.
+    lib.db
+        .connection
+        .execute(
+            "INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at) \
+             VALUES(1,'SNES','folder_alias',0,'2026-01-09')",
+            [],
+        )
+        .unwrap();
+    let later = lib.db.connection.last_insert_rowid();
+    let mut receipt = read_receipt(&receipt_path).unwrap();
+    assert!(later > receipt.records[0].applied_assignment_id);
+    receipt.records[0].previous.id = later;
+    receipt.seal = receipt.compute_seal();
+    fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    let state = lib.state();
+    let undone = lib
+        .db
+        .undo_platform_corrections(&receipt_path, None, WhenSomeChanged::RefuseAll)
+        .unwrap();
+    assert!(undone.undone.is_empty());
+    assert!(
+        undone.refused[0].reason.contains("out of order"),
+        "{:?}",
+        undone.refused
+    );
+    assert_eq!(lib.state(), state);
+}

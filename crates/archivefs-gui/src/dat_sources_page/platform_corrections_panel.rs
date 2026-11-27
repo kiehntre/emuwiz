@@ -349,6 +349,16 @@ impl PlatformCorrectionsState {
                         widgets::StatusTone::Info,
                         "Nothing left to undo: these corrections were already undone.".into(),
                     ));
+                } else if undone.undone.is_empty()
+                    && undone.refused.iter().all(|r| {
+                        r.reason == "already undone"
+                            || r.reason == "this correction was never applied"
+                    })
+                {
+                    self.status = Some((
+                        widgets::StatusTone::Info,
+                        "Nothing left to undo: this correction was already undone.".into(),
+                    ));
                 } else if undone.undone.is_empty() {
                     self.status = Some((
                         widgets::StatusTone::Warning,
@@ -527,7 +537,7 @@ pub(crate) fn show(ui: &mut egui::Ui, view: &PlatformCorrectionsView) -> Option<
                     }
                 }
                 ui.label(format!(
-                    "{} — {} ({}) → {} · {}{}",
+                    "{} — now {} ({}), corrected to {} · {}{}",
                     row.path,
                     row.current,
                     row.current_source,
@@ -747,6 +757,21 @@ mod review_tests {
         state.poll(None);
         let status = state.status.clone().unwrap().1;
         assert!(status.contains("Nothing left to undo"), "{status}");
+        // N4: one game's Undo of a correction already undone says so too.
+        let (sender, receiver) = channel();
+        state.worker = Some(receiver);
+        sender
+            .send(WorkerResult::Undone(Ok(PlatformCorrectionsUndone {
+                undone: Vec::new(),
+                refused: vec![archivefs_core::PlatformCorrectionRefusal {
+                    archive_id: 1,
+                    reason: "already undone".into(),
+                }],
+            })))
+            .unwrap();
+        state.poll(None);
+        let status = state.status.clone().unwrap().1;
+        assert!(status.contains("already undone"), "{status}");
         for result in [
             WorkerResult::Applied(Err("commit failed".into())),
             WorkerResult::Undone(Err("commit failed".into())),
