@@ -469,3 +469,236 @@ fn a_romm_hint_never_takes_a_name_or_blocks_a_verified_rename() {
     );
     assert_ne!(hint.destination_path, lib.root.join("Gamma (USA).gbc"));
 }
+
+/// Stage B B6 (owner 2026-11-26): "Verify the 122 eligible GBC renames on
+/// copied data, including Undo. Do not perform production renames."
+/// Runs only when pointed at a scratch copy (never the source collection):
+/// EMUWIZ_B6_ROOT (copied GBC folder), EMUWIZ_B6_DAT (copied No-Intro GBC DAT),
+/// EMUWIZ_B6_OUT (report folder). Real route: register, catalogue check and
+/// save, saved verified names, choose_name, the evidence-first plan, Apply of
+/// every Ready row, byte and evidence checks, then Undo of all of it.
+#[test]
+#[ignore = "B6 rehearsal on copied data; run explicitly with EMUWIZ_B6_* set"]
+fn b6_rehearsal_on_copied_gbc_files() {
+    use std::fmt::Write as _;
+    let root = PathBuf::from(std::env::var("EMUWIZ_B6_ROOT").expect("EMUWIZ_B6_ROOT"));
+    let dat = PathBuf::from(std::env::var("EMUWIZ_B6_DAT").expect("EMUWIZ_B6_DAT"));
+    let out = PathBuf::from(std::env::var("EMUWIZ_B6_OUT").expect("EMUWIZ_B6_OUT"));
+    for path in [&root, &dat, &out] {
+        let real = path.canonicalize().unwrap();
+        assert!(
+            real.starts_with("/tmp/claude-1000/") && !real.starts_with("/mnt"),
+            "B6 runs only on a scratch copy: {}",
+            real.display()
+        );
+    }
+    let hash_all = |root: &Path| -> std::collections::BTreeMap<String, String> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(|e| {
+                let path = e.unwrap().path();
+                (
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    sha256(&std::fs::read(&path).unwrap()),
+                )
+            })
+            .collect()
+    };
+    let before = hash_all(&root);
+    let body = std::fs::read(&dat).unwrap();
+    let db_dir = tempfile::tempdir_in(&out).unwrap();
+    let mut db = Database::open_or_create(db_dir.path().join("library.sqlite3")).unwrap();
+    db.register_source_folders(std::slice::from_ref(&root))
+        .unwrap();
+    let folder = db.list_source_folders().unwrap()[0].id;
+    let mut ids = HashMap::new();
+    for name in before.keys() {
+        let path = root.join(name);
+        let archive = archivefs_core::Archive::from_path_in_root(&path, &root).unwrap();
+        let id = db
+            .upsert_archive(folder, &root, &archive)
+            .unwrap()
+            .archive_id;
+        db.set_manual_platform(id, GBC).unwrap();
+        ids.insert(path, id);
+    }
+    let request = DatAuditRequest {
+        source_id: "165".into(),
+        source_display_name: "No-Intro: Nintendo - Game Boy Color".into(),
+        dat_path: dat.clone(),
+        dat_kind: DatSourceKind::File,
+        scan_root: root.clone(),
+        limits: Default::default(),
+        policy: None,
+        platform: Some(GBC.into()),
+    };
+    let outcome = run_dat_audit_with_cache(
+        &request,
+        &archivefs_core::safe_read::TrustedRoots::from_paths([root.clone()]),
+        &AtomicBool::new(false),
+        &|_| {},
+        AuditCacheConfig::Disabled,
+    )
+    .unwrap();
+    db.persist_library_dat_identities_and_platforms_from_audit(&outcome, 1)
+        .unwrap();
+    let catalogues = HashMap::from([(
+        "165".to_string(),
+        ConfiguredCatalogue {
+            reference: archivefs_core::dat::catalogue_selection::CatalogueRef::local("165"),
+            source_id: "165".into(),
+            display_name: "No-Intro: Nintendo - Game Boy Color".into(),
+            path: dat.clone(),
+            kind: DatSourceKind::File,
+            sha256: Some(sha256(&body)),
+            revision: None,
+        },
+    )]);
+    let lib = Library {
+        _dir: tempfile::tempdir().unwrap(),
+        root: root.clone(),
+        db,
+        ids,
+        catalogues,
+    };
+    let proposal = propose(&lib);
+    let plan = plan(&lib, &proposal);
+
+    let mut report = String::new();
+    let mut by_status = std::collections::BTreeMap::new();
+    for entry in &plan.entries {
+        *by_status
+            .entry(format!("{:?}", entry.status))
+            .or_insert(0_usize) += 1;
+    }
+    writeln!(report, "files: {}", before.len()).unwrap();
+    writeln!(report, "plan statuses: {by_status:?}").unwrap();
+    let mut reasons = std::collections::BTreeMap::new();
+    for entry in plan.entries.iter().filter(|e| {
+        e.status != OrganisationStatus::Suggested
+            && e.status != OrganisationStatus::AlreadyOrganised
+    }) {
+        *reasons
+            .entry(entry.reason.clone().unwrap_or_default())
+            .or_insert(0_usize) += 1;
+    }
+    writeln!(report, "not-ready reasons: {reasons:#?}").unwrap();
+    let ready: Vec<_> = plan.suggested().collect();
+    for entry in &ready {
+        // Every proposal is a verified catalogue name and a same-folder rename.
+        let choice = &proposal.choices[&entry.source_path];
+        assert!(
+            matches!(choice.source, NameSource::VerifiedDat { .. }),
+            "{choice:?}"
+        );
+        assert_eq!(entry.destination_path.parent(), entry.source_path.parent());
+        assert!(
+            !entry.destination_path.exists()
+                || entry.destination_path.to_string_lossy().to_lowercase()
+                    == entry.source_path.to_string_lossy().to_lowercase()
+        );
+        writeln!(
+            report,
+            "RENAME {} -> {}",
+            entry.source_path.file_name().unwrap().to_string_lossy(),
+            entry
+                .destination_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+        )
+        .unwrap();
+    }
+    writeln!(report, "ready: {}", ready.len()).unwrap();
+    std::fs::write(out.join("b6-preview.txt"), &report).unwrap();
+    assert!(!ready.is_empty(), "nothing ready: see b6-preview.txt");
+
+    let approved: BTreeSet<String> = ready
+        .iter()
+        .map(|e| e.source_path.to_string_lossy().into_owned())
+        .collect();
+    let moves: Vec<(PathBuf, PathBuf, i64)> = ready
+        .iter()
+        .map(|e| {
+            (
+                e.source_path.clone(),
+                e.destination_path.clone(),
+                lib.ids[&e.source_path],
+            )
+        })
+        .collect();
+    let journal = out.join("journal");
+    let mut transaction = build_organisation_transaction(&plan, &approved, 1).unwrap();
+    bind_organisation_transaction(&mut transaction, &lib.db).unwrap();
+    apply_organisation_transaction(
+        &mut transaction,
+        &approved,
+        1,
+        archivefs_core::safe_read::TrustedRoots::from_paths([root.clone()]),
+        &journal,
+        &AtomicBool::new(false),
+        OrganisationMode::RenameInPlace,
+        &root,
+        &lib.db,
+    )
+    .unwrap();
+    let after = hash_all(&root);
+    assert_eq!(after.len(), before.len(), "no file appears or disappears");
+    for (source, destination, id) in &moves {
+        let old = source.file_name().unwrap().to_string_lossy().into_owned();
+        let new = destination
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            after.get(&new),
+            before.get(&old),
+            "{old} -> {new}: same bytes"
+        );
+        assert_eq!(
+            lib.db
+                .find_archive_id_by_absolute_path(destination)
+                .unwrap(),
+            Some(*id),
+            "{new}: the library record follows the file"
+        );
+        assert!(
+            matches!(
+                lib.db
+                    .verified_dat_name_for_archive(*id, &lib.catalogues)
+                    .unwrap(),
+                archivefs_core::VerifiedDatName::Usable { .. }
+            ),
+            "{new}: verified evidence kept"
+        );
+    }
+    let renamed: BTreeSet<String> = moves
+        .iter()
+        .map(|(s, _, _)| s.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    for (name, hash) in &before {
+        if !renamed.contains(name) {
+            assert_eq!(after.get(name), Some(hash), "{name}: untouched");
+        }
+    }
+    let applied = format!(
+        "applied: {} renames; bytes identical; records and evidence follow\n",
+        moves.len()
+    );
+
+    rollback_organisation_transaction(&mut transaction, &journal, &AtomicBool::new(false), &root)
+        .unwrap();
+    assert_eq!(hash_all(&root), before, "Undo restores every name and byte");
+    for (source, _, id) in &moves {
+        assert_eq!(
+            lib.db.find_archive_id_by_absolute_path(source).unwrap(),
+            Some(*id)
+        );
+    }
+    std::fs::write(
+        out.join("b6-result.txt"),
+        format!("{applied}undo: every name and byte restored ({} files); records back on the original paths\n", before.len()),
+    )
+    .unwrap();
+}
