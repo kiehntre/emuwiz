@@ -3681,6 +3681,7 @@ fn a_cancelled_audit_never_appears_complete() {
             generation: 0,
             outcome: Box::new(minimal_outcome()),
             enrichment: None,
+            corrections: None,
             plan: None,
         })
         .unwrap();

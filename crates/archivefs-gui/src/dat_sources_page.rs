@@ -131,6 +131,7 @@ use crate::{
 
 mod custom;
 mod native_verification;
+mod platform_corrections_panel;
 mod save_result;
 #[cfg(test)]
 pub(crate) use save_result::{DatSaveOutcome as FixtureDatSaveOutcome, persist_audit};
@@ -833,6 +834,7 @@ pub(crate) struct RecognitionView {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DatSourcesPageView {
+    pub(crate) platform_corrections: Option<platform_corrections_panel::PlatformCorrectionsView>,
     pub(crate) rows: Vec<DatSourceRowView>,
     pub(crate) update_health: Vec<update_health::HealthRow>,
     /// Separately configured, app-managed DATs. These are never inferred from
@@ -2109,6 +2111,7 @@ pub(crate) fn rename_plan_page_bounds(total: usize, page: usize) -> (usize, usiz
 /// the global preferences by accident.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DatSourcesPageAction {
+    PlatformCorrections(platform_corrections_panel::CorrectionsAction),
     ViewPlatformGames {
         platform: String,
     },
@@ -2473,6 +2476,8 @@ enum JobMessage {
         generation: u64,
         outcome: Box<DatAuditOutcome>,
         enrichment: Option<Box<archivefs_core::PlatformIdentityEnrichmentSummary>>,
+        /// The read-only Platform Corrections preview, when the audit found any.
+        corrections: Option<Box<archivefs_core::PlatformCorrectionPreview>>,
         /// The read-only rename plan derived from the audit, when one could be
         /// built (and was not cancelled).
         plan: Option<Box<RenamePlan>>,
@@ -3294,6 +3299,8 @@ pub(crate) struct DatSourcesPageState {
     /// one-shot flag above.
     identity_enrichment_generation: u64,
     identity_enrichment: Option<Box<archivefs_core::PlatformIdentityEnrichmentSummary>>,
+    /// Platform Corrections preview, selection, Apply and Undo.
+    platform_corrections: platform_corrections_panel::PlatformCorrectionsState,
     /// Session-only review decisions, keyed by source path. Recording one
     /// never touches a file; nothing here persists them (deferral documented).
     review_decisions: BTreeMap<String, ReviewDecision>,
@@ -3604,6 +3611,7 @@ impl DatSourcesPageState {
             identity_enrichment_completed: false,
             identity_enrichment_generation: 0,
             identity_enrichment: None,
+            platform_corrections: Default::default(),
             review_decisions: BTreeMap::new(),
             transaction_dir,
             journal_dir_unavailable: journal_dir_unavailable.clone(),
@@ -4010,6 +4018,15 @@ impl DatSourcesPageState {
 
     pub(crate) fn poll(&mut self) -> bool {
         let mut changed = self.poll_apply();
+        let (corrections_changed, library_changed) = self
+            .platform_corrections
+            .poll(self.database_path.as_deref());
+        changed |= corrections_changed;
+        if library_changed {
+            // Library views reload: systems and results changed.
+            self.identity_enrichment_generation += 1;
+            self.identity_enrichment_completed = true;
+        }
         changed |= self.poll_managed_dat_job();
         changed |= self.poll_health_checks();
         changed |= self.poll_mame_replacement_job();
@@ -4165,6 +4182,7 @@ impl DatSourcesPageState {
                     generation,
                     outcome,
                     enrichment,
+                    corrections,
                     plan,
                 }) => {
                     if job.cancel_requested {
@@ -4189,6 +4207,8 @@ impl DatSourcesPageState {
                             self.identity_enrichment_generation += 1;
                         }
                         self.identity_enrichment = enrichment;
+                        self.platform_corrections
+                            .set_preview(corrections, self.database_path.as_deref());
                         self.audit_error = None;
                         match plan {
                             Some(plan) => {
@@ -4293,6 +4313,10 @@ impl DatSourcesPageState {
             self.platform_assignment = None;
         }
         match action {
+            DatSourcesPageAction::PlatformCorrections(action) => {
+                self.platform_corrections
+                    .handle(action, self.database_path.as_deref());
+            }
             DatSourcesPageAction::ImportVerificationData { path } => {
                 if !self.is_busy() {
                     let id = self.draft.suggest_id(&path);
@@ -6844,6 +6868,14 @@ impl DatSourcesPageState {
                         generation,
                         &worker_cancel,
                     );
+                    // Read-only: corrections change nothing until the person
+                    // applies them from the preview.
+                    let corrections = database_path
+                        .as_deref()
+                        .and_then(|path| archivefs_core::Database::open_or_create(path).ok())
+                        .and_then(|db| db.preview_platform_corrections(&outcome, generation).ok())
+                        .filter(|preview| !preview.candidates.is_empty())
+                        .map(Box::new);
                     if sender
                         .send(JobMessage::SaveResult {
                             generation: Some(generation),
@@ -6871,6 +6903,7 @@ impl DatSourcesPageState {
                         generation,
                         outcome: Box::new(outcome),
                         enrichment,
+                        corrections,
                         plan,
                     })
                 }
@@ -6973,6 +7006,7 @@ impl DatSourcesPageState {
                         generation,
                         outcome: Box::new(outcome),
                         enrichment: None,
+                        corrections: None,
                         plan,
                     })
                 }
@@ -7186,6 +7220,7 @@ impl DatSourcesPageState {
                 .map(|outcome| Box::new(audit_view(outcome, self.audit_elapsed_seconds))),
             audit_error: self.audit_error.clone(),
             identity_enrichment: self.identity_enrichment.clone(),
+            platform_corrections: self.platform_corrections.view(),
             policy: self.policy_view(),
             rename_plan: self.rename_plan_view(),
             rename_apply: self.rename_apply_view(),
@@ -9280,6 +9315,14 @@ pub(crate) fn show_dat_sources_page(
             error,
             widgets::StatusTone::Blocked,
         );
+    }
+    if action.is_none()
+        && let Some(corrections) = &view.platform_corrections
+        && let Some(corrections_action) = platform_corrections_panel::show(ui, corrections)
+    {
+        action = Some(DatSourcesPageAction::PlatformCorrections(
+            corrections_action,
+        ));
     }
     if let Some(enrichment) = &view.identity_enrichment {
         ui.add_space(8.0);
