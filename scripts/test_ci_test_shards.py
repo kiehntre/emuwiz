@@ -21,7 +21,7 @@ import ci_test_shards  # noqa: E402
 FIXTURE = """
 mod dat { #[test] fn a() {} mod rename_apply { mod interrupted_apply_tests { #[test] fn slow() {} } } }
 mod memory_card_inventory { #[test] fn c() {} #[test] #[ignore] fn ignored() {} }
-mod gui_v2 { #[test] fn d() {} mod dat { #[test] fn overlap() {} } }
+mod gui_v2 { #[test] fn d() {} mod dat { #[test] fn overlap() {} } mod tests { #[test] fn shell() {} } }
 mod mame_dat { #[test] fn e() {} }
 mod update { #[test] fn f() {} }
 #[test] fn top() {}
@@ -79,7 +79,7 @@ class PartitionTests(unittest.TestCase):
                 self.enumerate(tier)
                 result = self.check()
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("exact partition: 18 tests, each in exactly one shard", result.stdout)
+                self.assertIn("exact partition: 20 tests, each in exactly one shard", result.stdout)
 
     def test_first_matching_shard_owns_overlapping_names(self) -> None:
         self.enumerate("full")
@@ -95,12 +95,15 @@ class PartitionTests(unittest.TestCase):
         self.assertEqual(owners["update::f"], {"rest"})
         self.assertEqual(owners["top"], {"rest"})
 
-    def test_gui_tier_shards_split_only_on_gui_v2(self) -> None:
+    def test_gui_tier_shards_split_within_gui_v2(self) -> None:
         self.enumerate("gui")
         tests = {shard: {name.split(" :: ", 1)[1] for name in ci_test_shards.parse_listing(
                      (self.lists / f"{shard}.selected").read_text())}
                  for shard in ci_test_shards.shards("gui")}
-        self.assertEqual(tests["gui-tier-v2"], {"gui_v2::d", "gui_v2::dat::overlap"})
+        self.assertEqual(tests["gui-tier-v2"], {"gui_v2::tests::shell"})
+        # The rest of gui_v2 runs in the other shard, with everything else.
+        self.assertIn("gui_v2::d", tests["gui-tier-other"])
+        self.assertIn("gui_v2::dat::overlap", tests["gui-tier-other"])
         # Tests the full tier gives to recovery or dat must not vanish here.
         self.assertIn("dat::a", tests["gui-tier-other"])
         self.assertIn("memory_card_inventory::ignored", tests["gui-tier-other"])
@@ -209,8 +212,9 @@ class SelectionTests(unittest.TestCase):
 
     def test_tiers(self) -> None:
         self.assertEqual(ci_test_shards.shards("gui"), ["gui-tier-v2", "gui-tier-other"])
-        self.assertEqual(ci_test_shards.selection("gui-tier-v2"), ["gui_v2::"])
-        self.assertEqual(ci_test_shards.selection("gui-tier-other"), ["--skip", "gui_v2::"])
+        groups = ["gui_v2::tests::", "gui_v2::retroarch_journey_tests::", "gui_v2::vice_evidence::"]
+        self.assertEqual(ci_test_shards.selection("gui-tier-v2"), groups)
+        self.assertEqual(ci_test_shards.selection("gui-tier-other"), [a for g in groups for a in ("--skip", g)])
         for tier in ("core", "full"):
             self.assertEqual(ci_test_shards.shards(tier), [name for name, _ in ci_test_shards.SHARDS])
         self.assertEqual(ci_test_shards.PACKAGES["full"], ["--workspace"])

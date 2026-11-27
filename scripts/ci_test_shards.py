@@ -26,22 +26,35 @@ import pathlib
 import re
 import sys
 
-# Groups balance wall time only (from CI logs of 2026-10-24): moving a module
-# can shift the balance but never drops or duplicates a test.
+# Groups balance wall time only: moving a module can shift the balance but
+# never drops or duplicates a test (the coverage job proves the partition).
+# FORGE measured-cost balance (2026-11-27): every test timed with libtest
+# --report-time, scaled per group to hosted runners (median tests-step times of
+# 29 CI runs, 2026-11-24..26), and the libtest schedule (name order, 4 threads)
+# simulated. Predicted hosted test time per shard, median runner:
+# recovery 442 s, gui-v2 441 s, rest 439 s, dat 330 s (was rest 548 s,
+# gui-v2 541 s, dat 330 s, recovery 268 s). A shard's name says what it was
+# built around; moved groups are listed after its own.
 SHARDS: list[tuple[str, list[str]]] = [
-    # One ~530 s and one ~410 s crash-injection test; run beside the others.
-    ("recovery", ["interrupted_apply_tests::", "memory_card_inventory::"]),
+    # The longest single test (~265 s hosted) is an interrupted-apply
+    # crash-injection test; it sets this shard's floor, so the shard also
+    # takes the core database group and one GUI group beside it.
+    ("recovery", ["interrupted_apply_tests::", "memory_card_inventory::",
+                  "database::", "gui_v2::tests::simple_shell_ui::"]),
     ("dat", ["dat::"]),
     ("gui-v2", ["gui_v2::"]),
     ("rest", []),
 ]
 
 # The gui tier tests one crate, so it needs less compilation and has no
-# recovery or dat group to balance: its own partition splits that crate's two
-# large halves. These names are distinct from SHARDS so a shard name alone still
-# determines its selection, and a tier cannot run the other's skip list.
+# recovery or dat group to balance: its own partition splits that crate's
+# measured cost in two (FORGE 2026-11-27: predicted 325 / 351 s, was 541 / 131 s).
+# gui-tier-v2 takes three large gui_v2 groups; gui-tier-other takes the rest
+# of gui_v2 and everything outside it. These names are distinct from SHARDS so
+# a shard name alone still determines its selection, and a tier cannot run the
+# other's skip list.
 GUI_TIER_SHARDS: list[tuple[str, list[str]]] = [
-    ("gui-tier-v2", ["gui_v2::"]),
+    ("gui-tier-v2", ["gui_v2::tests::", "gui_v2::retroarch_journey_tests::", "gui_v2::vice_evidence::"]),
     ("gui-tier-other", []),
 ]
 
