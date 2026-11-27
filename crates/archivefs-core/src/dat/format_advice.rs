@@ -109,7 +109,7 @@ pub fn advice_for(platform: &str, extension: &str) -> String {
         "n64" => "Catalogues list the standard (.z64) byte order. EmuWiz cannot yet check byte-swapped .n64 files.".to_owned(),
         "" => "Files without an extension cannot be matched to a catalogue format.".to_owned(),
         _ => format!(
-            "No catalogue in use lists .{extension} files for {platform}. Add a trusted catalogue for this format in DAT Management."
+            "The catalogue checked does not list .{extension} files for {platform}. Add a trusted catalogue for this format in DAT Management."
         ),
     }
 }

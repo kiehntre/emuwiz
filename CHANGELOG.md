@@ -24,9 +24,10 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   - Archive member names with apostrophes and other ordinary characters now verify.
   - A catalogue that fits none of a set's files no longer stops a whole `dat recheck` set run. Real
     read, database and integrity failures still stop it.
-  - Eligibility and missing-catalogue advice name the formats a game's system needs and say when no
-    installed catalogue lists them.
-  - Single-game Rename is prefilled from the verified catalogue name.
+  - Eligibility and missing-catalogue advice name the formats a game's system needs and say when the
+    catalogue checked does not list the game's format.
+  - Single-game Rename of a loose file is prefilled from its verified catalogue name, when that name
+    has the same file extension; archives keep their name.
   - A game on a system guessed by the scanner that matches another system's catalogue exactly is
     listed as a proposed correction, with its evidence. Nothing is changed until Platform
     Corrections has a preview and Undo.
