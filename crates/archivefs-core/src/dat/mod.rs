@@ -73,6 +73,7 @@ pub mod model;
 pub mod neogeo_set;
 pub mod parser;
 pub mod parsers;
+pub mod platform_discovery;
 pub mod policy;
 pub mod reaudit;
 #[cfg(test)]

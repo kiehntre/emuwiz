@@ -1086,10 +1086,10 @@ fn discovery_undo_still_open(conn: &Connection, archive_id: i64) -> Result<bool>
     .map_err(|error| db_error("failed to read Discovery Import history", error))
 }
 
-fn fingerprint_platform(
-    conn: &Connection,
-    archive_id: i64,
-) -> Result<Option<(i64, Vec<u8>, Option<String>)>> {
+/// A scanner cache row: source folder, relative path, cached system.
+type FingerprintRow = (i64, Vec<u8>, Option<String>);
+
+fn fingerprint_platform(conn: &Connection, archive_id: i64) -> Result<Option<FingerprintRow>> {
     conn.query_row(
         "SELECT f.source_folder_id, f.relative_path, f.platform FROM scan_fingerprints f \
          JOIN archives a ON a.source_folder_id = f.source_folder_id AND a.relative_path = f.relative_path \
@@ -1141,11 +1141,7 @@ impl ResultRow {
         let mut stmt = conn
             .prepare(&format!("SELECT * FROM {table} WHERE {filter}"))
             .map_err(|error| db_error("failed to read a verification result", error))?;
-        let columns: Vec<String> = stmt
-            .column_names()
-            .into_iter()
-            .map(|c| c.to_string())
-            .collect();
+        let columns: Vec<String> = stmt.column_names().map(|c| c.to_string()).collect();
         let width = columns.len();
         stmt.query_row(args, |row| {
             let mut values = Vec::with_capacity(width);
@@ -1408,7 +1404,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn unhex(text: &str) -> Result<Vec<u8>> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return Err(malformed());
     }
     (0..text.len())

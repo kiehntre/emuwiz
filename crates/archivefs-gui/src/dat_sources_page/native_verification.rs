@@ -77,6 +77,11 @@ pub(super) struct Controller {
     /// the user may explicitly turn into a saved assignment.
     executing: Option<(String, String)>,
     assignable: Option<(String, String)>,
+    /// After a check: look for its unmatched games in other systems'
+    /// catalogues (on request only).
+    pub(super) other_systems: other_systems::OtherSystems,
+    /// The database the last poll was given, for the corrections worker.
+    database: Option<PathBuf>,
 }
 impl Controller {
     pub fn busy(&self) -> bool {
@@ -98,7 +103,9 @@ impl Controller {
         self.completions += 1;
     }
     pub fn select(&mut self, selection: Selection) {
-        if self.selection.as_ref() != Some(&selection) && !self.busy() {
+        if self.selection.as_ref() != Some(&selection) && !self.busy() && !self.other_systems.busy()
+        {
+            self.other_systems.reset();
             self.selection = Some(selection);
             self.preview = None;
             self.totals = None;
@@ -136,6 +143,13 @@ impl Controller {
                                 self.saved = true;
                                 self.completions += 1;
                                 self.assignable = self.executing.take();
+                                if let Some(selection) = &self.selection {
+                                    self.other_systems.offer(
+                                        &totals,
+                                        &selection.platform,
+                                        self.completions,
+                                    );
+                                }
                                 self.totals = Some(*totals);
                             }
                             Err(e) => {
@@ -152,6 +166,10 @@ impl Controller {
             self.receiver = None;
             self.cancel = None;
         }
+        if self.other_systems.poll(self.database.as_deref()) {
+            // A correction or its Undo: hosts reload the library.
+            self.completions += 1;
+        }
     }
     fn start_preview(&mut self, inventory: CatalogueInventorySnapshot, database: PathBuf) {
         let Some(selection) = self.selection.clone() else {
@@ -160,6 +178,7 @@ impl Controller {
         self.preview = None;
         self.error = None;
         self.totals = None;
+        self.other_systems.reset();
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
         self.progress = "Preparing exact library population and catalogue evidence…".into();
@@ -222,6 +241,7 @@ impl Controller {
         trusted: archivefs_core::safe_read::TrustedRoots,
         enabled: bool,
     ) {
+        self.database = database.clone();
         self.poll();
         if self.busy() {
             ui.label(&self.progress);
@@ -283,6 +303,15 @@ impl Controller {
                 None => {}
             }
             ui.label("Use View games, then Reload game list to refresh Browse & Play and Game Details. Game files and platform assignments were unchanged.");
+        }
+        if self.totals.is_some() {
+            self.other_systems.show(
+                ui,
+                inventory.as_ref(),
+                database.as_deref(),
+                &trusted,
+                enabled,
+            );
         }
         let mut confirm = false;
         if let Some(p) = &self.preview {
@@ -373,6 +402,8 @@ impl Drop for Controller {
         }
     }
 }
+
+mod other_systems;
 
 #[cfg(test)]
 mod tests;
