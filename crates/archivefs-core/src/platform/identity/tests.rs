@@ -88,7 +88,16 @@ fn dat_outcome(platform: Option<&str>, verdict: AuditVerdict) -> DatAuditOutcome
         source_display_name: "No-Intro PSP".to_string(),
         dat_path: "/catalogues/psp.dat".to_string(),
         scan_root: "/library".to_string(),
-        catalogue_names: vec!["Sony PSP".to_string()],
+        // The real header of the assigned system's catalogue, so evidence
+        // takes the normal path where header and assignment agree.
+        catalogue_names: vec![
+            match platform {
+                Some("PSX") => "Sony - PlayStation",
+                Some("PSP") => "Sony - PlayStation Portable",
+                _ => "Fixture catalogue",
+            }
+            .to_string(),
+        ],
         catalogue_entries: 1,
         catalogue_roms: 1,
         catalogue_version: None,
@@ -96,7 +105,7 @@ fn dat_outcome(platform: Option<&str>, verdict: AuditVerdict) -> DatAuditOutcome
         catalogue_inventory: None,
         catalogue_author: None,
         catalogue_homepage: None,
-        catalogue_ecosystem: None,
+        catalogue_ecosystem: Some(crate::dat::model::DatEcosystem::Redump),
         catalogue_variant: None,
         unreadable_catalogues: Vec::new(),
         report: AuditReport {
@@ -527,4 +536,40 @@ fn a_cue_sheet_match_is_platform_evidence_only_when_its_whole_disc_is_verified()
     outcome.loose_discs = vec![disc];
     let evidence = PlatformIdentityEvidence::from_verified_dat(&outcome, cue, GENERATION).unwrap();
     assert_eq!(evidence.source, PlatformIdentitySource::VerifiedDat);
+}
+
+/// Owner policy 2026-11-26: a system is established only by one exact
+/// SHA-256/SHA-1 match from a catalogue whose header does not contradict
+/// the system it was assigned.
+#[test]
+fn only_a_single_strong_match_from_an_agreeing_catalogue_is_system_evidence() {
+    let path = Path::new("/library/Game.cso");
+    let exact = |algorithm| AuditVerdict::Exact {
+        game_name: "Game".to_string(),
+        rom_name: "Game.cso".to_string(),
+        algorithm,
+    };
+    let evidence = |outcome: &DatAuditOutcome| {
+        PlatformIdentityEvidence::from_verified_dat(outcome, path, GENERATION)
+    };
+    assert!(evidence(&dat_outcome(Some("PSP"), exact("SHA-1"))).is_some());
+    assert!(evidence(&dat_outcome(Some("PSP"), exact("SHA-256/SHA-1"))).is_some());
+    assert!(evidence(&dat_outcome(Some("PSP"), exact("MD5"))).is_none());
+    assert!(evidence(&dat_outcome(Some("PSP"), exact("SHA-1/MD5"))).is_none());
+    let several = AuditVerdict::ExactMultipleCandidates {
+        algorithm: "SHA-1",
+        count: 2,
+        game_names: vec!["Game".into(), "Game (Rev 1)".into()],
+    };
+    assert!(evidence(&dat_outcome(Some("PSP"), several)).is_none());
+    // A header naming another system contradicts the assignment.
+    let mut contradicted = dat_outcome(Some("PSP"), exact("SHA-1"));
+    contradicted.catalogue_names = vec!["Nintendo - Game Boy Advance".to_string()];
+    assert!(evidence(&contradicted).is_none());
+    // A header naming no system: the assignment alone decides.
+    let mut unnamed = dat_outcome(Some("PSP"), exact("SHA-1"));
+    unnamed.catalogue_names = vec!["Fixture catalogue".to_string()];
+    assert!(evidence(&unnamed).is_some());
+    // No assigned system: nothing to establish.
+    assert!(evidence(&dat_outcome(None, exact("SHA-1"))).is_none());
 }

@@ -194,10 +194,14 @@ pub(crate) fn persist_audit(
     result
         .technical_details
         .push(format!("{persisted} set verdict(s) saved."));
-    let identities = match database.persist_library_dat_identities_from_audit(outcome) {
-        Ok(identities) => identities,
+    // Identities and the systems their exact matches establish are saved as
+    // one change: a failure keeps neither.
+    let (identities, enrichment) = match database
+        .persist_library_dat_identities_and_platforms_from_audit(outcome, generation)
+    {
+        Ok(both) => both,
         Err(error) => {
-            result.failed("saving library DAT identities", error);
+            result.failed("saving library DAT identities and platforms", error);
             return (result, None);
         }
     };
@@ -210,6 +214,63 @@ pub(crate) fn persist_audit(
             "{} \"no match\" result(s) not saved: this catalogue is not known to be for those files' platform (the file has no platform, another platform, or the catalogue header names none), so not being listed in it says nothing about them.",
             identities.negative_platform_unproven_skipped
         ));
+    }
+    if identities.platform_refused > 0 {
+        let reasons: Vec<String> = identities
+            .platform_refusals
+            .reasons()
+            .into_iter()
+            .map(|(count, reason)| format!("{count}: {reason}"))
+            .collect();
+        result.warn(format!(
+            "{} result(s) not saved for the game's system ({}).",
+            identities.platform_refused,
+            reasons.join("; ")
+        ));
+    }
+    if enrichment.corrected > 0 {
+        result.technical_details.push(format!(
+            "{} game(s) moved from the system guessed by the scanner (from their folder, file type, archive layout or RomM) to the one an exact SHA-256/SHA-1 catalogue match gives them; the guess is kept in each game's history. No file was moved or renamed.",
+            enrichment.corrected
+        ));
+    }
+    if !enrichment.proposed_corrections.is_empty() {
+        result.warn(format!(
+            "{} game(s) match this catalogue exactly but are on another system, guessed by the scanner (from their folder, file type, archive layout or RomM). Their system was not changed and their result was not saved. Correcting them needs a preview you can undo, which is not available yet.",
+            enrichment.proposed_corrections.len()
+        ));
+        result
+            .technical_details
+            .extend(enrichment.proposed_corrections.iter().map(|proposal| {
+                format!(
+                    "Game {}: on {} ({}); {} matched it exactly with {} and says {}.",
+                    proposal.archive_id,
+                    proposal.current_platform,
+                    proposal.current_source,
+                    proposal.catalogue,
+                    proposal.algorithm,
+                    proposal.proposed_platform
+                )
+            }));
+    }
+    if !enrichment.correction_reviews.is_empty() {
+        result.warn(format!(
+            "{} game(s) match this catalogue exactly but their system was set by you, by an earlier verification, by the game's header or by an unknown source, so it was not changed. Review them before changing their system.",
+            enrichment.correction_reviews.len()
+        ));
+        result
+            .technical_details
+            .extend(enrichment.correction_reviews.iter().map(|review| {
+                format!(
+                    "Game {}: on {} ({}); {} matched it exactly with {} and says {}.",
+                    review.archive_id,
+                    review.current_platform,
+                    review.current_source,
+                    review.catalogue,
+                    review.algorithm,
+                    review.proposed_platform
+                )
+            }));
     }
     if identities.refused.is_some() || identities.ambiguous > 0 {
         result.outcome = DatSaveOutcome::PartialFailure;
@@ -239,25 +300,16 @@ pub(crate) fn persist_audit(
             identities.unassociated, identities.skipped_protected_prior_result, identities.negative_incomplete_skipped
         ));
     }
-    let enrichment = match database.enrich_platforms_from_dat_audit(outcome, generation) {
-        Ok(enrichment) => {
-            if enrichment.conflicts > 0 {
-                result.warn(format!(
-                    "{} platform conflict(s) require review.",
-                    enrichment.conflicts
-                ));
-            }
-            result.technical_details.push(format!(
-                "Platform enrichment: {} applied, {} already current, {} manual assignment(s) preserved.",
-                enrichment.applied, enrichment.unchanged, enrichment.manual_preserved
-            ));
-            enrichment
-        }
-        Err(error) => {
-            result.failed("saving platform enrichment", error);
-            return (result, None);
-        }
-    };
+    if enrichment.conflicts > 0 {
+        result.warn(format!(
+            "{} platform conflict(s) require review.",
+            enrichment.conflicts
+        ));
+    }
+    result.technical_details.push(format!(
+        "Platform enrichment: {} applied, {} already current, {} manual assignment(s) preserved.",
+        enrichment.applied, enrichment.unchanged, enrichment.manual_preserved
+    ));
     // Last, so it sees this audit's identities and platforms. It only adds
     // disc order; a failure here never undoes the steps above.
     match database.refresh_dat_disc_order(generation) {

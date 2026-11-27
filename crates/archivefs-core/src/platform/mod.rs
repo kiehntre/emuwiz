@@ -534,7 +534,13 @@ pub const PLATFORMS: &[Platform] = &[
     Platform {
         id: "AmigaCD32",
         display_name: "Amiga CD32",
-        folder_aliases: &["amigacd32", "cd32", "commodorecd32", "amigacd32cd"],
+        folder_aliases: &[
+            "amigacd32",
+            "cd32",
+            "commodorecd32",
+            "amigacd32cd",
+            "commodoreamigacd32",
+        ],
         filename_aliases: &[],
         strong_extensions: &[],
         weak_extensions: &["iso", "cue", "bin", "chd", "ccd", "mdf"],
@@ -915,7 +921,7 @@ pub const PLATFORMS: &[Platform] = &[
     Platform {
         id: "Commodore CDTV",
         display_name: "Commodore CDTV",
-        folder_aliases: &["cdtv", "commodorecdtv", "amigacdtv"],
+        folder_aliases: &["cdtv", "commodorecdtv", "amigacdtv", "commodoreamigacdtv"],
         filename_aliases: &[],
         strong_extensions: &[],
         weak_extensions: &["iso", "cue", "bin", "chd"],

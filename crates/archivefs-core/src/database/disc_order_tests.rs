@@ -54,10 +54,17 @@ fn library_in(folder: &str, catalogue: &[(&str, &str)], library: &[(&str, &str)]
             )
         })
         .collect();
+    // The catalogue is for the library folder's system: a result is saved
+    // only where the catalogue speaks for the game's system.
+    let header = match folder {
+        "amiga" => "Commodore Amiga - Games - [ADF]",
+        "zxspectrum" => "Sinclair ZX Spectrum - Games - [TZX]",
+        _ => "Sony - PlayStation",
+    };
     fs::write(
         root.join("redump.dat"),
         format!(
-            r#"<?xml version="1.0"?><datafile><header><name>Sony - PlayStation</name><version>2026-10-01</version><author>redump.org</author></header>{body}</datafile>"#
+            r#"<?xml version="1.0"?><datafile><header><name>{header}</name><version>2026-10-01</version><author>redump.org</author></header>{body}</datafile>"#
         ),
     )
     .unwrap();
@@ -626,7 +633,7 @@ fn a_second_source_naming_another_entry_contests_the_disc() {
     fs::write(
         lib.root.join("other.dat"),
         format!(
-            r#"<?xml version="1.0"?><datafile><header><name>Other</name><version>7</version></header><game name="Orbit Quest (Europe) (Disc 1)"><rom name="x.bin" size="{}" sha1="{}"/></game></datafile>"#,
+            r#"<?xml version="1.0"?><datafile><header><name>Sony - PlayStation</name><version>7</version></header><game name="Orbit Quest (Europe) (Disc 1)"><rom name="x.bin" size="{}" sha1="{}"/></game></datafile>"#,
             bytes.len(),
             sha1_hex(bytes.as_bytes())
         ),

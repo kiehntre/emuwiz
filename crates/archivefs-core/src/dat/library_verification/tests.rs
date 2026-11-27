@@ -1696,3 +1696,80 @@ mod reaudit;
 
 // S1: the verified catalogue name Organise may propose.
 mod dat_names;
+
+/// Apostrophes, quotes, spaces, punctuation and non-ASCII letters are ordinary
+/// archive member name characters: the member is checked and the archive
+/// verified (owner report 2026-11-26: 653 library ZIPs, e.g. NES "'89 ...").
+#[test]
+fn archive_members_with_legitimate_punctuation_and_unicode_names_verify() {
+    for member in [
+        "inner.tap",
+        "it's.tap",
+        "'89 Game (Japan).tap",
+        "\"Quoted\".tap",
+        "a b c.tap",
+        "Ünïcødé ゲーム.tap",
+        "x,y;z&(1)[a]!.tap",
+    ] {
+        let f = Fixture::new();
+        f.zip("z.zip", member, b"matching synthetic tape");
+        f.add(4, "z.zip", None, Some("ZX Spectrum"));
+        let t = f.run();
+        assert_eq!(
+            (t.verified, t.no_match, t.not_checked),
+            (1, 0, 0),
+            "{member:?}: {:?}",
+            t.unchecked
+        );
+    }
+}
+
+/// A member name that is not safe stays unverified: the fix accepts ordinary
+/// characters only, never a path that leaves the archive or a control byte.
+#[test]
+fn archive_members_with_unsafe_names_still_do_not_verify() {
+    for member in ["../up.tap", "dir\\back.tap", "ctl\u{1b}.tap"] {
+        let f = Fixture::new();
+        f.zip("z.zip", member, b"matching synthetic tape");
+        f.add(4, "z.zip", None, Some("ZX Spectrum"));
+        let t = f.run();
+        assert_eq!(t.verified, 0, "{member:?}");
+    }
+}
+
+/// Review 5 W1: "Nothing is wrong with the files; another catalogue is
+/// needed" is said only when the catalogue simply lists none of the files'
+/// formats, never when a file is missing (an unmounted drive, for example).
+#[test]
+fn nothing_wrong_advice_only_when_the_catalogue_lists_none_of_the_formats() {
+    use crate::dat::format_advice::nothing_eligible_explanation;
+    let missing = Fixture::new();
+    missing.add(1, "missing.tap", None, Some("ZX Spectrum"));
+    let p = missing.preview();
+    assert_eq!((p.selected_games, p.eligible_games), (1, 0));
+    assert_eq!(nothing_eligible_explanation(&p), None, "missing file");
+    let mixed = Fixture::new();
+    mixed.add(
+        1,
+        "d.tzx",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    mixed.add(2, "missing.tap", None, Some("ZX Spectrum"));
+    assert_eq!(
+        nothing_eligible_explanation(&mixed.preview()),
+        None,
+        "format gap and a missing file"
+    );
+    let format = Fixture::new();
+    format.add(
+        1,
+        "d.tzx",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    let p = format.preview();
+    assert!(p.lists_none_of_these_formats());
+    let why = nothing_eligible_explanation(&p).expect("format gap explained");
+    assert!(why.contains("Nothing is wrong with the files"), "{why}");
+}

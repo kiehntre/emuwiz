@@ -97,7 +97,9 @@ impl Database {
             scan_root: folder.clone(),
             limits: crate::dat::limits::DatLimits::default(),
             policy: None,
-            platform: archive.platform.clone(),
+            // The catalogue's own mapping as first saved, never the disc's
+            // system: the save checks one against the other.
+            platform: saved.source.configured_platform.clone(),
         };
         let targets = AuditTargets::Catalogue(catalogue_audit_targets([cue.clone()], &folder));
         let outcome = match run_dat_audit_with_targets(

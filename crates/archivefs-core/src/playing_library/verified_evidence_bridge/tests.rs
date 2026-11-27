@@ -12,6 +12,9 @@ use crate::safe_read::TrustedRoots;
 
 use super::*;
 
+/// The system the fixture catalogue is configured for, and its game's.
+const SYSTEM: &str = "PSX";
+
 /// SHA-1 of `b"test"` (4 bytes) - mirrors `playing_library::matching::tests`.
 const SHA1_TEST: &str = "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3";
 /// SHA-1 of `b"other"` (5 bytes) - a different file's content, used to prove
@@ -54,6 +57,12 @@ impl Fixture {
             .database
             .upsert_archive(self.source_folder_id, &self.root, &archive)
             .expect("upsert archive");
+        // On the system its catalogue is configured for, as a folder would
+        // place it: a saved result needs a game the catalogue speaks for
+        // (owner policy 2026-11-26). The bridge itself never reads a system.
+        self.database
+            .assign_platform(outcome.archive_id, Some(SYSTEM), "folder_alias")
+            .expect("assign system");
         (path, outcome.archive_id)
     }
 
@@ -70,6 +79,7 @@ impl Fixture {
                 source_revision: Some("v1".into()),
                 catalogue_sha256: None,
                 author: None,
+                configured_platform: Some(SYSTEM.into()),
                 catalogue_names: vec![format!("{source_id} catalogue")],
                 dat_path: format!("/dats/{source_id}.dat"),
             },
@@ -306,6 +316,7 @@ fn ambiguous_persisted_evidence_is_never_silently_resolved() {
         source_revision: Some("v1".into()),
         catalogue_sha256: None,
         author: None,
+        configured_platform: Some(SYSTEM.into()),
         catalogue_names: vec!["catalogue".into()],
         dat_path: "/dats/no-intro-test.dat".into(),
     };
@@ -379,6 +390,7 @@ fn a_probable_only_verdict_is_not_strong_enough_to_bridge() {
             source_revision: Some("v1".into()),
             catalogue_sha256: None,
             author: None,
+            configured_platform: Some(SYSTEM.into()),
             catalogue_names: vec!["catalogue".into()],
             dat_path: "/dats/no-intro-test.dat".into(),
         },

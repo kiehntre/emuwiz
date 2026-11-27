@@ -142,16 +142,40 @@ impl Format {
     }
 }
 
+/// The system the fixture catalogue is configured for, and its games' system:
+/// a result is saved only where the catalogue speaks for the game's system
+/// (owner policy 2026-11-26). The header ("Fixture") names none itself.
+/// SNES, because the scanner itself puts the loose `.sfc` controls there.
+const SYSTEM: &str = "SNES";
+
+/// Gives every scanned game without a system the fixture's system, as a
+/// folder would: a test may still assign another system over it.
+fn classify(database: &mut Database) {
+    for archive in database.load_archives().unwrap() {
+        if archive.platform.is_none() {
+            database
+                .assign_platform(archive.id, Some(SYSTEM), "folder_alias")
+                .unwrap();
+        }
+    }
+}
+
 struct Fixture {
     root: PathBuf,
     source: PathBuf,
     archive: PathBuf,
     database: Database,
     dat_path: PathBuf,
+    /// The system the fixture catalogue is configured for.
+    catalogue_system: String,
 }
 
 impl Fixture {
     fn new(format: Format, members: &[(&str, &[u8])], dat: &[Dat<'_>]) -> Self {
+        Self::build(format, members, dat, true)
+    }
+
+    fn build(format: Format, members: &[(&str, &[u8])], dat: &[Dat<'_>], classified: bool) -> Self {
         let root = tempfile::tempdir().unwrap().keep();
         let source = root.join("source");
         std::fs::create_dir_all(&source).unwrap();
@@ -160,17 +184,26 @@ impl Fixture {
         let dat_path = root.join("fixture.dat");
         std::fs::write(&dat_path, dat_xml(dat)).unwrap();
         let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
-        Self::scan(&mut database, &source, &root);
+        Self::scan_only(&mut database, &source, &root);
+        if classified {
+            classify(&mut database);
+        }
         Self {
             root,
             source,
             archive,
             database,
             dat_path,
+            catalogue_system: SYSTEM.to_string(),
         }
     }
 
     fn scan(database: &mut Database, source: &Path, root: &Path) {
+        Self::scan_only(database, source, root);
+        classify(database);
+    }
+
+    fn scan_only(database: &mut Database, source: &Path, root: &Path) {
         let config = Config {
             configured_source_roots: None,
             source_folders: vec![source.to_path_buf()],
@@ -191,7 +224,7 @@ impl Fixture {
                 scan_root: self.source.clone(),
                 limits: DatLimits::default(),
                 policy: None,
-                platform: None,
+                platform: Some(self.catalogue_system.clone()),
             },
             &TrustedRoots::none(),
             &AtomicBool::new(false),
@@ -1009,7 +1042,7 @@ fn lha_and_lzh_are_catalogued_reloaded_and_audited_without_projected_identity() 
             scan_root: source.clone(),
             limits: DatLimits::default(),
             policy: None,
-            platform: None,
+            platform: Some(SYSTEM.to_string()),
         },
         &TrustedRoots::none(),
         &AtomicBool::new(false),
@@ -1057,8 +1090,9 @@ fn lha_row_stores_whole_file_evidence_only_never_member_projection() {
         &[Dat::Full("Game A", "Game.rom", GAME)],
     );
     let (_, member_row) = fx.run();
-    // The fixture item has no platform, so "not in this catalogue" is not
-    // evidence about it and no negative row is saved
+    // The fixture catalogue's header ("Fixture") names no system, so its
+    // "not in this catalogue" is not evidence about the game and no negative
+    // row is saved
     // (`negative_dat_result_applies`); nothing else may be stored either.
     assert!(member_row.is_none(), "{member_row:?}");
     assert_no_member_identity(&member_row);
@@ -1140,7 +1174,7 @@ impl WholeFile {
                 scan_root: self.source.clone(),
                 limits: DatLimits::default(),
                 policy: None,
-                platform: None,
+                platform: Some(SYSTEM.to_string()),
             },
             &TrustedRoots::none(),
             &AtomicBool::new(false),
@@ -1527,5 +1561,140 @@ fn archive_parent_hash_time_fingerprint_rejects_same_size_replacement_without_a_
     assert_ne!(
         saved.file_state_for_path(&fx.archive),
         crate::dat::library_identity_summary::DiscFileState::Unchanged
+    );
+}
+
+// ---- F1 (independent review 2026-11-26): zipped games and their system ----
+
+impl Fixture {
+    /// A fixture whose scanned archive has no system, or only `guess` from
+    /// its folder.
+    fn unclassified(
+        format: Format,
+        members: &[(&str, &[u8])],
+        dat: &[Dat<'_>],
+        guess: Option<&str>,
+    ) -> Self {
+        let mut fx = Self::build(format, members, dat, false);
+        let id = fx.archive_id();
+        assert_eq!(fx.database.current_platform_for_archive(id).unwrap(), None);
+        if let Some(guess) = guess {
+            fx.database
+                .assign_platform(id, Some(guess), "folder_alias")
+                .unwrap();
+        }
+        fx
+    }
+
+    /// Audit + the identity-and-platform save; then the row and the system.
+    fn run_identifying(&mut self) -> (Option<PersistedLibraryDatIdentity>, Option<String>) {
+        self.run_identifying_with(crate::database::PlatformCorrections::Propose)
+    }
+
+    fn run_identifying_with(
+        &mut self,
+        corrections: crate::database::PlatformCorrections,
+    ) -> (Option<PersistedLibraryDatIdentity>, Option<String>) {
+        let outcome = self.audit();
+        self.database
+            .persist_library_dat_identities_and_platforms_from_audit_with(&outcome, 1, corrections)
+            .unwrap();
+        let id = self.archive_id();
+        (
+            self.database
+                .library_dat_identity_for_item(id, SOURCE_ID)
+                .unwrap(),
+            self.database.current_platform_for_archive(id).unwrap(),
+        )
+    }
+}
+
+fn is_system(platform: &Option<String>, expected: &str) -> bool {
+    platform
+        .as_deref()
+        .and_then(crate::canonical_platform_for_alias)
+        == crate::canonical_platform_for_alias(expected)
+}
+
+fn identifies_unclassified(format: Format) {
+    let mut fx = Fixture::unclassified(
+        format,
+        &[("Game A.sfc", GAME)],
+        &[Dat::Full("Game A (USA)", "Game A.sfc", GAME)],
+        None,
+    );
+    let before = std::fs::read(&fx.archive).unwrap();
+    let (row, platform) = fx.run_identifying();
+    assert_verified_parent(&row.expect("parent row"), "Game A (USA)", "Game A.sfc");
+    assert!(is_system(&platform, SYSTEM), "{platform:?}");
+    assert_eq!(std::fs::read(&fx.archive).unwrap(), before);
+}
+
+#[test]
+fn an_unclassified_zip_whose_one_member_matches_gets_its_system_and_result() {
+    identifies_unclassified(Format::Zip);
+}
+
+#[test]
+fn an_unclassified_7z_whose_one_member_matches_gets_its_system_and_result() {
+    identifies_unclassified(Format::SevenZ);
+}
+
+/// A zipped game whose folder put it on the wrong system is corrected by its
+/// member's exact match when corrections are applied, and nothing inside or
+/// about the file changes. By default (owner 2026-11-26) it is only proposed.
+#[test]
+fn a_zipped_game_guessed_from_its_folder_is_corrected_by_its_member_match() {
+    let fixture = || {
+        Fixture::unclassified(
+            Format::Zip,
+            &[("Game A.sfc", GAME)],
+            &[Dat::Full("Game A (USA)", "Game A.sfc", GAME)],
+            Some("Game Boy"),
+        )
+    };
+    let mut proposed = fixture();
+    let (row, platform) = proposed.run_identifying();
+    assert!(row.is_none(), "{row:?}");
+    assert!(is_system(&platform, "Game Boy"), "{platform:?}");
+
+    let mut fx = fixture();
+    let before = std::fs::read(&fx.archive).unwrap();
+    let (row, platform) = fx.run_identifying_with(crate::database::PlatformCorrections::Apply);
+    assert_verified_parent(&row.expect("parent row"), "Game A (USA)", "Game A.sfc");
+    assert!(is_system(&platform, SYSTEM), "{platform:?}");
+    assert_eq!(std::fs::read(&fx.archive).unwrap(), before);
+    assert_eq!(std::fs::read_dir(&fx.source).unwrap().count(), 1);
+}
+
+/// An archive holding two different games, or matching only by CRC,
+/// identifies no system and keeps no result.
+#[test]
+fn an_unclassified_zip_of_two_games_or_a_crc_match_gets_nothing() {
+    let mut two = Fixture::unclassified(
+        Format::Zip,
+        &[("Game A.sfc", GAME), ("Game B.sfc", OTHER)],
+        &[
+            Dat::Full("Game A (USA)", "Game A.sfc", GAME),
+            Dat::Full("Game B (USA)", "Game B.sfc", OTHER),
+        ],
+        None,
+    );
+    let (row, platform) = two.run_identifying();
+    assert!(!is_verified(&row));
+    assert_eq!(platform, None);
+
+    let mut crc = Fixture::unclassified(
+        Format::Zip,
+        &[("Game A.sfc", GAME)],
+        &[Dat::CrcOnly("Game A (USA)", "Game A.sfc", GAME)],
+        Some("Game Boy"),
+    );
+    let (row, platform) = crc.run_identifying();
+    assert!(!is_verified(&row));
+    assert_eq!(
+        platform.as_deref(),
+        Some("Game Boy"),
+        "a CRC match corrects nothing"
     );
 }

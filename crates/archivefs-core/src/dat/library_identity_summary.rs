@@ -180,6 +180,11 @@ pub struct DatSourceProvenance {
     pub catalogue_sha256: Option<String>,
     /// The `<author>` header, when present.
     pub author: Option<String>,
+    /// The system the catalogue was assigned when it was configured (by the
+    /// person, or from its recognised header), as the audit carried it.
+    /// Absent on older evidence; never guessed from the game.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_platform: Option<String>,
     /// Every catalogue `<name>` header this audit actually read.
     pub catalogue_names: Vec<String>,
     /// The catalogue path the audit read from - provenance only.
@@ -196,6 +201,7 @@ impl DatSourceProvenance {
             source_revision: outcome.catalogue_version.clone(),
             catalogue_sha256: outcome.catalogue_sha256.clone(),
             author: outcome.catalogue_author.clone(),
+            configured_platform: outcome.platform.clone(),
             catalogue_names: outcome.catalogue_names.clone(),
             dat_path: outcome.dat_path.clone(),
         }
@@ -222,6 +228,7 @@ impl DatSourceProvenance {
             source_revision: evidence.catalogue_revision.clone(),
             catalogue_sha256: None,
             author: None,
+            configured_platform: None,
             catalogue_names: evidence.catalogue_names.clone(),
             dat_path: evidence.dat_path.clone(),
         }

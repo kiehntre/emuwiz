@@ -699,6 +699,7 @@ fn current_verified_dat_summary_is_consumed_without_new_authority() {
             source_revision: Some("v1".into()),
             catalogue_sha256: None,
             author: None,
+            configured_platform: None,
             catalogue_names: vec![],
             dat_path: "fixture.xml".into(),
         },

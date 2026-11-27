@@ -24,6 +24,32 @@ fn database(fixture: &Fixture, roms: Option<&Path>) -> PathBuf {
     path
 }
 
+/// Gives the fixture catalogue (whose header names no system) the real NES
+/// header and leaves it unassigned. A result is saved only for a game on a
+/// system the catalogue speaks for, or one an exact match identifies (owner
+/// policy 2026-11-26). The audit then reads every file; `super.bin` has no
+/// system, so its exact SHA-1 match identifies it in the same save, and
+/// `mystery.bin` (no system, no match) keeps no negative.
+fn nes_header(fixture: &Fixture, file: &str) {
+    let path = fixture.root.join(file);
+    let xml = std::fs::read_to_string(&path).unwrap();
+    let named = xml.replace(
+        "<name>Test No-Intro Collection</name>",
+        "<name>Nintendo - Nintendo Entertainment System</name>",
+    );
+    assert_ne!(named, xml, "the fixture header was replaced");
+    std::fs::write(&path, named).unwrap();
+}
+
+/// Configures the catalogue for the NES, as a person would. An audit for a
+/// configured system reads only the games already on it.
+fn for_nes(page: &mut DatSourcesPageState, id: &str) {
+    page.apply(DatSourcesPageAction::SetPlatform {
+        id: id.to_string(),
+        platform: Some("NES".to_string()),
+    });
+}
+
 fn audit(page: &mut DatSourcesPageState, id: &str, roms: &Path) {
     page.apply(DatSourcesPageAction::Audit {
         id: id.to_string(),
@@ -33,11 +59,12 @@ fn audit(page: &mut DatSourcesPageState, id: &str, roms: &Path) {
 }
 
 fn result(page: &DatSourcesPageState, operation: DatSaveOperation, id: &str) -> DatSaveResult {
-    page.view()
-        .save_results
-        .into_iter()
+    let results = page.view().save_results;
+    results
+        .iter()
         .find(|result| result.operation == operation && result.source_id == id)
-        .expect("source's final result")
+        .cloned()
+        .unwrap_or_else(|| panic!("source's final result: {results:?}"))
 }
 
 #[test]
@@ -45,6 +72,7 @@ fn successful_audit_saves_real_identity_rows_and_retains_success() {
     let (fixture, mut page, roms) = audit_fixture();
     let path = database(&fixture, Some(&roms));
     page.database_path = Some(path.clone());
+    nes_header(&fixture, "collection.dat");
     audit(&mut page, "collection", &roms);
     assert_eq!(
         result(&page, DatSaveOperation::Audit, "collection").outcome,
@@ -63,6 +91,30 @@ fn successful_audit_saves_real_identity_rows_and_retains_success() {
     // `mystery.bin` has no platform: its "no match" says nothing about it
     // and is not saved; the real match is.
     assert_eq!(count, 1);
+    // ...and it identified `super.bin`'s system in the same save, while
+    // `mystery.bin` still has none.
+    let systems: Vec<(String, Option<String>, Option<String>)> = connection
+        .prepare(
+            "SELECT a.display_name, p.platform, p.source FROM archives a \
+             LEFT JOIN platform_assignments p ON p.archive_id = a.id AND p.is_current = 1 \
+             ORDER BY a.id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect();
+    assert_eq!(systems[0].0, "super.bin");
+    assert_eq!(
+        systems[0]
+            .1
+            .as_deref()
+            .and_then(archivefs_core::canonical_platform_for_alias),
+        archivefs_core::canonical_platform_for_alias("NES"),
+        "{systems:?}"
+    );
+    assert_eq!(systems[0].2.as_deref(), Some("verified_dat"));
+    assert_eq!(systems[1], ("mystery.bin".to_string(), None, None));
     assert!(
         result(&page, DatSaveOperation::Audit, "collection")
             .technical_details
@@ -108,6 +160,9 @@ fn mid_save_database_error_is_failure_and_keeps_technical_detail() {
     // connection that can extend SQLite's lock lifetime under suite load.
     drop(connection);
     page.database_path = Some(path);
+    // A header naming the system, so the save reaches the INSERT the
+    // trigger rejects.
+    nes_header(&fixture, "collection.dat");
     audit(&mut page, "collection", &roms);
     let saved = result(&page, DatSaveOperation::Audit, "collection");
     assert_eq!(saved.outcome, DatSaveOutcome::PersistenceFailure);
@@ -121,24 +176,24 @@ fn mid_save_database_error_is_failure_and_keeps_technical_detail() {
     assert!(page.view().identity_enrichment.is_none());
 }
 
+/// Owner requirement 2026-11-26: identities and systems are saved as one
+/// change. When the system write fails, no identity row is kept either and
+/// every game keeps the system it had. (This test asserted the opposite,
+/// non-atomic behaviour before the requirement.)
 #[test]
-fn platform_save_failure_reports_failure_after_identity_rows_committed() {
+fn platform_save_failure_keeps_neither_identities_nor_platforms() {
     let (fixture, mut page, roms) = audit_fixture();
     let path = database(&fixture, Some(&roms));
-    // A platform audit reads only its own platform's games, and enrichment
-    // writes only when the platform text changes: here a legacy `nes` spelling
-    // from a heuristic, which verified DAT evidence replaces with `NES`. That
-    // write is what fails.
+    // Enrichment writes only when the platform text changes: here a legacy
+    // `nes` spelling from a heuristic, which verified DAT evidence replaces
+    // with `NES`. That write is what fails.
     rusqlite::Connection::open(&path).unwrap().execute_batch(
         "INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at) SELECT id,'nes','heuristic-path-detector',1,'now' FROM archives; \
          CREATE TRIGGER fail_dat_platform BEFORE INSERT ON platform_assignments BEGIN SELECT RAISE(ABORT, 'fixture platform write rejected'); END; \
          CREATE TRIGGER fail_dat_platform_update BEFORE UPDATE ON platform_assignments BEGIN SELECT RAISE(ABORT, 'fixture platform write rejected'); END;"
     ).unwrap();
     page.database_path = Some(path.clone());
-    page.apply(DatSourcesPageAction::SetPlatform {
-        id: "collection".to_string(),
-        platform: Some("NES".to_string()),
-    });
+    for_nes(&mut page, "collection");
     audit(&mut page, "collection", &roms);
     let saved = result(&page, DatSaveOperation::Audit, "collection");
     assert_eq!(
@@ -146,24 +201,41 @@ fn platform_save_failure_reports_failure_after_identity_rows_committed() {
         DatSaveOutcome::PersistenceFailure,
         "{saved:?}"
     );
-    assert!(saved.explanation.contains("saving platform enrichment"));
+    assert!(
+        saved
+            .explanation
+            .contains("saving library DAT identities and platforms"),
+        "{saved:?}"
+    );
     assert!(
         saved
             .technical_details
             .iter()
             .any(|detail| detail.contains("fixture platform write rejected"))
     );
-    let count: i64 = rusqlite::Connection::open(path)
-        .unwrap()
+    let connection = rusqlite::Connection::open(path).unwrap();
+    let count: i64 = connection
         .query_row(
             "SELECT count(*) FROM library_dat_identities WHERE dat_source_id='collection'",
             [],
             |row| row.get(0),
         )
         .unwrap();
+    assert_eq!(count, 0, "a failed system write keeps no identity row");
+    let assignments: Vec<(String, String)> = connection
+        .prepare("SELECT platform, source FROM platform_assignments WHERE is_current = 1 ORDER BY archive_id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect();
     assert_eq!(
-        count, 1,
-        "earlier committed rows do not imply overall save success"
+        assignments,
+        vec![
+            ("nes".to_string(), "heuristic-path-detector".to_string()),
+            ("nes".to_string(), "heuristic-path-detector".to_string()),
+        ],
+        "every game keeps the system it had"
     );
 }
 
@@ -230,6 +302,8 @@ fn retry_replaces_only_its_source_and_operation_after_completion() {
         path: fixture.write("other.dat", LOGIQX),
     });
     page.database_path = Some(fixture.dir("bad-database"));
+    nes_header(&fixture, "collection.dat");
+    nes_header(&fixture, "other.dat");
     audit(&mut page, "collection", &roms);
     audit(&mut page, "other", &roms);
     let other = result(&page, DatSaveOperation::Audit, "other");
@@ -459,4 +533,76 @@ fn full_progress_queue_cannot_drop_a_final_result_and_cancellation_keeps_it() {
     );
     assert!(page.view().audit.is_none());
     assert!(page.view().running.is_none());
+}
+
+/// Independent review 2 (T2): the person is told the real reason a result
+/// was not saved. Here the catalogue's header names no system and none was
+/// assigned, so it cannot speak for any game, whatever the match.
+#[test]
+fn an_unassigned_catalogue_is_named_as_the_reason_results_were_not_saved() {
+    let (fixture, mut page, roms) = audit_fixture();
+    let path = database(&fixture, Some(&roms));
+    page.database_path = Some(path.clone());
+    audit(&mut page, "collection", &roms);
+    let saved = result(&page, DatSaveOperation::Audit, "collection");
+    assert_eq!(
+        saved.outcome,
+        DatSaveOutcome::SuccessWithWarnings,
+        "{saved:?}"
+    );
+    let warnings = format!("{:?}", saved);
+    assert!(
+        warnings.contains("1 result(s) not saved for the game's system (1: the catalogue is not assigned to any system)"),
+        "{warnings}"
+    );
+    assert!(!warnings.contains("did not give it one"), "{warnings}");
+    let count: i64 = rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row("SELECT count(*) FROM library_dat_identities", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+/// Independent review 2 (T2), owner decision 2026-11-26: until Platform
+/// Corrections has a preview and Undo, the page proposes a correction (with
+/// its evidence) and changes nothing; a system chosen by hand is left alone.
+#[test]
+fn a_guessed_system_is_proposed_not_corrected_and_a_chosen_system_is_left_alone() {
+    let (fixture, mut page, roms) = audit_fixture();
+    let path = database(&fixture, Some(&roms));
+    // `super.bin` guessed SNES from its folder; `mystery.bin` chosen by hand.
+    rusqlite::Connection::open(&path).unwrap().execute_batch(
+        "UPDATE platform_assignments SET is_current = 0; \
+         INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at) VALUES(1,'SNES','folder_alias',1,'now'); \
+         INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at) VALUES(2,'SNES','manual',1,'now');",
+    ).unwrap();
+    page.database_path = Some(path.clone());
+    nes_header(&fixture, "collection.dat");
+    audit(&mut page, "collection", &roms);
+    let saved = result(&page, DatSaveOperation::Audit, "collection");
+    let text = format!("{saved:?}");
+    assert!(
+        text.contains("1 game(s) match this catalogue exactly but are on another system, guessed by the scanner (from their folder, file type, archive layout or RomM). Their system was not changed"),
+        "{text}"
+    );
+    assert!(text.contains("on SNES (folder_alias)"), "{text}");
+    assert!(text.contains("matched it exactly with SHA-1"), "{text}");
+    let connection = rusqlite::Connection::open(path).unwrap();
+    let current: Vec<(String, String)> = connection
+        .prepare("SELECT platform, source FROM platform_assignments WHERE is_current = 1 ORDER BY archive_id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect();
+    assert_eq!(current[0], ("SNES".to_string(), "folder_alias".to_string()));
+    assert_eq!(current[1], ("SNES".to_string(), "manual".to_string()));
+    let rows: i64 = connection
+        .query_row("SELECT count(*) FROM library_dat_identities", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(rows, 0);
 }

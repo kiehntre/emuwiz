@@ -4204,11 +4204,58 @@ pub enum LibraryDatIdentityPersistOutcome {
     /// identity, and a prior row for this `(item, source)` did carry one, so
     /// the prior row was left untouched.
     SkippedProtectedPriorResult,
+    /// The result does not apply to the item's current system (see
+    /// [`crate::dat::identity::dat_result_platform_refusal`]); nothing was
+    /// written and any prior row was left untouched.
+    RefusedPlatform(crate::dat::identity::PlatformRefusal),
 }
 
 /// What [`Database::persist_library_dat_identities_from_audit`] did with one
 /// completed audit's worth of entries. Every count is accounted for -
 /// nothing is silently dropped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlatformRefusalCounts {
+    pub no_system: usize,
+    pub no_system_several_systems: usize,
+    pub other_system: usize,
+    pub not_arcade: usize,
+    pub catalogue_contradicts: usize,
+    pub catalogue_unassigned: usize,
+    pub no_match_not_for_system: usize,
+}
+
+impl PlatformRefusalCounts {
+    pub fn note(&mut self, refusal: crate::dat::identity::PlatformRefusal) {
+        use crate::dat::identity::PlatformRefusal as R;
+        *match refusal {
+            R::NoSystem => &mut self.no_system,
+            R::NoSystemSeveralSystems => &mut self.no_system_several_systems,
+            R::OtherSystem => &mut self.other_system,
+            R::NotArcade => &mut self.not_arcade,
+            R::CatalogueContradicts => &mut self.catalogue_contradicts,
+            R::CatalogueUnassigned => &mut self.catalogue_unassigned,
+            R::NoMatchNotForSystem => &mut self.no_match_not_for_system,
+        } += 1;
+    }
+
+    /// Each reason that occurred, with its count, in a fixed order.
+    pub fn reasons(&self) -> Vec<(usize, &'static str)> {
+        use crate::dat::identity::PlatformRefusal as R;
+        [
+            (self.no_system, R::NoSystem),
+            (self.no_system_several_systems, R::NoSystemSeveralSystems),
+            (self.other_system, R::OtherSystem),
+            (self.not_arcade, R::NotArcade),
+            (self.catalogue_contradicts, R::CatalogueContradicts),
+            (self.catalogue_unassigned, R::CatalogueUnassigned),
+            (self.no_match_not_for_system, R::NoMatchNotForSystem),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, reason)| (count, reason.reason()))
+        .collect()
+    }
+}
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LibraryDatIdentityAuditPersistOutcome {
     /// New `(archive_id, dat_source_id)` rows written.
@@ -4225,6 +4272,12 @@ pub struct LibraryDatIdentityAuditPersistOutcome {
     /// [`crate::dat::identity::negative_dat_result_applies`]). Matches are
     /// always saved.
     pub negative_platform_unproven_skipped: usize,
+    /// Results refused at the save because they do not apply to the item's
+    /// current system: a match from another system's catalogue, or one for a
+    /// game with no system from a catalogue that names several.
+    pub platform_refused: usize,
+    /// [`Self::platform_refused`] by reason.
+    pub platform_refusals: PlatformRefusalCounts,
     /// Entries the projection itself withheld because the run's
     /// completeness makes their negative verdict unsafe to persist (see
     /// `crate::dat::library_identity_projection`'s module doc).
@@ -4267,7 +4320,24 @@ fn persist_library_dat_identity_row(
             .as_ref()
             .is_some_and(|prior| prior.carries_identity())
     {
+        // Writes nothing, so it is reported as before the platform rule.
         return Ok(LibraryDatIdentityPersistOutcome::SkippedProtectedPriorResult);
+    }
+
+    let platform: Option<String> = conn
+        .query_row(
+            "SELECT platform FROM platform_assignments WHERE archive_id = ?1 AND is_current = 1",
+            params![archive_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| db_error("failed to read current archive platform", error))?;
+    // Read in the same transaction as the write below, so the system the
+    // rule was judged against is the one the saved row sits beside.
+    if let Some(reason) =
+        crate::dat::identity::dat_result_platform_refusal(persisted, platform.as_deref())
+    {
+        return Ok(LibraryDatIdentityPersistOutcome::RefusedPlatform(reason));
     }
 
     let facts_json = serde_json::to_vec(persisted).map_err(|error| {
@@ -4511,6 +4581,100 @@ pub struct PlatformIdentityEnrichmentSummary {
     /// the current platform and its provenance stay as they are.
     pub romm_suggestions: usize,
     pub romm_suggestion_details: Vec<RommPlatformSuggestion>,
+    /// Games whose guessed system an exact catalogue match corrected in
+    /// this save (the guess stays in the history).
+    pub corrected: usize,
+    /// Systems an exact catalogue match disagrees with but that were not
+    /// changed, because they are verified, chosen by the person, read from
+    /// the game's header, or of unknown origin. Shown for review.
+    pub correction_reviews: Vec<PlatformCorrectionReview>,
+    /// Guessed systems a strong exact match would correct, left unchanged
+    /// because this save only proposes corrections
+    /// ([`PlatformCorrections::Propose`]).
+    pub proposed_corrections: Vec<PlatformCorrectionReview>,
+}
+
+/// Whether the identity-and-platform save corrects guessed systems.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformCorrections {
+    /// List them in `proposed_corrections`; change nothing (the default
+    /// until the Platform Corrections preview and Undo exist).
+    Propose,
+    /// Correct them in the same transaction as their results.
+    Apply,
+}
+
+/// Step 1 of the identity-and-platform save: its summary, each system change
+/// made (game, new assignment row, previous current row) and the games whose
+/// system was absent before or changed by the step.
+type IdentifiedOrCorrected = (
+    PlatformIdentityEnrichmentSummary,
+    Vec<(i64, i64, Option<i64>)>,
+    std::collections::HashSet<i64>,
+);
+
+#[cfg(test)]
+pub(crate) mod test_seams {
+    use std::cell::Cell;
+    thread_local! {
+        static SKIP_IDENTITY_ROW: Cell<Option<i64>> = const { Cell::new(None) };
+    }
+    /// Makes the identity save skip writing this game's row (this thread only).
+    pub(crate) fn set_skip_identity_row(archive_id: Option<i64>) {
+        SKIP_IDENTITY_ROW.with(|cell| cell.set(archive_id));
+    }
+    pub(super) fn skip_identity_row(archive_id: i64) -> bool {
+        SKIP_IDENTITY_ROW.with(|cell| cell.get() == Some(archive_id))
+    }
+}
+
+/// Who set a game's current system, as far as EmuWiz can tell from the
+/// assignment's recorded source (owner decision 2026-11-26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum PlatformProvenanceClass {
+    /// A guess from the folder, file type, path, archive layout or RomM
+    /// metadata: strong catalogue evidence may correct it.
+    Inferred,
+    /// Read from the game's own header: a disagreement is reviewed.
+    Header,
+    /// A verified catalogue match: a disagreement needs investigation.
+    Verified,
+    /// Chosen by the person (for the game, its source or its folder): a
+    /// correction is proposed for their approval.
+    Person,
+    /// A source EmuWiz cannot attribute: never assumed to be a guess.
+    Unknown,
+}
+
+impl PlatformProvenanceClass {
+    pub fn of(source: &str) -> Self {
+        match source {
+            "folder_alias"
+            | "registry_detector"
+            | "heuristic-path-detector"
+            | ARCHIVE_MEMBER_PLATFORM_SOURCE
+            | ROMM_PLATFORM_SOURCE => Self::Inferred,
+            "header_identity" => Self::Header,
+            VERIFIED_DAT_PLATFORM_SOURCE | DAT_ROMM_AGREEMENT_SOURCE => Self::Verified,
+            MANUAL_PLATFORM_SOURCE
+            | SOURCE_PLATFORM_ASSIGNMENT_SOURCE
+            | CUSTOM_FOLDER_ALIAS_SOURCE => Self::Person,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// A system an exact catalogue match disagrees with, left unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PlatformCorrectionReview {
+    pub archive_id: i64,
+    pub current_platform: String,
+    pub current_source: String,
+    pub proposed_platform: String,
+    pub catalogue: String,
+    /// The hash algorithm(s) of the exact match, as recorded.
+    pub algorithm: String,
+    pub provenance: PlatformProvenanceClass,
 }
 
 /// A platform RomM proposes for a game that already has a different one.
@@ -4631,6 +4795,28 @@ impl PlatformIdentityEnrichmentSummary {
             });
         }
         items
+    }
+
+    /// Adds another summary's counts and details to this one.
+    fn merge(&mut self, other: Self) {
+        self.evidence_considered += other.evidence_considered;
+        self.archives_matched += other.archives_matched;
+        self.applied += other.applied;
+        self.unchanged += other.unchanged;
+        self.manual_preserved += other.manual_preserved;
+        self.conflicts += other.conflicts;
+        self.stale_ignored += other.stale_ignored;
+        self.unknown_ignored += other.unknown_ignored;
+        self.conflict_details.extend(other.conflict_details);
+        self.romm_disagreements += other.romm_disagreements;
+        self.romm_disagreement_details
+            .extend(other.romm_disagreement_details);
+        self.romm_suggestions += other.romm_suggestions;
+        self.romm_suggestion_details
+            .extend(other.romm_suggestion_details);
+        self.corrected += other.corrected;
+        self.correction_reviews.extend(other.correction_reviews);
+        self.proposed_corrections.extend(other.proposed_corrections);
     }
 
     fn note(&mut self, outcome: PlatformIdentityApplyOutcome) {
@@ -5760,6 +5946,16 @@ impl Database {
         outcome: &crate::dat::sources::audit_run::DatAuditOutcome,
         generation: u64,
     ) -> Result<PlatformIdentityEnrichmentSummary> {
+        self.enrich_platforms_from_dat_audit_among(outcome, generation, &|_| true)
+    }
+
+    /// [`Self::enrich_platforms_from_dat_audit`] for the games `among` admits.
+    fn enrich_platforms_from_dat_audit_among(
+        &mut self,
+        outcome: &crate::dat::sources::audit_run::DatAuditOutcome,
+        generation: u64,
+        among: &dyn Fn(i64) -> bool,
+    ) -> Result<PlatformIdentityEnrichmentSummary> {
         let mut summary = PlatformIdentityEnrichmentSummary::default();
         for entry in &outcome.report.entries {
             let path = Path::new(&entry.local_path);
@@ -5770,10 +5966,14 @@ impl Database {
             else {
                 continue;
             };
-            summary.evidence_considered += 1;
             let Some(archive_id) = self.find_archive_id_by_absolute_path(path)? else {
+                summary.evidence_considered += 1;
                 continue;
             };
+            if !among(archive_id) {
+                continue;
+            }
+            summary.evidence_considered += 1;
             summary.archives_matched += 1;
             let mut evidence = self.current_platform_identity_evidence(archive_id, generation)?;
             evidence.push(provider);
@@ -8136,6 +8336,266 @@ impl Database {
         self.persist_library_dat_identities_checked(outcome, None)
     }
 
+    /// Saves one audit's DAT identities and the systems its results establish
+    /// as one change (owner requirements 2026-11-26), per game and for the
+    /// whole audit:
+    ///
+    /// 1. a game with no system is given one only from the very result row
+    ///    this save will write, when that result identifies a system
+    ///    ([`crate::dat::identity::identifies_system`]) and its catalogue
+    ///    speaks for exactly one system - archive members and disc tracks
+    ///    included, as the row records them;
+    /// 2. the rows are written, each judged against the game's system as it
+    ///    now stands;
+    /// 3. a system set in step 1 whose row was not written fails the save,
+    ///    which is rolled back whole, so no game keeps a system without its
+    ///    result;
+    /// 4. games that already had a system are confirmed from this audit's
+    ///    whole-file matches only where their result row was written.
+    ///
+    /// Any error rolls the whole save back: no row and no system is kept.
+    ///
+    /// Guessed systems are only proposed for correction here
+    /// ([`PlatformCorrections::Propose`]): owner decision 2026-11-26, applying
+    /// corrections needs the Platform Corrections preview and Undo.
+    pub fn persist_library_dat_identities_and_platforms_from_audit(
+        &mut self,
+        outcome: &crate::dat::sources::audit_run::DatAuditOutcome,
+        generation: u64,
+    ) -> Result<(
+        LibraryDatIdentityAuditPersistOutcome,
+        PlatformIdentityEnrichmentSummary,
+    )> {
+        self.persist_library_dat_identities_and_platforms_from_audit_with(
+            outcome,
+            generation,
+            PlatformCorrections::Propose,
+        )
+    }
+
+    /// [`Self::persist_library_dat_identities_and_platforms_from_audit`],
+    /// choosing whether guessed systems are corrected or only proposed.
+    ///
+    /// Crate-only on purpose (owner gate 2026-11-26): `Apply` is for the
+    /// Platform Corrections Preview/Undo slice and tests, never a direct
+    /// production caller.
+    pub(crate) fn persist_library_dat_identities_and_platforms_from_audit_with(
+        &mut self,
+        outcome: &crate::dat::sources::audit_run::DatAuditOutcome,
+        generation: u64,
+        corrections: PlatformCorrections,
+    ) -> Result<(
+        LibraryDatIdentityAuditPersistOutcome,
+        PlatformIdentityEnrichmentSummary,
+    )> {
+        if !self.connection.is_autocommit() {
+            return Err(ArchiveFsError::Database(
+                "an identity-and-platform save cannot run inside another transaction".into(),
+            ));
+        }
+        self.connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|error| db_error("failed to start identity and platform save", error))?;
+        let saved = self
+            .persist_identities_and_platforms_in_transaction(outcome, generation, corrections)
+            .and_then(|both| {
+                self.connection.execute_batch("COMMIT").map_err(|error| {
+                    db_error("failed to commit identity and platform save", error)
+                })?;
+                Ok(both)
+            });
+        if saved.is_err() && !self.connection.is_autocommit() {
+            // Nothing from this audit is kept: not the identities, not the
+            // systems. A failed rollback is reported with the first error.
+            if let Err(error) = self.connection.execute_batch("ROLLBACK") {
+                return Err(ArchiveFsError::Database(format!(
+                    "{}; and the rollback failed too: {error}",
+                    saved.err().map(|e| e.to_string()).unwrap_or_default()
+                )));
+            }
+        }
+        saved
+    }
+
+    fn persist_identities_and_platforms_in_transaction(
+        &mut self,
+        outcome: &crate::dat::sources::audit_run::DatAuditOutcome,
+        generation: u64,
+        corrections: PlatformCorrections,
+    ) -> Result<(
+        LibraryDatIdentityAuditPersistOutcome,
+        PlatformIdentityEnrichmentSummary,
+    )> {
+        let (mut platforms, changed, excluded) =
+            self.identify_or_correct_from_audit(outcome, generation, corrections)?;
+        let mut identified_rows = Vec::new();
+        let identities =
+            self.persist_library_dat_identities_recording(outcome, None, &mut identified_rows)?;
+        let identified_rows: std::collections::HashSet<i64> = identified_rows.into_iter().collect();
+        // Both steps use the same projection and refusal rules, so a system
+        // this save set always has its result row. If one ever does not, the
+        // save fails and is rolled back whole: a partial repair could not
+        // undo what the assignment's triggers already recorded.
+        if let Some((archive_id, _, _)) = changed
+            .iter()
+            .find(|(archive_id, _, _)| !identified_rows.contains(archive_id))
+        {
+            return Err(ArchiveFsError::Database(format!(
+                "game {archive_id} was given a system but its verification result was not saved; nothing from this audit was kept"
+            )));
+        }
+        let confirmed = self.enrich_platforms_from_dat_audit_among(outcome, generation, &|id| {
+            identified_rows.contains(&id) && !excluded.contains(&id)
+        })?;
+        platforms.merge(confirmed);
+        Ok((identities, platforms))
+    }
+
+    /// Step 1 of the identity-and-platform save (owner decisions 2026-11-26).
+    /// For each result row this audit projects that identifies a system
+    /// ([`crate::dat::identity::identifies_system`]) and whose catalogue
+    /// speaks for exactly one system:
+    ///
+    /// * a game with no system is given that system;
+    /// * a game whose current system is only a guess
+    ///   ([`PlatformProvenanceClass::Inferred`]) and is not one the
+    ///   catalogue speaks for is corrected to it; the guess stays in the
+    ///   history;
+    /// * a verified, user-chosen, header-derived or unattributable system is
+    ///   never changed here: the conflict is listed for review.
+    ///
+    /// Returns the summary, each change made (game, new assignment row,
+    /// previous current row) and the games whose system was absent or
+    /// changed by this step.
+    fn identify_or_correct_from_audit(
+        &mut self,
+        outcome: &crate::dat::sources::audit_run::DatAuditOutcome,
+        generation: u64,
+        corrections: PlatformCorrections,
+    ) -> Result<IdentifiedOrCorrected> {
+        use crate::dat::identity::{CatalogueSystems, catalogue_systems, identifies_system};
+        let mut summary = PlatformIdentityEnrichmentSummary::default();
+        let mut changed = Vec::new();
+        let mut excluded = std::collections::HashSet::new();
+        let now = now_utc_string();
+        let Ok(projection) =
+            crate::dat::library_identity_projection::project_dat_audit_for_library_identity(
+                outcome, &now,
+            )
+        else {
+            // The identity save refuses the same outcome; nothing to identify.
+            return Ok((summary, changed, excluded));
+        };
+        for item in &projection.items {
+            // An ambiguous path is never guessed at (the save refuses it too).
+            let Ok(Some(archive_id)) =
+                self.find_archive_id_by_absolute_path(Path::new(&item.local_path))
+            else {
+                continue;
+            };
+            let before = self.current_platform_row(archive_id)?;
+            if before.is_none() {
+                excluded.insert(archive_id);
+            }
+            if self.is_preservation_recording(archive_id)? || !identifies_system(&item.identity) {
+                continue;
+            }
+            let CatalogueSystems::One(platform) = catalogue_systems(&item.identity.source) else {
+                continue;
+            };
+            let algorithm = match &item.identity.verification_state {
+                crate::dat::library_identity_summary::DatVerificationState::VerifiedSingleMatch {
+                    algorithm,
+                } => algorithm.clone(),
+                _ => continue,
+            };
+            if let Some((_, current, source)) = &before {
+                let current_id = crate::canonical_platform_for_alias(current);
+                if current_id.is_some_and(|current| {
+                    current == platform
+                        || crate::platform::equivalent_platform_ids(&platform).contains(&current)
+                }) {
+                    continue;
+                }
+                let review = PlatformCorrectionReview {
+                    archive_id,
+                    current_platform: current.clone(),
+                    current_source: source.clone(),
+                    proposed_platform: platform.clone(),
+                    catalogue: outcome.source_display_name.clone(),
+                    algorithm: algorithm.clone(),
+                    provenance: PlatformProvenanceClass::of(source),
+                };
+                if review.provenance != PlatformProvenanceClass::Inferred {
+                    summary.correction_reviews.push(review);
+                    continue;
+                }
+                if corrections == PlatformCorrections::Propose {
+                    summary.proposed_corrections.push(review);
+                    continue;
+                }
+            }
+            summary.evidence_considered += 1;
+            summary.archives_matched += 1;
+            let mut evidence = self.current_platform_identity_evidence(archive_id, generation)?;
+            evidence.push(crate::platform::identity::PlatformIdentityEvidence {
+                platform: platform.clone(),
+                source: crate::platform::identity::PlatformIdentitySource::VerifiedDat,
+                confidence: crate::platform::identity::PlatformIdentityConfidence::Verified,
+                generation,
+                detail: format!(
+                    "{} verified this file with {algorithm} (Exact)",
+                    outcome.source_display_name
+                ),
+            });
+            let resolution =
+                crate::platform::identity::resolve_platform_identity(generation, evidence);
+            if let PlatformIdentityResolution::Conflict { evidence, .. } = &resolution {
+                // Step 1 only ever adds or corrects a system; it never
+                // retires one. The conflict is listed for review.
+                summary.conflicts += 1;
+                summary
+                    .conflict_details
+                    .push(PlatformIdentityConflictDetail {
+                        archive_id,
+                        evidence: evidence.clone(),
+                    });
+                continue;
+            }
+            let applied =
+                self.apply_platform_identity_resolution(archive_id, &resolution, generation)?;
+            summary.note(applied);
+            // Only a new current row is a change this save made: a lower
+            // priority result can leave the current row in place.
+            let after = self.current_platform_row(archive_id)?;
+            let before_row = before.as_ref().map(|(id, _, _)| *id);
+            match after {
+                Some((after_row, _, _)) if Some(after_row) != before_row => {
+                    if before.is_some() {
+                        summary.corrected += 1;
+                    }
+                    excluded.insert(archive_id);
+                    changed.push((archive_id, after_row, before_row));
+                }
+                _ => {}
+            }
+        }
+        Ok((summary, changed, excluded))
+    }
+
+    /// The game's current system assignment: (row id, system, source).
+    fn current_platform_row(&self, archive_id: i64) -> Result<Option<(i64, String, String)>> {
+        self.connection
+            .query_row(
+                "SELECT id, platform, source FROM platform_assignments \
+                 WHERE archive_id = ?1 AND is_current = 1",
+                params![archive_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| db_error("failed to read current archive platform", error))
+    }
+
     /// Verification-only persistence. Revalidate the preview's library membership
     /// inside the same transaction as the writes; never enrich platform identity.
     pub fn persist_scoped_library_dat_verification(
@@ -8151,15 +8611,37 @@ impl Database {
         outcome: &crate::dat::sources::audit_run::DatAuditOutcome,
         scope: Option<&crate::dat::library_verification::VerificationScope>,
     ) -> Result<LibraryDatIdentityAuditPersistOutcome> {
+        self.persist_library_dat_identities_recording(outcome, scope, &mut Vec::new())
+    }
+
+    /// [`Self::persist_library_dat_identities_checked`], also recording each
+    /// game whose result row carrying an identity was written.
+    fn persist_library_dat_identities_recording(
+        &mut self,
+        outcome: &crate::dat::sources::audit_run::DatAuditOutcome,
+        scope: Option<&crate::dat::library_verification::VerificationScope>,
+        identified_rows: &mut Vec<i64>,
+    ) -> Result<LibraryDatIdentityAuditPersistOutcome> {
         // Reads and writes share one SQLite snapshot. The write lock is taken
         // at the start (waiting out another writer for the busy timeout), so
         // a membership change either precedes validation or waits for this
         // save; a save is never refused only because it had read first.
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.connection,
-            rusqlite::TransactionBehavior::Immediate,
-        )
-        .map_err(|error| db_error("failed to start library DAT identity transaction", error))?;
+        // Inside a caller's transaction (the identity-and-platform save) the
+        // rows join it and are committed or rolled back with it.
+        let own = if self.connection.is_autocommit() {
+            Some(
+                rusqlite::Transaction::new_unchecked(
+                    &self.connection,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .map_err(|error| {
+                    db_error("failed to start library DAT identity transaction", error)
+                })?,
+            )
+        } else {
+            None
+        };
+        let tx: &Connection = own.as_deref().unwrap_or(&self.connection);
         if let Some(scope) = scope {
             scope
                 .validate(&self.load_archives()?, outcome)
@@ -8210,7 +8692,7 @@ impl Database {
             (&outcome.catalogue_inventory, &outcome.catalogue_sha256)
         {
             dat_inventory::replace_inventory(
-                &tx,
+                tx,
                 &outcome.source_id,
                 outcome.catalogue_version.as_deref(),
                 outcome.catalogue_ecosystem,
@@ -8222,26 +8704,49 @@ impl Database {
         let mut inserted = 0usize;
         let mut updated = 0usize;
         let mut skipped_protected_prior_result = 0usize;
+        let mut platform_refused = 0usize;
+        let mut platform_refusals = PlatformRefusalCounts::default();
         if !resolved.is_empty() {
             for (archive_id, persisted) in &resolved {
-                match persist_library_dat_identity_row(&tx, *archive_id, persisted, &now)? {
+                #[cfg(test)]
+                if test_seams::skip_identity_row(*archive_id) {
+                    continue;
+                }
+                let written = persist_library_dat_identity_row(tx, *archive_id, persisted, &now)?;
+                if matches!(
+                    written,
+                    LibraryDatIdentityPersistOutcome::Inserted
+                        | LibraryDatIdentityPersistOutcome::Updated
+                ) && persisted.carries_identity()
+                {
+                    identified_rows.push(*archive_id);
+                }
+                match written {
                     LibraryDatIdentityPersistOutcome::Inserted => inserted += 1,
                     LibraryDatIdentityPersistOutcome::Updated => updated += 1,
                     LibraryDatIdentityPersistOutcome::SkippedProtectedPriorResult => {
                         skipped_protected_prior_result += 1;
                     }
+                    LibraryDatIdentityPersistOutcome::RefusedPlatform(reason) => {
+                        platform_refused += 1;
+                        platform_refusals.note(reason);
+                    }
                 }
             }
         }
-        tx.commit().map_err(|error| {
-            db_error("failed to commit library DAT identity transaction", error)
-        })?;
+        if let Some(own) = own {
+            own.commit().map_err(|error| {
+                db_error("failed to commit library DAT identity transaction", error)
+            })?;
+        }
 
         Ok(LibraryDatIdentityAuditPersistOutcome {
             inserted,
             updated,
             skipped_protected_prior_result,
             negative_platform_unproven_skipped,
+            platform_refused,
+            platform_refusals,
             preservation_only_skipped,
             negative_incomplete_skipped: projection.skipped.len(),
             unassociated,
@@ -9534,7 +10039,7 @@ impl Database {
         Ok(out)
     }
 
-    fn current_platform_for_archive(&self, archive_id: i64) -> Result<Option<String>> {
+    pub(crate) fn current_platform_for_archive(&self, archive_id: i64) -> Result<Option<String>> {
         self.connection
             .query_row(
                 "SELECT platform FROM platform_assignments WHERE archive_id = ?1 AND is_current = 1",
@@ -19203,6 +19708,20 @@ echo "$out"
         .unwrap()
     }
 
+    /// [`unknown_archive_database`] with the game on `platform`: a saved
+    /// result needs a game whose system the catalogue speaks for.
+    /// The DAT page's save: identities and the systems they establish, as one
+    /// change.
+    fn save_identifying(
+        database: &mut Database,
+        outcome: &crate::dat::sources::audit_run::DatAuditOutcome,
+    ) -> LibraryDatIdentityAuditPersistOutcome {
+        database
+            .persist_library_dat_identities_and_platforms_from_audit(outcome, 1)
+            .unwrap()
+            .0
+    }
+
     fn unknown_archive_database(name: &str) -> (PathBuf, Database, i64) {
         let root = temp_dir(name);
         let source = root.join("source");
@@ -20526,8 +21045,9 @@ echo "$out"
     }
 
     // -------------------------------------------------------------------
-    // `persist_library_dat_identities_from_audit`: the production wiring
-    // from a completed, single-source DAT audit into `library_dat_identities`
+    // Persisting a completed, single-source DAT audit into
+    // `library_dat_identities`: the plain route (Check Games) and the
+    // identity-and-platform save the DAT page uses
     // - a projection of the audit the caller already ran, never a new scan,
     // hash, or match.
     // -------------------------------------------------------------------
@@ -20605,16 +21125,34 @@ echo "$out"
             .unwrap();
         let path = archive.absolute_path.display().to_string();
         let outcome = single_source_outcome("no-intro-psp", vec![exact_entry(&path, "Mystery")]);
-
-        let result = database
+        // The game has no system: the plain route never identifies one, so
+        // it keeps nothing (owner policy 2026-11-26)...
+        let plain = database
             .persist_library_dat_identities_from_audit(&outcome)
             .unwrap();
+        assert_eq!((plain.inserted, plain.platform_refused), (0, 1));
+        assert_eq!(
+            database.current_platform_for_archive(archive_id).unwrap(),
+            None
+        );
+        // ...while the identity-and-platform save gives it PSP from the exact
+        // match and keeps the result, together.
+
+        let result = save_identifying(&mut database, &outcome);
         assert_eq!(result.inserted, 1);
         assert_eq!(result.updated, 0);
         assert_eq!(result.unassociated, 0);
         assert_eq!(result.ambiguous, 0);
         assert_eq!(result.negative_incomplete_skipped, 0);
         assert!(result.refused.is_none());
+        assert_eq!(
+            database
+                .current_platform_for_archive(archive_id)
+                .unwrap()
+                .as_deref()
+                .and_then(crate::canonical_platform_for_alias),
+            crate::canonical_platform_for_alias("PSP")
+        );
 
         // Persisted archive_id is the correct library item.
         let persisted = database
@@ -20670,12 +21208,8 @@ echo "$out"
         let no_intro = single_source_outcome("no-intro-psp", vec![exact_entry(&path, "Mystery")]);
         let redump =
             single_source_outcome("redump-psp", vec![exact_entry(&path, "Mystery (Redump)")]);
-        database
-            .persist_library_dat_identities_from_audit(&no_intro)
-            .unwrap();
-        database
-            .persist_library_dat_identities_from_audit(&redump)
-            .unwrap();
+        save_identifying(&mut database, &no_intro);
+        save_identifying(&mut database, &redump);
 
         let all = database
             .library_dat_identities_for_item(archive_id)
@@ -20704,9 +21238,7 @@ echo "$out"
         let path = archive.absolute_path.display().to_string();
 
         let first = single_source_outcome("no-intro-psp", vec![exact_entry(&path, "Mystery")]);
-        let result = database
-            .persist_library_dat_identities_from_audit(&first)
-            .unwrap();
+        let result = save_identifying(&mut database, &first);
         assert_eq!(result.inserted, 1);
         assert_eq!(result.updated, 0);
 
@@ -20714,9 +21246,7 @@ echo "$out"
             "no-intro-psp",
             vec![exact_entry(&path, "Mystery (Revised)")],
         );
-        let result = database
-            .persist_library_dat_identities_from_audit(&second)
-            .unwrap();
+        let result = save_identifying(&mut database, &second);
         assert_eq!(
             result.inserted, 0,
             "the same (archive, source) row is updated"
@@ -20923,9 +21453,7 @@ echo "$out"
             crate::dat::set::SetState::Complete
         );
 
-        let identity_result = database
-            .persist_library_dat_identities_from_audit(&outcome)
-            .unwrap();
+        let identity_result = save_identifying(&mut database, &outcome);
         assert_eq!(identity_result.inserted, 1);
 
         // The set-level row is completely unaffected.
@@ -22095,7 +22623,47 @@ echo "$out"
                     ],
                 )
                 .unwrap();
-            database.connection.last_insert_rowid()
+            let id = database.connection.last_insert_rowid();
+            // The system the scanner gives a strong extension, recorded as a
+            // detector guess that a test (or `on_platform`) may replace. A
+            // file the scanner cannot place (`.bin`, `.zip`) has none.
+            let detected = match file_name.rsplit('.').next() {
+                Some("nes") => Some("NES"),
+                Some("gba") => Some("Game Boy Advance"),
+                _ => None,
+            };
+            if let Some(platform) = detected {
+                database
+                    .connection
+                    .execute(
+                        "INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at) \
+                         VALUES(?1,?2,'registry_detector',1,'2026-01-02')",
+                        params![id, platform],
+                    )
+                    .unwrap();
+            }
+            id
+        }
+
+        /// Replaces the game's current system; `None` leaves it unclassified.
+        fn set_system(database: &Database, id: i64, platform: Option<&str>) {
+            database
+                .connection
+                .execute(
+                    "UPDATE platform_assignments SET is_current = 0 WHERE archive_id = ?1",
+                    params![id],
+                )
+                .unwrap();
+            if let Some(platform) = platform {
+                database
+                    .connection
+                    .execute(
+                        "INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at) \
+                         VALUES(?1,?2,'manual',1,'2026-01-03')",
+                        params![id, platform],
+                    )
+                    .unwrap();
+            }
         }
 
         fn hashes() -> LibraryItemHashes {
@@ -22121,6 +22689,15 @@ echo "$out"
                 source_revision: revision.map(str::to_string),
                 catalogue_sha256: None,
                 author: Some("Publisher".into()),
+                // The system each catalogue was configured for. MAME and
+                // FBNeo name arcade machines and are left unassigned, so the
+                // guard's arcade rule is what these tests exercise.
+                configured_platform: match id {
+                    "no-intro-gba" => Some("Game Boy Advance".into()),
+                    "no-intro-snk" => Some("NeoGeo".into()),
+                    id if id == "fbneo" || id == "mame" || id.starts_with("mame:") => None,
+                    _ => Some("NES".into()),
+                },
                 // A real No-Intro header for the platform the id names, so a
                 // saved negative applies to that platform's items.
                 catalogue_names: vec![match id {
@@ -22215,6 +22792,198 @@ echo "$out"
                 )
                 .unwrap()
                 .expect("a stored summary")
+        }
+
+        /// Owner policy 2026-11-26 (Check Games Stage C): a result is saved
+        /// only where it applies to the game's system. Every save route goes
+        /// through the same row writer, so this covers them all.
+        #[test]
+        fn every_save_applies_the_platform_rules() {
+            let (root, mut database) = open("persist-platform-rules");
+            let nes = seed_archive(&database, "Zelda.nes");
+            let gba = seed_archive(&database, "Other.gba");
+            let unknown = seed_archive(&database, "Unknown.bin");
+            set_system(&database, gba, Some("Game Boy Advance"));
+            set_system(&database, unknown, None);
+            let strong = || {
+                verified(
+                    "no-intro-nes",
+                    DatEcosystem::NoIntro,
+                    Some("20240501"),
+                    "The Legend of Zelda (USA) (Rev 1)",
+                    DatAuditCompleteness::Exhaustive,
+                )
+            };
+            let with_state = |state: DatVerificationState| {
+                let mut p = strong();
+                p.verification_state = state;
+                p
+            };
+            let miss = || no_match("no-intro-nes", DatAuditCompleteness::Exhaustive);
+            let refused = |outcome: LibraryDatIdentityPersistOutcome| {
+                matches!(
+                    outcome,
+                    LibraryDatIdentityPersistOutcome::RefusedPlatform(_)
+                )
+            };
+            let mut save = |id, p: &PersistedLibraryDatIdentity| {
+                database.persist_library_dat_identity(id, p).unwrap()
+            };
+
+            // Known compatible system: saved, match or not.
+            assert_eq!(
+                save(nes, &strong()),
+                LibraryDatIdentityPersistOutcome::Inserted
+            );
+            assert_eq!(
+                save(nes, &miss()),
+                LibraryDatIdentityPersistOutcome::Updated
+            );
+            // Known system conflicting with the catalogue: refused either way.
+            assert!(refused(save(gba, &strong())));
+            assert!(refused(save(gba, &miss())));
+            // No system, no match: no negative evidence.
+            assert!(refused(save(unknown, &miss())));
+            // No system, weak evidence: CRC-only, filename-only, conflicting.
+            assert!(refused(save(
+                unknown,
+                &with_state(DatVerificationState::Probable)
+            )));
+            assert!(refused(save(
+                unknown,
+                &with_state(DatVerificationState::FilenameOnlyNotVerified)
+            )));
+            assert!(refused(save(
+                unknown,
+                &with_state(DatVerificationState::Conflicting {
+                    detail: "sizes differ".into()
+                })
+            )));
+            // A "single match" whose hash is only CRC32 is not strong either.
+            assert!(refused(save(
+                unknown,
+                &with_state(DatVerificationState::VerifiedSingleMatch {
+                    algorithm: "CRC32".into()
+                })
+            )));
+            // No system, several exact matches: never one picked.
+            assert!(refused(save(
+                unknown,
+                &with_state(DatVerificationState::AmbiguousMultipleCandidates {
+                    algorithm: "SHA-1".into(),
+                    candidate_count: 2,
+                })
+            )));
+            let mut two_entries = strong();
+            two_entries
+                .matched_entries
+                .push(two_entries.matched_entries[0].clone());
+            two_entries.matched_entries[1].game_name = "Another Game (Japan)".into();
+            assert!(refused(save(unknown, &two_entries)));
+            let mut with_candidates = strong();
+            with_candidates.ambiguous_candidates = vec!["Another Game (Japan)".into()];
+            assert!(refused(save(unknown, &with_candidates)));
+            // No system, strong unambiguous exact match: not on this route.
+            // Only the identity-and-platform save may identify a system,
+            // assigning it in the same transaction first (tested with it).
+            assert!(refused(save(unknown, &strong())));
+
+            // Catalogue mappings, for a game on a known system (NES).
+            let from = |id: &str, names: &[&str], configured: Option<&str>, eco| {
+                let mut p = strong();
+                p.source.source_id = id.into();
+                p.source.ecosystem = eco;
+                p.source.catalogue_names = names.iter().map(|n| n.to_string()).collect();
+                p.source.configured_platform = configured.map(str::to_string);
+                p
+            };
+            let nes_header = "Nintendo - Nintendo Entertainment System";
+            let gba_header = "Nintendo - Game Boy Advance";
+            // A header naming no system, assigned to the NES when configured.
+            assert_eq!(
+                save(
+                    nes,
+                    &from(
+                        "assigned",
+                        &["Homebrew list"],
+                        Some("NES"),
+                        Some(DatEcosystem::Tosec)
+                    )
+                ),
+                LibraryDatIdentityPersistOutcome::Inserted
+            );
+            // The same header with nothing mapping it: refused, never let
+            // through for want of a mapping.
+            assert!(refused(save(
+                nes,
+                &from(
+                    "unmapped",
+                    &["Homebrew list"],
+                    None,
+                    Some(DatEcosystem::Tosec)
+                )
+            )));
+            // Assigned system and header disagree.
+            assert!(refused(save(
+                nes,
+                &from(
+                    "disagree",
+                    &[gba_header],
+                    Some("NES"),
+                    Some(DatEcosystem::NoIntro)
+                )
+            )));
+            // A header deliberately naming several systems, among them NES.
+            assert_eq!(
+                save(
+                    nes,
+                    &from(
+                        "several",
+                        &[nes_header, gba_header],
+                        None,
+                        Some(DatEcosystem::NoIntro)
+                    )
+                ),
+                LibraryDatIdentityPersistOutcome::Inserted
+            );
+            // An unassigned MAME catalogue names arcade machines: it speaks
+            // for the arcade systems only (owner decision 2026-11-26).
+            assert!(refused(save(
+                nes,
+                &from("mame", &["MAME"], None, Some(DatEcosystem::MAMEArcade))
+            )));
+            // A "no match" still needs the header itself to be for the game.
+            let mut assigned_miss = miss();
+            assigned_miss.source.source_id = "assigned-miss".into();
+            assigned_miss.source.catalogue_names = vec!["Homebrew list".into()];
+            assigned_miss.source.configured_platform = Some("NES".into());
+            assert!(refused(save(nes, &assigned_miss)));
+
+            for (id, source) in [
+                (gba, "no-intro-nes"),
+                (unknown, "no-intro-nes"),
+                (nes, "unmapped"),
+                (nes, "disagree"),
+                (nes, "assigned-miss"),
+                (nes, "mame"),
+            ] {
+                assert!(
+                    database
+                        .library_dat_identity_for_item(id, source)
+                        .unwrap()
+                        .is_none(),
+                    "{id} {source}"
+                );
+            }
+            drop(root);
+        }
+
+        #[test]
+        fn only_sha256_or_sha1_on_every_file_identifies_a_system() {
+            use crate::dat::identity::identifies_by_strong_hash as strong;
+            assert!(strong("SHA-256") && strong("SHA-1") && strong("SHA-256/SHA-1"));
+            assert!(!strong("MD5") && !strong("SHA-1/MD5") && !strong("SHA-256/SHA-1/MD5"));
+            assert!(!strong("CRC32") && !strong("CRC32+size") && !strong(""));
         }
 
         #[test]
@@ -22733,6 +23502,8 @@ echo "$out"
             // Arcade-set.
             let (root, mut database) = open("managed-update-stales-own-source");
             let archive_id = seed_archive(&database, "SNK.zip");
+            // A Neo Geo set, the system both of its catalogues speak for.
+            set_system(&database, archive_id, Some("NeoGeo"));
             database
                 .persist_library_dat_identity(
                     archive_id,
@@ -22869,6 +23640,8 @@ echo "$out"
             // confirming the row is untouched.
             let (root, database) = open("managed-update-failed-marks-nothing");
             let archive_id = seed_archive(&database, "Untouched.zip");
+            // A Neo Geo set, the system both of its catalogues speak for.
+            set_system(&database, archive_id, Some("NeoGeo"));
             let mut database = database;
             database
                 .persist_library_dat_identity(
@@ -22907,28 +23680,36 @@ echo "$out"
         fn different_dat_sources_stay_isolated_and_are_all_returned() {
             let (root, mut database) = open("persist-multi-source");
             let archive_id = seed_archive(&database, "Multi.zip");
+            // An arcade set: unassigned MAME and FBNeo catalogues speak for
+            // its system, and the No-Intro and Redump lists here were
+            // configured for it.
+            set_system(&database, archive_id, Some("Arcade"));
+            let for_arcade = |mut p: PersistedLibraryDatIdentity| {
+                p.source.configured_platform = Some("Arcade".into());
+                p
+            };
             database
                 .persist_library_dat_identity(
                     archive_id,
-                    &verified(
+                    &for_arcade(verified(
                         "no-intro",
                         DatEcosystem::NoIntro,
                         Some("ni-1"),
                         "Game (No-Intro name)",
                         DatAuditCompleteness::Exhaustive,
-                    ),
+                    )),
                 )
                 .unwrap();
             database
                 .persist_library_dat_identity(
                     archive_id,
-                    &verified(
+                    &for_arcade(verified(
                         "redump",
                         DatEcosystem::Redump,
                         Some("rd-9"),
                         "Game (Redump name)",
                         DatAuditCompleteness::Exhaustive,
-                    ),
+                    )),
                 )
                 .unwrap();
             // A MAME and an FBNeo result for the same item stay separate too.
@@ -23089,7 +23870,7 @@ echo "$out"
                 .persist_library_dat_identity(
                     archive_id,
                     &verified(
-                        "no-intro",
+                        "no-intro-nes",
                         DatEcosystem::NoIntro,
                         Some("v1"),
                         "Verified Game",
@@ -23103,14 +23884,14 @@ echo "$out"
             let outcome = database
                 .persist_library_dat_identity(
                     archive_id,
-                    &no_match("no-intro", DatAuditCompleteness::Partial),
+                    &no_match("no-intro-nes", DatAuditCompleteness::Partial),
                 )
                 .unwrap();
             assert_eq!(
                 outcome,
                 LibraryDatIdentityPersistOutcome::SkippedProtectedPriorResult
             );
-            let still_verified = summary_for(&database, archive_id, "no-intro");
+            let still_verified = summary_for(&database, archive_id, "no-intro-nes");
             assert!(still_verified.is_verified());
             assert_eq!(
                 still_verified.canonical.canonical_dat_name.as_deref(),
@@ -23121,11 +23902,11 @@ echo "$out"
             let outcome = database
                 .persist_library_dat_identity(
                     archive_id,
-                    &no_match("no-intro", DatAuditCompleteness::Exhaustive),
+                    &no_match("no-intro-nes", DatAuditCompleteness::Exhaustive),
                 )
                 .unwrap();
             assert_eq!(outcome, LibraryDatIdentityPersistOutcome::Updated);
-            assert!(summary_for(&database, archive_id, "no-intro").is_no_match());
+            assert!(summary_for(&database, archive_id, "no-intro-nes").is_no_match());
 
             database.close().unwrap();
             let _ = fs::remove_dir_all(&root);
@@ -23255,20 +24036,27 @@ echo "$out"
             assert_eq!(database.schema_version().unwrap(), latest_schema_version());
             // Prior data preserved.
             assert_eq!(database.load_archives().unwrap().len(), 1);
-            // New table is usable.
+            // New table is usable, by a catalogue configured for the system
+            // the upgraded game already has.
             let archive_id = 1;
-            database
-                .persist_library_dat_identity(
-                    archive_id,
-                    &verified(
-                        "no-intro",
-                        DatEcosystem::NoIntro,
-                        Some("v1"),
-                        "Upgraded Game",
-                        DatAuditCompleteness::Exhaustive,
-                    ),
-                )
-                .unwrap();
+            let system = database
+                .current_platform_for_archive(archive_id)
+                .unwrap()
+                .expect("the representative older game keeps its system");
+            let mut upgraded = verified(
+                "no-intro",
+                DatEcosystem::NoIntro,
+                Some("v1"),
+                "Upgraded Game",
+                DatAuditCompleteness::Exhaustive,
+            );
+            upgraded.source.configured_platform = Some(system);
+            assert_eq!(
+                database
+                    .persist_library_dat_identity(archive_id, &upgraded)
+                    .unwrap(),
+                LibraryDatIdentityPersistOutcome::Inserted
+            );
             assert!(summary_for(&database, archive_id, "no-intro").is_verified());
 
             database.close().unwrap();

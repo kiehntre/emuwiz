@@ -610,3 +610,58 @@ fn c16_and_plus4_catalogues_are_recognised_for_the_ted_machines_never_the_c64() 
     assert!(plus4.is_for("Commodore 16"));
     assert!(!plus4.is_for("Commodore 64"));
 }
+
+/// Independent review F4 (2026-11-26): Check Games admits a catalogue with
+/// `recognise_catalogue`, and the save guard reads the same header with
+/// `dat_platform_from_catalogue_names`. Where both name a system they must
+/// name the same one, or every result Check Games produces would be refused
+/// as "assigned system and header disagree". Checked for every real header
+/// in `header_samples.txt` and every header literal in these tests.
+#[test]
+fn recognisers_agree_on_every_known_header() {
+    use crate::dat::identity::{DatPlatformIdentity, dat_platform_from_catalogue_names};
+    let mut headers: Vec<String> = include_str!("header_samples.txt")
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    let source = include_str!("tests.rs");
+    for literal in source.split('"').skip(1).step_by(2) {
+        if literal.contains(" - ") && !literal.contains('{') && !literal.contains('\\') {
+            headers.push(literal.to_string());
+        }
+    }
+    assert!(headers.len() > 300, "{}", headers.len());
+    let mut disagreements = Vec::new();
+    for header in &headers {
+        for ecosystem in [
+            DatEcosystem::NoIntro,
+            DatEcosystem::Redump,
+            DatEcosystem::Tosec,
+            DatEcosystem::GenericLogiqx,
+        ] {
+            let admitted = recognise_catalogue(Some(header), Some(ecosystem));
+            let Some(admitted) = admitted.platform() else {
+                continue;
+            };
+            match dat_platform_from_catalogue_names(std::slice::from_ref(header), Some(ecosystem)) {
+                DatPlatformIdentity::Resolved { platform, .. }
+                    if !same_platform(admitted, &platform) =>
+                {
+                    disagreements.push(format!(
+                        "{header} ({ecosystem:?}): admitted {admitted}, guard {platform}"
+                    ));
+                }
+                DatPlatformIdentity::Ambiguous { candidates, .. }
+                    if !candidates
+                        .iter()
+                        .any(|c| same_platform(admitted, &c.platform)) =>
+                {
+                    disagreements.push(format!("{header} ({ecosystem:?}): admitted {admitted}, guard ambiguous {candidates:?}"));
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(disagreements.is_empty(), "{}", disagreements.join("\n"));
+}

@@ -1,0 +1,320 @@
+# Real catalogue header names (staged No-Intro/Redump/TOSEC DATs, 2026-11-26), one per line.
+# Used by recognisers_agree_on_every_known_header; add a header here when a new catalogue family appears.
+3DO 3DO Interactive Multiplayer - Applications - [IMG]
+3DO 3DO Interactive Multiplayer - Applications - [ISO]
+3DO 3DO Interactive Multiplayer - Bonus Discs
+3DO 3DO Interactive Multiplayer - Coverdiscs - [IMG]
+3DO 3DO Interactive Multiplayer - Coverdiscs - [ISO]
+3DO 3DO Interactive Multiplayer - Educational - [IMG]
+3DO 3DO Interactive Multiplayer - Educational - [ISO]
+3DO 3DO Interactive Multiplayer - Firmware
+3DO 3DO Interactive Multiplayer - Games
+3DO 3DO Interactive Multiplayer - Homebrew - Applications
+3DO 3DO Interactive Multiplayer - Homebrew - Compilations
+3DO 3DO Interactive Multiplayer - Homebrew - Demos
+3DO 3DO Interactive Multiplayer - Homebrew - Games
+3DO 3DO Interactive Multiplayer - Multimedia
+3DO 3DO Interactive Multiplayer - Samplers
+Acorn Archimedes - CD - Applications
+Acorn Archimedes - CD - Compilations
+Acorn Archimedes - CD - Coverdiscs
+American Laser Games CD-ROM System - Games
+Amstrad CPC - Games - [DSK]
+Apple II - Games - [2MG]
+Apple II - Games - [DSK]
+Apple IIGS - Games - [2MG]
+Apple Macintosh - CD - Applications - [BIN]
+Apple Macintosh - CD - Coverdiscs
+Apple Macintosh - CD - Educational
+Apple Macintosh - CD - Games - [BIN]
+Apple Macintosh - CD - Multimedia
+Apple Macintosh - DVD - Applications
+Apple Macintosh - DVD - Coverdiscs
+Atari Jaguar CD - Bonus Discs
+Atari Jaguar CD - Games
+Atari Jaguar CD - Homebrew - Compilations - Games
+Atari Jaguar CD - Homebrew - Games - [BIN]
+Atari Jaguar CD - Homebrew - Games - [CDI]
+Atari Jaguar CD - Homebrew - Games - [NRG]
+Atari Jaguar CD - Samplers
+Atari ST - Games - [STX]
+Bandai Pippin @World & Pippin Atmark - Applications
+Bandai Pippin @World & Pippin Atmark - Multimedia
+Bandai Playdia - Educational - [IMG]
+Bandai Playdia - Educational - [ISO]
+Bandai Playdia - Games - [IMG]
+Bandai Playdia - Games - [ISO]
+Capcom CP System III - Games
+Commodore - Amiga CD32
+Commodore Amiga CD32 - Applications
+Commodore Amiga CD32 - Compilations - [IMG]
+Commodore Amiga CD32 - Compilations - [ISO]
+Commodore Amiga CD32 - Coverdiscs - [BIN]
+Commodore Amiga CD32 - Coverdiscs - [IMG]
+Commodore Amiga CD32 - Coverdiscs - [ISO]
+Commodore Amiga CD32 - Demos
+Commodore Amiga CD32 - Educational - [IMG]
+Commodore Amiga CD32 - Educational - [ISO]
+Commodore Amiga CD32 - Games - [BIN]
+Commodore Amiga CD32 - Games - [IMG]
+Commodore Amiga CD32 - Games - [ISO]
+Commodore Amiga CD32 - Homebrew - Compilations - [BIN]
+Commodore Amiga CD32 - Homebrew - Compilations - [IMG]
+Commodore Amiga CD32 - Homebrew - Compilations - [ISO]
+Commodore Amiga CD32 - Homebrew - Compilations - [Multipart]
+Commodore Amiga CD32 - Homebrew - Compilations - [NRG]
+Commodore Amiga CD32 - Homebrew - Games - [BIN]
+Commodore Amiga CD32 - Homebrew - Games - [IMG]
+Commodore Amiga CD32 - Homebrew - Games - [ISO]
+Commodore Amiga CD32 - Homebrew - Games - [NRG]
+Commodore Amiga CD32 - Homebrew - Multimedia
+Commodore Amiga CD32 - Multimedia - [IMG]
+Commodore Amiga CD32 - Multimedia - [ISO]
+Commodore Amiga CD32 - Samplers
+Commodore Amiga - CD - Applications - [IMG]
+Commodore Amiga - CD - Applications - [ISO]
+Commodore Amiga - CD - Compilations - [BIN]
+Commodore Amiga - CD - Compilations - [IMG]
+Commodore Amiga - CD - Compilations - [ISO]
+Commodore Amiga - CD - Coverdiscs - [BIN]
+Commodore Amiga - CD - Coverdiscs - [ISO]
+Commodore Amiga - CD - Games - [BIN]
+Commodore Amiga - CD - Games - [IMG]
+Commodore Amiga - CD - Games - [ISO]
+Commodore Amiga - CD - Games - [MDF]
+Commodore Amiga - CD - Homebrew - [IMG]
+Commodore Amiga - CD - Multimedia - [IMG]
+Commodore Amiga - CD - Multimedia - [ISO]
+Commodore Amiga - CD - Operating Systems - [BIN]
+Commodore Amiga - CD - Operating Systems - [IMG]
+Commodore Amiga - CD - Operating Systems - [ISO]
+Commodore Amiga CDTV - Applications - [IMG]
+Commodore Amiga CDTV - Applications - [ISO]
+Commodore Amiga CDTV - Compilations - [IMG]
+Commodore Amiga CDTV - Compilations - [ISO]
+Commodore Amiga CDTV - Educational - [IMG]
+Commodore Amiga CDTV - Educational - [ISO]
+Commodore Amiga CDTV - Entertainment
+Commodore Amiga CDTV - Games - [BIN]
+Commodore Amiga CDTV - Games - [IMG]
+Commodore Amiga CDTV - Games - [ISO]
+Commodore Amiga CDTV - Games - [MDF]
+Commodore Amiga CDTV - Homebrew - Compilations - [IMG]
+Commodore Amiga CDTV - Homebrew - Compilations - [ISO]
+Commodore Amiga CDTV - Homebrew - Games - [BIN]
+Commodore Amiga CDTV - Homebrew - Games - [ISO]
+Commodore Amiga CDTV - Multimedia - [IMG]
+Commodore Amiga CDTV - Multimedia - [ISO]
+Commodore Amiga CDTV - Samplers - [IMG]
+Commodore Amiga CDTV - Samplers - [ISO]
+Commodore C64 - CD - Compilations - [ISO]
+Fujitsu FM Towns - CD - Applications
+Fujitsu FM Towns - CD - Compilations
+Fujitsu FM Towns - CD - Demos
+Fujitsu FM Towns - CD - Games
+Fujitsu FM Towns - CD - Homebrew - Demos
+Fujitsu FM Towns - CD - Homebrew - Games
+Fujitsu FM Towns - CD - Operating Systems
+IBM PC Compatibles - CD - Applications - [BIN]
+IBM PC Compatibles - CD - Applications - [ISO]
+IBM PC Compatibles - CD - Bonus Discs
+IBM PC Compatibles - CD - Compilations - [BIN]
+IBM PC Compatibles - CD - Compilations - [ISO]
+IBM PC Compatibles - CD - Coverdiscs - [BIN]
+IBM PC Compatibles - CD - Coverdiscs - [ISO]
+IBM PC Compatibles - CD - Educational - [BIN]
+IBM PC Compatibles - CD - Educational - [ISO]
+IBM PC Compatibles - CD - Games - [BIN]
+IBM PC Compatibles - CD - Games - [ISO]
+IBM PC Compatibles - CD - Multimedia - [BIN]
+IBM PC Compatibles - CD - Multimedia - [ISO]
+IBM PC Compatibles - CD - Operating Systems - [BIN]
+IBM PC Compatibles - CD - Operating Systems - [ISO]
+IBM PC Compatibles - CD - Samplers - [BIN]
+IBM PC Compatibles - CD - Samplers - [ISO]
+IBM PC Compatibles - DVD - Applications
+IBM PC Compatibles - DVD - Bonus Discs
+IBM PC Compatibles - DVD - Coverdiscs
+IBM PC Compatibles - DVD - Educational
+IBM PC Compatibles - DVD - Games
+IBM PC Compatibles - DVD - Multimedia
+IBM PC Compatibles - DVD - Operating Systems
+IBM PC Compatibles - DVD - Samplers
+Incredible Technologies Eagle - CD - Games
+Konami Bemani System 573 Analog - Games
+Konami Bemani System 573 Digital - Games
+Konami System 573 - Games
+Mattel HyperScan - Games
+Memorex Video Information System - Educational
+Memorex Video Information System - Games
+Memorex Video Information System - Multimedia
+Memorex Video Information System - Samplers
+Microsoft Xbox 360 - Coverdiscs
+Microsoft Xbox 360 - Samplers
+Microsoft Xbox - Demos - [XBE]
+Microsoft Xbox - Homebrew - Games - [ISO]
+Microsoft Xbox - Homebrew - Games - [XBE]
+MSX MSX2+ - Games
+MSX MSX2 - Games - [DSK]
+Multi-format - DVD - Games
+Multi-format - DVD - Video
+Namco-Sega-Nintendo Triforce - Applications
+Namco-Sega-Nintendo Triforce - Games
+NEC PC-Engine CD & TurboGrafx-16 CD - Applications
+NEC PC-Engine CD & TurboGrafx-16 CD - Compilations
+NEC PC-Engine CD & TurboGrafx-16 CD - Educational
+NEC PC-Engine CD & TurboGrafx-16 CD - Games - [BIN]
+NEC PC-Engine CD & TurboGrafx-16 CD - Games - [IMG]
+NEC PC-Engine CD & TurboGrafx-16 CD - Games - [ISO]
+NEC PC-Engine CD & TurboGrafx-16 CD - Homebrew - Applications
+NEC PC-Engine CD & TurboGrafx-16 CD - Homebrew - Games
+NEC PC-Engine CD & TurboGrafx-16 CD - Multimedia
+NEC PC-Engine CD & TurboGrafx-16 CD - Samplers - [BIN]
+NEC PC-Engine CD & TurboGrafx-16 CD - Samplers - [IMG]
+NEC - PC Engine CD & TurboGrafx CD
+NEC PC-FX - Applications - [BIN]
+NEC PC-FX - Demos - [BIN]
+NEC PC-FX - Firmware
+NEC PC-FXGA - Firmware
+NEC PC-FXGA - Games
+NEC PC-FX - Games
+Nintendo Famicom Disk System - Games - [FDS]
+Nintendo - Family Computer Disk System (FDS)
+Nintendo - GameCube
+Nintendo GameCube - Applications
+Nintendo GameCube - Compilations
+Nintendo GameCube - Games
+Nintendo GameCube - Samplers
+Nintendo - Nintendo DS (Download Play)
+Nintendo - Nintendo DSi (Decrypted)
+Nintendo - Nintendo DSi (Digital)
+Nintendo Super Famicom & Super Entertainment System - Voicer-kun Audio CDs
+Philips CD-i - Applications
+Philips CD-i - Bonus Discs
+Philips CD-i - Coverdiscs
+Philips CD-i - Educational
+Philips CD-i - Firmware
+Philips CD-i - Games
+Philips CD-i - Homebrew - Demos
+Philips CD-i - Homebrew - Games - [BIN]
+Philips CD-i - Homebrew - Games - [NRG]
+Philips CD-i - Multimedia
+Philips CD-i - Samplers
+Sega 32X - CD - Games - [BIN-CUE]
+Sega 32X - CD - Games - [IMG]
+Sega 32X - CD - Games - [ISO]
+Sega Chihiro - Games
+Sega Dreamcast - Applications - [BIN]
+Sega Dreamcast - Applications - [CDI]
+Sega Dreamcast - Applications - Dev Builds - [BIN]
+Sega Dreamcast - Applications - [ISO]
+Sega Dreamcast - Demos - [BIN]
+Sega Dreamcast - Demos - [CDI]
+Sega Dreamcast - Demos - [ISO]
+Sega Dreamcast - Firmware
+Sega Dreamcast - Games - [CDI]
+Sega Dreamcast - Games - Dev Builds - [BIN]
+Sega Dreamcast - Games - Dev Builds - [CDI]
+Sega Dreamcast - Games - Dev Builds - [ISO]
+Sega Dreamcast - Games - Dev Builds - [NRG]
+Sega Dreamcast - Games - JP
+Sega Dreamcast - Games - PAL
+Sega Dreamcast - Games - US
+Sega Dreamcast - Homebrew - Applications - [CDI]
+Sega Dreamcast - Homebrew - Compilations - [CDI]
+Sega Dreamcast - Homebrew - Demos - [BIN]
+Sega Dreamcast - Homebrew - Demos - [CDI]
+Sega Dreamcast - Homebrew - Demos - [ELF]
+Sega Dreamcast - Homebrew - Demos - [Multipart]
+Sega Dreamcast - Homebrew - Demos - [NRG]
+Sega Dreamcast - Homebrew - Games - [CDI]
+Sega Dreamcast - Homebrew - Games - [GDI]
+Sega Dreamcast - Homebrew - Games - [MDF-MDS]
+Sega Dreamcast - Multimedia - [BIN]
+Sega Dreamcast - Multimedia - [CDI]
+Sega Dreamcast - Samplers - [BIN]
+Sega Dreamcast - Samplers - [CDI]
+Sega Dreamcast - Various Unverified Dumps
+Sega Mega-CD & Sega CD - CD - Applications
+Sega Mega-CD & Sega CD - CD - Bonus Discs - [IMG]
+Sega Mega-CD & Sega CD - CD - Bonus Discs - [ISO]
+Sega Mega-CD & Sega CD - CD - Educational - [IMG]
+Sega Mega-CD & Sega CD - CD - Educational - [ISO]
+Sega Mega-CD & Sega CD - CD - Games - [IMG]
+Sega Mega-CD & Sega CD - CD - Games - [ISO]
+Sega Mega-CD & Sega CD - CD - Multimedia - [IMG]
+Sega Mega-CD & Sega CD - CD - Multimedia - [ISO]
+Sega Mega-CD & Sega CD - CD - Samplers - [IMG]
+Sega Mega-CD & Sega CD - CD - Samplers - [ISO]
+Sega Mega-CD & Sega CD - Homebrew - Applications
+Sega Mega-CD & Sega CD - Homebrew - Demos
+Sega Mega-CD & Sega CD - Homebrew - Games
+Sega NAOMI 2 - Games
+Sega NAOMI - Applications
+Sega NAOMI - Games
+Sega Saturn - Applications
+Sega Saturn - Bonus Discs
+Sega Saturn - Firmware
+Sega Saturn - Games - [BIN]
+Sega Saturn - Games - [ISO]
+Sega Saturn - Homebrew - Games - [ISO]
+Sega Saturn - Multimedia
+Sega Saturn - Samplers
+Sega WonderMega - CD - Educational - [IMG]
+Sega WonderMega - CD - Educational - [ISO]
+Sega WonderMega - CD - Games
+Sega WonderMega - CD - Samplers
+Sinclair ZX Spectrum - CD - Compilations
+SNK Hyper Neo-Geo 64 - CD - Multimedia
+SNK - Neo Geo CD
+SNK Neo-Geo CD - Bonus Discs
+SNK Neo-Geo CD - Demos
+SNK Neo-Geo CD - Firmware
+SNK Neo-Geo CD - Games - [IMG]
+SNK Neo-Geo CD - Games - [ISO]
+SNK Neo-Geo CD - Games - [Multipart]
+SNK Neo-Geo CD - Multimedia - [IMG]
+SNK Neo-Geo CD - Multimedia - [ISO]
+SNK Neo-Geo CD - Samplers - [IMG]
+SNK Neo-Geo CD - Samplers - [ISO]
+SNK Neo-Geo CD - Samplers - [Multipart]
+Sony - PlayStation
+Sony PlayStation 2 - Applications - PAL
+Sony PlayStation 2 - Applications - US
+Sony PlayStation 2 - Coverdiscs - PAL - [ISO]
+Sony PlayStation 2 - Coverdiscs - US - [ISO]
+Sony PlayStation 2 - Demos
+Sony PlayStation 2 - Firmware
+Sony PlayStation 2 - Games - JP - [ISO]
+Sony PlayStation 2 - Games - PAL - [ISO]
+Sony PlayStation 2 - Homebrew - Games - [ELF]
+Sony PlayStation 2 - Homebrew - Games - [ISO]
+Sony PlayStation 2 - Samplers - [ISO]
+Sony PlayStation - Applications
+Sony PlayStation - Coverdiscs
+Sony PlayStation - Demos - [BIN]
+Sony PlayStation - Demos - [BIN-CUE]
+Sony PlayStation - Demos - [EXE]
+Sony PlayStation - Demos - [ISO]
+Sony PlayStation - Demos - [Multipart]
+Sony PlayStation - Demos - [PSX]
+Sony PlayStation - Firmware
+Sony PlayStation - Games - [BIN]
+Sony PlayStation - Games - [EXE]
+Sony PlayStation - Homebrew - Games - [BIN]
+Sony PlayStation - Homebrew - Games - [ISO]
+Sony - PlayStation Portable
+Sony PlayStation Portable - Applications - [ISO]
+Sony PlayStation Portable - Demos
+Sony PlayStation Portable - Firmware
+Sony PlayStation Portable - Games - [ISO]
+Sony PlayStation Portable - Homebrew - Games - [ISO]
+Sony PlayStation Portable - Homebrew - Games - [PBP]
+Sony PlayStation Portable - Samplers - [ISO]
+Sony PlayStation - Samplers - [BIN]
+Sony PlayStation - Samplers - [IMG]
+Sony PlayStation - Samplers - [ISO]
+Tomy KISS-Site - Games
+VM Labs Nuon - Games
+VTech V.Flash Home Edutainment System - Educational
+ZAPiT Games Game Wave Family Entertainment System - Games

@@ -297,7 +297,7 @@ fn a_later_contrary_identity_retires_the_saved_order() {
     let other = library.fixture.write(
         "other.dat",
         &format!(
-            r#"<?xml version="1.0"?><datafile><header><name>Other</name><version>7</version></header><game name="Orbit Quest (Europe) (Disc 1)"><rom name="x.bin" size="{}" sha1="{}"/></game></datafile>"#,
+            r#"<?xml version="1.0"?><datafile><header><name>Sony - PlayStation</name><version>7</version></header><game name="Orbit Quest (Europe) (Disc 1)"><rom name="x.bin" size="{}" sha1="{}"/></game></datafile>"#,
             format!("bytes of {}", ENTRIES[0].0).len(),
             ENTRIES[0].1
         ),

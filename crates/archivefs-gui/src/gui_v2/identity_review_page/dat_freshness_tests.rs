@@ -92,6 +92,16 @@ fn audited(managed: bool) -> (dat_exact_tests::Fixture, Catalogues) {
         .replace("Nintendo - Game Boy Color", "Sony - PlayStation")
         .replace("No-Intro", "Redump");
     std::fs::write(&dat, &body).unwrap();
+    // The catalogue is now PlayStation's, so the games are on PlayStation: a
+    // result is saved only where the catalogue speaks for the game's system.
+    rusqlite::Connection::open(&fixture.db)
+        .unwrap()
+        .execute_batch(
+            "UPDATE platform_assignments SET is_current = 0; \
+             INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at) \
+             SELECT id,'PSX','registry_detector',1,'now' FROM archives;",
+        )
+        .unwrap();
     if managed {
         install_managed(&fixture, &body);
     }

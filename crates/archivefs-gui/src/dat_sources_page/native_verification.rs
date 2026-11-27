@@ -298,6 +298,20 @@ impl Controller {
             )
             .clicked();
             ui.label(format!("{} selected · {} excluded (Not checked). ZIP/7z member sizes add decoded hashing work.",p.selected_games,p.exclusions.len()));
+            if let Some(why) = archivefs_core::dat::format_advice::nothing_eligible_explanation(p) {
+                ui.colored_label(ui.visuals().warn_fg_color, why);
+            }
+            for gap in archivefs_core::dat::format_advice::format_gaps(p) {
+                let format = if gap.extension.is_empty() {
+                    "no extension".to_owned()
+                } else {
+                    format!(".{}", gap.extension)
+                };
+                ui.label(format!(
+                    "{} {format} game(s) not in this catalogue's formats. {}",
+                    gap.games, gap.advice
+                ));
+            }
             ui.label(format!(
                 "Catalogue: {} · version {}",
                 p.catalogue_name,

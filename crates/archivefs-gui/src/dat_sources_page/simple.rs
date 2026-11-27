@@ -431,24 +431,31 @@ pub(super) fn show_with_inputs(
         }
         ui.ctx().request_repaint();
     }
-    for (index, error) in [
-        view.load_error.as_ref(),
-        view.action_error.as_ref(),
-        view.audit_error.as_ref(),
-        match &view.save_state {
-            DatSaveState::Failed(error) => Some(error),
-            _ => None,
-        },
-        ui_state.catalogue_picker.error.as_ref(),
+    const SETUP: &str = "EmuWiz could not finish reading or saving the setup. Your game files have not changed. Open Change setup, check the selected data and folder, then try again.";
+    // The check itself stopped: say so, not "the setup", and point at the
+    // reason (often that no file is in a format this catalogue lists).
+    const CHECK: &str = "The check stopped before it finished. Your game files have not changed. The details below say why. If no files could be checked, the preview says why: a file may be unavailable, or this catalogue may not list its format.";
+    for (index, (message, error)) in [
+        (SETUP, view.load_error.as_ref()),
+        (SETUP, view.action_error.as_ref()),
+        (CHECK, view.audit_error.as_ref()),
+        (
+            SETUP,
+            match &view.save_state {
+                DatSaveState::Failed(error) => Some(error),
+                _ => None,
+            },
+        ),
+        (SETUP, ui_state.catalogue_picker.error.as_ref()),
     ]
     .into_iter()
-    .flatten()
+    .filter_map(|(message, error)| error.map(|error| (message, error)))
     .enumerate()
     {
         widgets::banner(
             ui,
             "This check needs attention",
-            "EmuWiz could not finish reading or saving the setup. Your game files have not changed. Open Change setup, check the selected data and folder, then try again.",
+            message,
             widgets::StatusTone::Warning,
         );
         widgets::technical_details(ui, ("simple-error", index), |ui| {

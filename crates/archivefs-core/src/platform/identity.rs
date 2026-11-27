@@ -153,12 +153,41 @@ impl PlatformIdentityEvidence {
     ) -> Option<Self> {
         let candidate = outcome.platform.as_deref()?;
         let platform = platform_by_id(candidate)?;
+        // The catalogue's assigned system must not contradict its header
+        // (owner policy 2026-11-26): an assignment never overrides it.
+        let header = crate::dat::identity::dat_platform_from_catalogue_names(
+            &outcome.catalogue_names,
+            outcome.catalogue_ecosystem,
+        );
+        let agrees = |named: &str| {
+            named == platform.id
+                || crate::platform::equivalent_platform_ids(named).contains(&platform.id)
+        };
+        match &header {
+            crate::dat::identity::DatPlatformIdentity::Resolved {
+                platform: named, ..
+            } if !agrees(named) => {
+                return None;
+            }
+            crate::dat::identity::DatPlatformIdentity::Ambiguous { candidates }
+                if !candidates.iter().any(|c| agrees(&c.platform)) =>
+            {
+                return None;
+            }
+            _ => {}
+        }
         let entry = outcome.report.entries.iter().find(|entry| {
             Path::new(&entry.local_path) == local_path && entry.verdict.is_confident()
         })?;
+        // Only one exact catalogue entry, matched on SHA-256 or SHA-1 for
+        // every file, establishes a system: never one of several candidates,
+        // never MD5 alone (owner policy 2026-11-26).
         let algorithm = match &entry.verdict {
             AuditVerdict::Exact { algorithm, .. }
-            | AuditVerdict::ExactMultipleCandidates { algorithm, .. } => *algorithm,
+                if crate::dat::identity::identifies_by_strong_hash(algorithm) =>
+            {
+                *algorithm
+            }
             _ => return None,
         };
         // A CUE sheet's own match is not the disc: only a disc verified as

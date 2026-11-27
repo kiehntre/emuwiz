@@ -15,6 +15,26 @@ guessing at intent, dates, or scope.
 
 Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
 
+- Check Games and DAT verification no longer keep results from another system's catalogue.
+  - A result is saved only when the catalogue is for the game's system.
+  - An unassigned MAME or FBNeo arcade catalogue counts only for arcade systems.
+  - A game with no system gets one only from a single exact SHA-1 or SHA-256 match from a complete
+    check, saved together with its result. If either cannot be saved, neither is kept.
+  - MD5 still verifies games already on the catalogue's system.
+  - Archive member names with apostrophes and other ordinary characters now verify.
+  - A catalogue that fits none of a set's files no longer stops a whole `dat recheck` set run. Real
+    read, database and integrity failures still stop it.
+  - Eligibility and missing-catalogue advice name the formats a game's system needs and say when the
+    catalogue checked does not list the game's format.
+  - Single-game Rename of a loose file is prefilled from its verified catalogue name, when that name
+    has the same file extension; archives keep their name.
+  - A game on a system guessed by the scanner that matches another system's catalogue exactly is
+    listed as a proposed correction, with its evidence. Nothing is changed until Platform
+    Corrections has a preview and Undo.
+  - Systems that are verified, read from the header or chosen by hand are listed for review and
+    never changed.
+  - Commodore CD32 and CDTV catalogue headers are recognised as those systems, not Amiga.
+  - Save messages give the actual reason a result was not saved.
 - New Blue page "Game recovery" (All Tools, Health & recovery; also a card on
   the game's own page) and `emuwiz-cli recovery`: for a game that cannot
   start, shows what is wrong with the evidence behind each finding, what
