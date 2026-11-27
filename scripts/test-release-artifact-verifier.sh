@@ -5,7 +5,23 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=scripts/release-common.sh
 source "$SCRIPT_DIR/release-common.sh"
 
-[[ $# -eq 1 ]] || release_die "usage: scripts/test-release-artifact-verifier.sh ARCHIVE.tar.xz"
+# --group 1 or --group 2 runs one half of the cases, for two parallel CI jobs on
+# the same downloaded artifact. Group 1 owns the cases named in GROUP_1_CASES;
+# group 2 owns every other case, so a new case cannot be left out. Without
+# --group every case runs, as before.
+GROUP=
+if [[ ${1-} == --group ]]; then
+    [[ ${2-} == 1 || ${2-} == 2 ]] || release_die "--group must be 1 or 2"
+    GROUP=$2
+    shift 2
+fi
+[[ $# -eq 1 ]] || release_die "usage: scripts/test-release-artifact-verifier.sh [--group 1|2] ARCHIVE.tar.xz"
+GROUP_1_CASES=" bad-checksum renamed-package missing-file modified-binary manifest-mismatch corrupted-metadata "
+in_group() {
+    [[ -z $GROUP ]] && return 0
+    if [[ $GROUP_1_CASES == *" $1 "* ]]; then [[ $GROUP == 1 ]]; else [[ $GROUP == 2 ]]; fi
+}
+RAN_CASES=()
 VALID_ARTIFACT=$1
 [[ -f "$VALID_ARTIFACT" ]] || release_die "archive not found: $VALID_ARTIFACT"
 [[ "$VALID_ARTIFACT" == *.tar.xz ]] || release_die "artifact must use the current .tar.xz format"
@@ -25,6 +41,7 @@ write_checksum() {
 
 expect_failure() {
     local label=$1
+    RAN_CASES+=("$label")
     local archive=$2
     local expected=$3
     local output="$TEMP_ROOT/$label.out"
@@ -37,17 +54,34 @@ expect_failure() {
     release_note "malformed artifact rejected: $label ($expected)"
 }
 
+if in_group bad-checksum; then
 mkdir -p "$TEMP_ROOT/bad-checksum"
 cp -- "$VALID_ARTIFACT" "$TEMP_ROOT/bad-checksum/$ARCHIVE_NAME"
 printf '%064d  %s\n' 0 "$ARCHIVE_NAME" >"$TEMP_ROOT/bad-checksum/$ARCHIVE_NAME.sha256"
 expect_failure bad-checksum "$TEMP_ROOT/bad-checksum/$ARCHIVE_NAME" "archive checksum mismatch"
+fi
+
+# The mutation cases this group owns, from the authoritative label list below.
+MUTATIONS=(
+    "missing-file|canonical payload files are missing: bin/emuwiz-cli"
+    "modified-binary|SHA-256 mismatch: bin/emuwiz"
+    "manifest-mismatch|manifest SHA-256 does not agree with SHA256SUMS"
+    "corrupted-metadata|manifest.json is unreadable"
+    "wrong-permissions|executable-mode mismatch: bin/emuwiz-cli"
+    "unexpected-member|unexpected payload files in strict mode: unexpected.txt"
+    "malformed-package|manifest.json is missing or unsafe"
+)
+SELECTED=()
+for label_and_reason in "${MUTATIONS[@]}"; do
+    in_group "${label_and_reason%%|*}" && SELECTED+=("${label_and_reason%%|*}")
+done
 
 # Build every malformed archive from the current release archive itself. This
 # keeps the fixture aligned with the package-release.py contract: PAX tar,
 # xz compression, one release directory, generated manifest/checksums, and
 # the current bin/docs/SBOM layout. The verifier remains the system under
 # test; this helper only performs controlled archive mutations.
-python3 - "$TEMP_ROOT" "$VALID_ARTIFACT" <<'PY'
+python3 - "$TEMP_ROOT" "$VALID_ARTIFACT" "${SELECTED[@]}" <<'PY'
 import concurrent.futures
 import copy
 import io
@@ -58,6 +92,7 @@ import tarfile
 
 output_root = pathlib.Path(sys.argv[1])
 source_archive = pathlib.Path(sys.argv[2])
+selected = set(sys.argv[3:])
 archive_name = source_archive.name
 
 with tarfile.open(source_archive, "r:xz") as source:
@@ -149,6 +184,14 @@ cases = [
     ("unexpected-member", unexpected_member),
     ("malformed-package", malformed_member),
 ]
+# Both lists must name the same cases, or one side would silently go untested.
+if {name for name, _ in cases} != {"missing-file", "modified-binary", "manifest-mismatch",
+        "corrupted-metadata", "wrong-permissions", "unexpected-member", "malformed-package"}:
+    raise SystemExit("mutation cases differ from the shell's MUTATIONS list")
+unknown = selected - {name for name, _ in cases}
+if unknown:
+    raise SystemExit(f"unknown mutation cases selected: {sorted(unknown)}")
+cases = [case for case in cases if case[0] in selected]
 with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as pool:
     for future in [pool.submit(write_case, name, mutation) for name, mutation in cases]:
         future.result()
@@ -160,15 +203,9 @@ if not any(member.name == f"{root_name}/install.sh" and member.isfile()
 
 PY
 
-for label_and_reason in \
-    "missing-file|canonical payload files are missing: bin/emuwiz-cli" \
-    "modified-binary|SHA-256 mismatch: bin/emuwiz" \
-    "manifest-mismatch|manifest SHA-256 does not agree with SHA256SUMS" \
-    "corrupted-metadata|manifest.json is unreadable" \
-    "wrong-permissions|executable-mode mismatch: bin/emuwiz-cli" \
-    "unexpected-member|unexpected payload files in strict mode: unexpected.txt" \
-    "malformed-package|manifest.json is missing or unsafe"; do
+for label_and_reason in "${MUTATIONS[@]}"; do
     label=${label_and_reason%%|*}
+    in_group "$label" || continue
     reason=${label_and_reason#*|}
     archive="$TEMP_ROOT/$label/$ARCHIVE_NAME"
     write_checksum "$archive"
@@ -179,10 +216,18 @@ done
 # extraction: the current verifier binds a checksum record to the exact
 # .tar.xz filename. This preserves the old renamed-package intent without
 # reintroducing the historical .tar.gz naming convention.
+if in_group renamed-package; then
 mkdir -p "$TEMP_ROOT/renamed-package"
 renamed="$TEMP_ROOT/renamed-package/emuwiz-renamed.tar.xz"
 cp -- "$VALID_ARTIFACT" "$renamed"
 cp -- "$VALID_ARTIFACT.sha256" "$renamed.sha256"
 expect_failure renamed-package "$renamed" "archive checksum file is invalid or names a different archive"
+fi
+
+# Each group must have run exactly its share: 6 in group 1, 3 in group 2, all 9 without --group.
+expected=$([[ $GROUP == 1 ]] && echo 6 || { [[ $GROUP == 2 ]] && echo 3 || echo 9; })
+((${#RAN_CASES[@]} == expected)) ||
+    release_die "verifier negative tests ran ${#RAN_CASES[@]} cases (${RAN_CASES[*]}), expected $expected"
+release_note "verifier negative cases run${GROUP:+ (group $GROUP)}: ${RAN_CASES[*]}"
 
 release_note "current tar.xz artifact verifier negative tests passed"

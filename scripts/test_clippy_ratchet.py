@@ -233,6 +233,9 @@ class WorkflowConditionTests(unittest.TestCase):
         self.assertIn("run: [1, 2]", build)
         self.assertIn('scripts/compare-release-builds.sh --run ${{ matrix.run }} --output-dir', build)
         self.assertNotIn("rust-cache", build)  # clean builds only
+        # Independent of the audit (it gives them nothing); the gate and the
+        # canonical candidate keep requiring it.
+        self.assertIn("    needs: [classify]\n", build)
         compare = job_block(self.workflow, "reproducibility")
         self.assertIn("needs: [classify, reproducibility-build]", compare)
         self.assertIn('scripts/compare-release-builds.sh --archives "${first[0]}" "${second[0]}"', compare)
