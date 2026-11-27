@@ -81,7 +81,7 @@ impl State {
         let cancel = self.cancel.clone();
         let (tx, rx) = mpsc::channel();
         self.job = Some(rx);
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let r = f(cancel);
             let _ = tx.send(r);
             ctx.request_repaint();

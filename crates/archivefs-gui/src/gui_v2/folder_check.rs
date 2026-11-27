@@ -365,7 +365,7 @@ impl State {
         self.cancel = Some(cancel.clone());
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = (|| {
                 let config = archivefs_core::Config::load_default().map_err(|e| e.to_string())?;
                 let trusted = archivefs_core::safe_read::TrustedRoots::from_paths(

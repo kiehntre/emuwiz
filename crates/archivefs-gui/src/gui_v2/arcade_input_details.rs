@@ -220,7 +220,7 @@ impl State {
         self.error = None;
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let usable = snapshot;
             let result = (|| {
                 let source_stamp = SourceStamp::observe(&catalogue_path).map_err(|_| {

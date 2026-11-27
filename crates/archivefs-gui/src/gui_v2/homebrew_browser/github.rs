@@ -21,7 +21,7 @@ pub(super) fn start(repository: String, context: &eframe::egui::Context) -> Pend
     let (tx, rx) = mpsc::channel();
     let context = context.clone();
     let name = repository.clone();
-    std::thread::spawn(move || {
+    crate::gui_v2::backend::spawn_worker(move || {
         let _ = tx.send(lookup(UreqGithubTransport::new(), &name));
         context.request_repaint();
     });

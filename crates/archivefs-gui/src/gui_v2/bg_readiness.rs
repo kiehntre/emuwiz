@@ -652,7 +652,7 @@ impl Scheduler {
         self.settled.insert(job.id, Outcome::Unknown);
         let (epoch, cancel, sender) = (self.epoch, Arc::clone(&self.cancel), self.sender.clone());
         let env = env.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let outcome = if cancel.load(Ordering::Relaxed) {
                 Outcome::Unknown
             } else {

@@ -547,7 +547,7 @@ impl RouteCache {
                 self.in_flight = true;
                 let (assessor, input) = (self.assessor, input.clone());
                 let paths = stamp_paths(plan);
-                std::thread::spawn(move || {
+                crate::gui_v2::backend::spawn_worker(move || {
                     let stamps = stamps_of(&paths);
                     let verdict =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| assessor(&input)))
@@ -560,7 +560,7 @@ impl RouteCache {
             } else if due {
                 self.in_flight = true;
                 let paths = stamp_paths(plan);
-                std::thread::spawn(move || {
+                crate::gui_v2::backend::spawn_worker(move || {
                     let _ = tx.send((generation, Done::Stamps(stamps_of(&paths))));
                     if let Some(context) = repaint {
                         context.request_repaint();

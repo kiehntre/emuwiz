@@ -214,7 +214,7 @@ impl SetupPortabilityState {
         self.worker = Some(receiver);
         self.status = None;
         self.error_detail = None;
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let _ = sender.send(work());
             context.request_repaint();
         });

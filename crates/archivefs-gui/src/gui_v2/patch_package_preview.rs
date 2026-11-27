@@ -42,7 +42,7 @@ impl State {
         let (tx, rx) = mpsc::channel();
         self.loading = Some(rx);
         let context = context.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let _ = tx.send(inspect(&path));
             context.request_repaint();
         });

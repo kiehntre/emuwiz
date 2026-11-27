@@ -569,7 +569,7 @@ impl State {
                 ..check
             },
         };
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = execute_checked(&reviewed, &options, &check, &mut |s| {
                 let _ = sender.send(Message::Stage(s.into()));
             });

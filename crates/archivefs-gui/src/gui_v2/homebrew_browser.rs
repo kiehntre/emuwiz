@@ -69,7 +69,7 @@ impl State {
         let (tx, rx) = mpsc::channel();
         self.loading = Some(rx);
         let context = context.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let source = format!("Local catalogue file {}", path.display());
             let result = entries_of(&LocalCatalogueProvider::from_path(&path), &source);
             let _ = tx.send(result);

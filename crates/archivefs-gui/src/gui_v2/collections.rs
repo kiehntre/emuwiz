@@ -362,7 +362,7 @@ fn start_worker(
 ) -> (mpsc::Sender<Job>, mpsc::Receiver<Answer>) {
     let (jobs, requests) = mpsc::channel();
     let (answers, results) = mpsc::channel();
-    std::thread::spawn(move || {
+    crate::gui_v2::backend::spawn_worker(move || {
         while let Ok(job) = requests.recv() {
             if answers.send(answer(&path, job)).is_err() {
                 break;

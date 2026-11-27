@@ -34,7 +34,7 @@ impl State {
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
         let context = context.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = (|| {
                 let views = archivefs_core::load_library_view_configs_default()
                     .map_err(|error| format!("Saved views could not be read: {error}"))?;

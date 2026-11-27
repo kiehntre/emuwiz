@@ -21,7 +21,7 @@ impl State {
         self.worker = Some(rx);
         let left = self.left.clone();
         let right = self.right.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result =
                 compare_cue_paths(std::path::Path::new(&left), std::path::Path::new(&right));
             let _ = tx.send(result);

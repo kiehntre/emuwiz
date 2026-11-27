@@ -345,7 +345,7 @@ impl State {
             sender,
             context,
         };
-        std::thread::spawn(move || job.run());
+        crate::gui_v2::backend::spawn_worker(move || job.run());
         self.entries.insert(
             id,
             Entry {

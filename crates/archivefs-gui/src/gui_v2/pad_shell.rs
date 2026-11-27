@@ -479,7 +479,7 @@ impl App {
         }
         let library = self.library.clone();
         let context = context.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let built = Arc::new(suggest::TitleIndex::build(
                 library.games.iter().map(|g| g.title.as_str()),
             ));

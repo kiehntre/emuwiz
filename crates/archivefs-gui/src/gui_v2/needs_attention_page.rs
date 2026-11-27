@@ -78,7 +78,7 @@ impl NeedsAttentionState {
             let (sender, receiver) = mpsc::channel();
             self.receiver = Some(receiver);
             let context = context.clone();
-            std::thread::spawn(move || {
+            crate::gui_v2::backend::spawn_worker(move || {
                 let _ = sender.send(crate::needs_attention::load_saved_snapshot());
                 context.request_repaint();
             });

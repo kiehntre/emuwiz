@@ -358,7 +358,7 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game: &Game) {
                 let (source, target, game) = (source.clone(), target.clone(), game.clone());
                 let (tx,rx) = mpsc::sync_channel(1);
                 panel.report = None; panel.error = None; panel.job = Some(rx);
-                std::thread::spawn(move || { let _ = tx.send(compare(&source, &target, &game)); });
+                crate::gui_v2::backend::spawn_worker(move || { let _ = tx.send(compare(&source, &target, &game)); });
             }
         });
         if panel.job.is_some() { ui.spinner(); ui.label("Checking observed save bytes…"); }

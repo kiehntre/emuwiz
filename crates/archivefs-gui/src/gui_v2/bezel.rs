@@ -189,7 +189,7 @@ impl BezelPanelState {
     fn refresh_catalogue(&mut self, ctx: &egui::Context) {
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = load_local_bezel_config().map(|config| {
                 let config = config.bounded();
                 let catalogue = discover_local_bezel_catalogue(&config);
@@ -282,7 +282,7 @@ impl BezelPanelState {
         };
         let (sender, receiver) = mpsc::channel();
         let worker_ctx = ctx.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = super::thumbnail::load_local(&path, &cache).map(|pixels| pixels.image);
             let _ = sender.send(result);
             worker_ctx.request_repaint();
@@ -361,7 +361,7 @@ impl BezelPanelState {
         };
         let (sender, receiver) = mpsc::channel();
         let worker_ctx = ctx.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let _ = sender.send(crate::launch_readiness_page::retroarch_bezel_identity(
                 &request,
             ));

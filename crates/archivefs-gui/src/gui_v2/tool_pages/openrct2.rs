@@ -58,7 +58,7 @@ impl State {
         self.checks.clear();
         self.dirs = dirs.clone();
         let context = context.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let _ = sender.send(discover_openrct2(&dirs));
             context.request_repaint();
         });
@@ -70,7 +70,7 @@ impl State {
         self.checks
             .insert(candidate.executable.clone(), Check::Running(receiver));
         let (dirs, context) = (self.dirs.clone(), context.clone());
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = check_openrct2(&candidate, &dirs, &*probe).map_err(|error| match error {
                 archivefs_core::launch::OpenRct2CheckError::Refused(why) => {
                     format!("Not checked: {why}. Refresh the list.")

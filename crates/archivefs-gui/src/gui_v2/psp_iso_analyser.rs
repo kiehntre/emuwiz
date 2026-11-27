@@ -127,7 +127,7 @@ impl Panel {
         self.report = None;
         self.error = None;
         let ctx = ctx.clone();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 analyze_psp_iso_report(&path, cancel)
             }))

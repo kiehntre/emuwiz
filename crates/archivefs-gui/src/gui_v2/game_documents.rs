@@ -141,7 +141,7 @@ impl DocumentRefresh {
         let (sender, requests) = mpsc::sync_channel::<RefreshRequest>(1);
         let (replies, receiver) = mpsc::channel();
         let (release, blocked) = mpsc::channel();
-        std::thread::spawn(move || {
+        crate::gui_v2::backend::spawn_worker(move || {
             if let Ok(request) = requests.recv()
                 && blocked.recv().is_ok()
             {

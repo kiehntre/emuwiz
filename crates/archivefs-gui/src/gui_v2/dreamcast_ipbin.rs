@@ -39,7 +39,7 @@ fn start(shared: SharedPanel, ctx: egui::Context, source: PathBuf, patch: Option
         }
         state.image.clone()
     };
-    std::thread::spawn(move || {
+    crate::gui_v2::backend::spawn_worker(move || {
         let result = match patch {
             Some(path) => expected
                 .as_ref()
