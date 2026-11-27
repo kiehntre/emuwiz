@@ -629,7 +629,6 @@ impl Database {
                 refused,
             });
         }
-        refused.sort_by_key(|r| r.archive_id);
         let stamp = now_utc_string();
         let mut records = Vec::new();
         for candidate in &ready {
@@ -752,6 +751,11 @@ fn content_still_matches(
     use std::io::Read;
     let hashes = &candidate.identity.audited_hashes;
     let (expected_sha256, expected_sha1) = (hashes.sha256.as_deref(), hashes.sha1.as_deref());
+    // A disc checked as a whole: every recorded disc file must still be the
+    // file that was hashed (the sheet alone is not the disc).
+    if !candidate.identity.disc_members_unchanged() {
+        return Err("a file of this disc changed since the preview, so it is not the disc the catalogue matched".into());
+    }
     if expected_sha256.is_none() && expected_sha1.is_none() {
         return Err("the check did not record a SHA-1 or SHA-256 of this file, so it cannot be compared again".into());
     }
@@ -1109,7 +1113,21 @@ fn record_state(
             "its previous system is no longer recorded".into(),
         ));
     }
+    if record.previous.id >= record.applied_assignment_id {
+        return Ok(RecordState::Changed(
+            "this receipt's systems are out of order, so it is not used".into(),
+        ));
+    }
     let result = result_row_by_id(conn, record.applied_result_id)?;
+    if result.as_ref().is_some_and(|r| {
+        r.field("archive_id") != Some(record.archive_id.to_string())
+            || r.field("dat_source_id").as_deref() != Some(receipt.catalogue.source_id.as_str())
+    }) {
+        return Ok(RecordState::Changed(
+            "the verification result this receipt names belongs to another game or catalogue"
+                .into(),
+        ));
+    }
     if result.map(|r| r.digest()) != Some(record.applied_result_digest.clone()) {
         return Ok(RecordState::Changed(
             "its verification result changed after the correction; Undo would overwrite that"
@@ -1388,6 +1406,14 @@ impl ResultRow {
         .map_err(|error| db_error("failed to read a verification result", error))
     }
 
+    /// One column's stored value (integers and text as written).
+    fn field(&self, name: &str) -> Option<String> {
+        self.columns
+            .iter()
+            .position(|c| c == name)
+            .and_then(|i| self.values[i].get(1).cloned())
+    }
+
     /// A row from a receipt is used only if its columns are exactly the
     /// table's, and it is the expected game's row for the expected catalogue.
     fn check_belongs(
@@ -1573,8 +1599,11 @@ impl Receipt {
     fn compute_seal(&self) -> String {
         let mut unsealed = self.clone();
         unsealed.seal = String::new();
-        let bytes = serde_json::to_vec(&unsealed).unwrap_or_default();
-        hex(&Sha256::digest(&bytes))
+        // Plain data always encodes; a failure gives a seal nothing matches.
+        match serde_json::to_vec(&unsealed) {
+            Ok(bytes) => hex(&Sha256::digest(&bytes)),
+            Err(_) => "unsealable".into(),
+        }
     }
 }
 

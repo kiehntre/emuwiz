@@ -327,7 +327,15 @@ impl PlatformCorrectionsState {
                 self.refresh(database);
             }
             WorkerResult::Applied(Err(error)) => {
-                self.status = Some((widgets::StatusTone::Blocked, error));
+                // An error is not proof nothing was saved (a commit can land
+                // and still report one): the library and receipts reload.
+                library_changed = true;
+                self.status = Some((
+                    widgets::StatusTone::Blocked,
+                    format!(
+                        "{error}. Check the list of corrections you can undo below: if any was saved, its Undo is there."
+                    ),
+                ));
                 self.refresh(database);
             }
             WorkerResult::Undone(Ok(undone)) => {
@@ -336,7 +344,12 @@ impl PlatformCorrectionsState {
                     .iter()
                     .map(|r| (r.archive_id, r.reason.clone()))
                     .collect();
-                if undone.undone.is_empty() {
+                if undone.undone.is_empty() && undone.refused.is_empty() {
+                    self.status = Some((
+                        widgets::StatusTone::Info,
+                        "Nothing left to undo: these corrections were already undone.".into(),
+                    ));
+                } else if undone.undone.is_empty() {
                     self.status = Some((
                         widgets::StatusTone::Warning,
                         "Nothing was undone: some games changed after the correction, and Undo never overwrites a later change.".into(),
@@ -358,6 +371,7 @@ impl PlatformCorrectionsState {
                 self.refresh(database);
             }
             WorkerResult::Undone(Err(error)) => {
+                library_changed = true;
                 self.offer_rest = None;
                 self.status = Some((widgets::StatusTone::Blocked, error));
                 self.refresh(database);
@@ -715,6 +729,34 @@ mod review_tests {
             state.offer_rest,
             Some(OfferRest::Undo { game: None, .. })
         ));
+    }
+
+    /// Review 2 C2: an Undo with nothing left says so (not "changed"); an
+    /// Apply or Undo that reports an error still reloads the library.
+    #[test]
+    fn undo_and_error_results_say_what_happened() {
+        let mut state = PlatformCorrectionsState::default();
+        let (sender, receiver) = channel();
+        state.worker = Some(receiver);
+        sender
+            .send(WorkerResult::Undone(Ok(PlatformCorrectionsUndone {
+                undone: Vec::new(),
+                refused: Vec::new(),
+            })))
+            .unwrap();
+        state.poll(None);
+        let status = state.status.clone().unwrap().1;
+        assert!(status.contains("Nothing left to undo"), "{status}");
+        for result in [
+            WorkerResult::Applied(Err("commit failed".into())),
+            WorkerResult::Undone(Err("commit failed".into())),
+        ] {
+            let (sender, receiver) = channel();
+            state.worker = Some(receiver);
+            sender.send(result).unwrap();
+            let (_, library_changed) = state.poll(None);
+            assert!(library_changed, "an error result reloads the library");
+        }
     }
 
     /// A new check drops the old preview but keeps the receipts (and an

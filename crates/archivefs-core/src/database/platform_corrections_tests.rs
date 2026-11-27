@@ -1193,3 +1193,74 @@ fn preview_age_fails_closed_and_the_library_path_is_compared_as_a_file() {
         .unwrap();
     assert_eq!(applied.corrected, vec![1]);
 }
+
+// --- review 2 (2026-11-27) ---------------------------------------------------
+
+/// C1: a receipt edited and sealed again to name another game's result is
+/// not used: that game's result is never deleted or overwritten.
+#[test]
+fn a_resealed_receipt_naming_another_games_result_is_not_used() {
+    let mut lib = Library::new();
+    let one = lib.game(1, "SNES", "folder_alias");
+    let two = lib.game(2, "SNES", "folder_alias");
+    let preview = lib.preview(vec![exact(&one, "SHA-1")]);
+    let receipt_path = lib
+        .db
+        .apply_platform_corrections(&preview, &[1], WhenSomeChanged::RefuseAll)
+        .unwrap()
+        .receipt_path
+        .unwrap();
+    let preview = lib.preview(vec![exact(&two, "SHA-1")]);
+    lib.db
+        .apply_platform_corrections(&preview, &[2], WhenSomeChanged::RefuseAll)
+        .unwrap();
+    let other = result_row(&lib.db.connection, 2, "nes").unwrap().unwrap();
+    let mut receipt = read_receipt(&receipt_path).unwrap();
+    receipt.records[0].applied_result_id = other.id;
+    receipt.records[0].applied_result_digest = other.digest();
+    receipt.seal = receipt.compute_seal();
+    fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    let state = lib.state();
+    let undone = lib
+        .db
+        .undo_platform_corrections(&receipt_path, None, WhenSomeChanged::RefuseAll)
+        .unwrap();
+    assert!(undone.undone.is_empty());
+    assert!(
+        undone.refused[0].reason.contains("another game"),
+        "{:?}",
+        undone.refused
+    );
+    assert_eq!(lib.state(), state);
+}
+
+/// C3: a disc checked as a whole: a disc file replaced after the preview
+/// refuses the correction, even though the sheet itself is unchanged.
+#[test]
+fn a_disc_whose_track_changed_is_refused() {
+    let mut lib = Library::new();
+    let sheet = lib.game(1, "SNES", "folder_alias");
+    let track = lib.roms().join("track01.bin");
+    fs::write(&track, b"track bytes").unwrap();
+    let mut preview = lib.preview(vec![exact(&sheet, "SHA-1")]);
+    assert_eq!(group_of(&preview, 1), Some(PlatformCorrectionGroup::Ready));
+    let candidate = &mut preview.candidates[0];
+    candidate.identity.disc_members = vec![
+        crate::identity_source::hashing::FileFingerprint::observe(Path::new(&sheet)).unwrap(),
+        crate::identity_source::hashing::FileFingerprint::observe(&track).unwrap(),
+    ];
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::write(&track, b"other bytes").unwrap();
+    let before = lib.state();
+    let applied = lib
+        .db
+        .apply_platform_corrections(&preview, &[1], WhenSomeChanged::RefuseAll)
+        .unwrap();
+    assert!(applied.corrected.is_empty());
+    assert!(
+        applied.refused[0].reason.contains("disc"),
+        "{:?}",
+        applied.refused
+    );
+    assert_eq!(lib.state(), before);
+}
