@@ -519,3 +519,46 @@ fn the_scope_banner_names_the_platform_folder_or_games() {
     };
     assert!(OrganisationScope::banner(Some(&games)).starts_with("Renaming 1 selected game."));
 }
+
+/// Stage B review C5: a RomM hint never moves a row between groups. An
+/// ambiguous check stays "No reliable catalogue match" with or without it.
+#[test]
+fn a_romm_hint_does_not_change_a_rows_group() {
+    use archivefs_core::dat::rom_organisation::{OrganisationPlanEntry, OrganisationStatus as S};
+    let row = |status, reason: Option<&str>| OrganisationPlanEntry {
+        source_identity: None,
+        catalogue_binding: None,
+        disc_set: None,
+        source_path: PathBuf::from("/g/a.gbc"),
+        destination_path: PathBuf::from("/g/a.gbc"),
+        platform: None,
+        platform_display_name: String::new(),
+        platform_source: String::new(),
+        slug: None,
+        layout_folder: None,
+        mode: archivefs_core::dat::rom_organisation::OrganisationMode::RenameInPlace,
+        content_classification: None,
+        original_metadata: Default::default(),
+        status,
+        reason: reason.map(str::to_string),
+        deferred_capture: None,
+    };
+    let hinted = row(S::Blocked, Some(super::hint_gate::UNVERIFIED_HINT_REASON));
+    let plain = row(S::AlreadyOrganised, None);
+    for check in [
+        SavedCheck::Other,
+        SavedCheck::NoMatch,
+        SavedCheck::Missing,
+        SavedCheck::NotCurrent,
+    ] {
+        assert_eq!(
+            rename_group(&hinted, None, check),
+            rename_group(&plain, None, check),
+            "{check:?}"
+        );
+    }
+    assert_eq!(
+        rename_group(&hinted, None, SavedCheck::Other),
+        RenameGroup::NoCatalogueMatch
+    );
+}

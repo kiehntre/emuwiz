@@ -640,6 +640,16 @@ pub(crate) fn rename_group(
             } else if verified {
                 // A verified name was found, but a guard refused the row.
                 RenameGroup::Blocked
+            } else if matches!(
+                entry.reason.as_deref(),
+                Some(
+                    super::hint_gate::UNVERIFIED_HINT_REASON
+                        | super::hint_gate::UNVERIFIED_NAME_REASON
+                )
+            ) {
+                // Held back only because its name is a hint (review C5): the
+                // group is what the saved check says, as without the hint.
+                unverified(saved_check)
             } else {
                 match saved_check {
                     SavedCheck::NoMatch => RenameGroup::NoCatalogueMatch,

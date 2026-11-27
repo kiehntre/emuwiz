@@ -106,6 +106,10 @@ fn library() -> Library {
     // the same game's name (the RomM conflict test).
     std::fs::write(root.join("gamma.gbc"), b"gamma rom").unwrap();
     std::fs::write(root.join("hinted.gbc"), b"not in the catalogue").unwrap();
+    // Review C2: an archive whose file two catalogue games share (ambiguous),
+    // and one matched only by CRC (weak evidence, no SHA-1 in the catalogue).
+    zip(&root.join("twin.zip"), &[("twin.gbc", b"twin rom")]);
+    zip(&root.join("crconly.zip"), &[("crc.gbc", b"crc rom")]);
 
     let dat = dir.path().join("gbc.dat");
     let mut body = format!(
@@ -122,6 +126,15 @@ fn library() -> Library {
         }
         body.push_str("</game>");
     }
+    for twin in ["Twin A (USA)", "Twin B (USA)"] {
+        body.push_str(&format!(
+            "<game name=\"{twin}\"><rom name=\"{twin}.gbc\" size=\"8\" sha1=\"{}\"/></game>",
+            sha1(b"twin rom")
+        ));
+    }
+    body.push_str(
+        "<game name=\"Crc Only (USA)\"><rom name=\"Crc Only (USA).gbc\" size=\"7\" crc=\"996b51dc\"/></game>",
+    );
     body.push_str("</datafile>");
     std::fs::write(&dat, &body).unwrap();
 
@@ -301,8 +314,9 @@ fn only_an_archive_holding_one_verified_game_takes_its_name_and_undo_restores_it
         assert!(matches!(choice.source, NameSource::VerifiedDat { .. }));
         assert_eq!(choice.note.as_deref(), Some(ARCHIVE_RENAME_NOTE));
     }
-    // Two games in one archive, or part of a game: never a name.
-    for file in ["two games.zip", "partial.zip"] {
+    // Two games in one archive, part of a game, a file two games share
+    // (ambiguous) or a CRC-only match (weak evidence): never a name.
+    for file in ["two games.zip", "partial.zip", "twin.zip", "crconly.zip"] {
         let choice = chosen(file);
         assert_eq!(choice.name, None, "{file}: {choice:?}");
         assert_eq!(choice.source, NameSource::Original, "{file}");
@@ -320,7 +334,7 @@ fn only_an_archive_holding_one_verified_game_takes_its_name_and_undo_restores_it
     }
     // A real collision is still a conflict.
     assert_eq!(status("zeta.zip"), OrganisationStatus::Conflict);
-    for file in ["two games.zip", "partial.zip"] {
+    for file in ["two games.zip", "partial.zip", "twin.zip", "crconly.zip"] {
         assert_ne!(status(file), OrganisationStatus::Suggested, "{file}");
     }
 
@@ -484,6 +498,15 @@ fn b6_rehearsal_on_copied_gbc_files() {
     let root = PathBuf::from(std::env::var("EMUWIZ_B6_ROOT").expect("EMUWIZ_B6_ROOT"));
     let dat = PathBuf::from(std::env::var("EMUWIZ_B6_DAT").expect("EMUWIZ_B6_DAT"));
     let out = PathBuf::from(std::env::var("EMUWIZ_B6_OUT").expect("EMUWIZ_B6_OUT"));
+    // Review C3: fail closed unless the profile is a scratch one too.
+    for var in ["EMUWIZ_DATA_HOME", "EMUWIZ_CONFIG_HOME", "HOME"] {
+        let value = std::env::var(var).unwrap_or_else(|_| panic!("{var} must be set to scratch"));
+        let real = Path::new(&value).canonicalize().unwrap();
+        assert!(
+            real.starts_with("/tmp/claude-1000/"),
+            "{var} is not a scratch path"
+        );
+    }
     for path in [&root, &dat, &out] {
         let real = path.canonicalize().unwrap();
         assert!(
