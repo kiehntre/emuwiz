@@ -84,13 +84,20 @@ impl App {
         let sources = self.canonical_organisation.source_roots().to_vec();
         let mut chosen = None;
         widgets::card(ui, |ui| {
+            // The active scope, first and unmistakable (Stage B, owner
+            // 2026-11-26).
+            widgets::status_badge(
+                ui,
+                crate::rom_organisation_page::scope::OrganisationScope::banner(
+                    self.canonical_organisation.scope(),
+                ),
+                if self.canonical_organisation.scope().is_some() {
+                    widgets::StatusTone::Info
+                } else {
+                    widgets::StatusTone::Pending
+                },
+            );
             ui.strong("What to include");
-            ui.label(match self.canonical_organisation.scope() {
-                Some(scope) => format!("Now: {}", scope.label()),
-                None => {
-                    "Nothing chosen yet. Your configured source folders are not changed.".into()
-                }
-            });
             ui.label(
                 egui::RichText::new(
                     "To rename particular games, select them in the Library and choose Rename selected.",

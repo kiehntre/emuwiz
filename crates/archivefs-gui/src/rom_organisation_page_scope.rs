@@ -54,6 +54,32 @@ pub(crate) enum OrganisationScope {
 }
 
 impl OrganisationScope {
+    /// Stage B (owner 2026-11-26): "Make the active platform, folder and
+    /// rename scope unmistakable." One line naming what kind of scope is
+    /// active and exactly which platforms, folder(s) or games it covers.
+    pub(crate) fn banner(scope: Option<&Self>) -> String {
+        const KEEP: &str = "Files stay in their folders; only their names change.";
+        match scope {
+            None => "Renaming: nothing chosen yet. Choose platforms, folders or games below; nothing is renamed until you preview and confirm.".into(),
+            Some(scope @ Self::Games { .. }) => format!("Renaming {}. {KEEP}", scope.label()),
+            Some(Self::Platforms { names, games }) => format!(
+                "Renaming platform{} {} ({} game{}). {KEEP}",
+                if names.len() == 1 { "" } else { "s" },
+                names.iter().cloned().collect::<Vec<_>>().join(", "),
+                games.len(),
+                if games.len() == 1 { "" } else { "s" },
+            ),
+            Some(Self::Folders(folders)) => match folders.as_slice() {
+                [one] => format!("Renaming the folder {}. {KEEP}", one.display()),
+                many => format!(
+                    "Renaming {} folders: {}. {KEEP}",
+                    many.len(),
+                    many.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(", ")
+                ),
+            },
+        }
+    }
+
     pub(crate) fn label(&self) -> String {
         fn plural(n: usize, one: &str, many: &str) -> String {
             format!("{n} {}", if n == 1 { one } else { many })

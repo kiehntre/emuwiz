@@ -492,6 +492,21 @@ impl App {
                         ui.label("Reads originals · Creates separate linked output · Originals preserved · Preview required · Undo available for supported operations");
                     });
                     ui.add_space(theme::SPACE_SM);
+                    // Stage B (owner 2026-11-26): Rename verified games is a
+                    // prominent top-level feature, not inside "Other output
+                    // destinations".
+                    {
+                        let card = ACTIONS[0];
+                        widgets::workflow_card(ui, card.kind.accent(), |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if primary(ui, card.title) {
+                                    selected = Some(card.destination);
+                                }
+                                ui.label(card.description);
+                            });
+                        });
+                    }
+                    ui.add_space(theme::SPACE_SM);
                     for (title, explanation, button, section) in REVIEW_TASKS {
                         ui.push_id(("organisation-task", section), |ui| {
                             widgets::card(ui, |ui| {
@@ -503,8 +518,8 @@ impl App {
                             });
                         });
                     }
-                    ui.collapsing("Other output destinations and verified-file naming", |ui| {
-                        for card in ACTIONS {
+                    ui.collapsing("Other output destinations", |ui| {
+                        for card in ACTIONS.into_iter().filter(|card| card.kind != CardKind::VerifiedGames) {
                             ui.push_id(card.title, |ui| {
                                 widgets::workflow_card(ui, card.kind.accent(), |ui| {
                                     ui.horizontal(|ui| {

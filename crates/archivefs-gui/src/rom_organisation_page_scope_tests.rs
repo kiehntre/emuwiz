@@ -485,3 +485,37 @@ fn idle_disk_priority_is_restored_afterwards() {
     let after = unsafe { libc::syscall(libc::SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0) };
     assert_eq!(before, after);
 }
+
+/// Stage B (owner 2026-11-26): the banner names the kind of scope and exactly
+/// what it covers, and says files keep their folders.
+#[test]
+fn the_scope_banner_names_the_platform_folder_or_games() {
+    use std::collections::BTreeSet;
+    let game = |id: i64| ScopedGame {
+        archive_id: id,
+        path: PathBuf::from(format!("/roms/gbc/{id}.gbc")),
+        known_missing: false,
+    };
+    assert!(OrganisationScope::banner(None).starts_with("Renaming: nothing chosen yet"));
+    let platforms = OrganisationScope::Platforms {
+        names: BTreeSet::from(["Game Boy Color".to_string()]),
+        games: vec![game(1), game(2)],
+    };
+    assert_eq!(
+        OrganisationScope::banner(Some(&platforms)),
+        "Renaming platform Game Boy Color (2 games). Files stay in their folders; only their names change."
+    );
+    let folder = OrganisationScope::Folders(vec![PathBuf::from("/roms/gbc")]);
+    assert!(OrganisationScope::banner(Some(&folder)).starts_with("Renaming the folder /roms/gbc."));
+    let folders =
+        OrganisationScope::Folders(vec![PathBuf::from("/roms/a"), PathBuf::from("/roms/b")]);
+    assert!(
+        OrganisationScope::banner(Some(&folders))
+            .starts_with("Renaming 2 folders: /roms/a, /roms/b.")
+    );
+    let games = OrganisationScope::Games {
+        games: vec![game(3)],
+        hidden_by_filter: 0,
+    };
+    assert!(OrganisationScope::banner(Some(&games)).starts_with("Renaming 1 selected game."));
+}
