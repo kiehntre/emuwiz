@@ -355,9 +355,17 @@ impl PlatformCorrectionsState {
                             || r.reason == "this correction was never applied"
                     })
                 {
+                    let never = undone
+                        .refused
+                        .iter()
+                        .all(|r| r.reason == "this correction was never applied");
                     self.status = Some((
                         widgets::StatusTone::Info,
-                        "Nothing left to undo: this correction was already undone.".into(),
+                        if never {
+                            "Nothing to undo: this correction was never applied.".into()
+                        } else {
+                            "Nothing left to undo: this correction was already undone.".into()
+                        },
                     ));
                 } else if undone.undone.is_empty() {
                     self.status = Some((
@@ -482,6 +490,23 @@ impl PlatformCorrectionsState {
     }
 }
 
+/// What a row says about its proposed system: only a Ready row "would
+/// become" it; the others are suggestions or cannot name one system.
+fn proposal_text(row: &CorrectionRowView) -> String {
+    match row.group {
+        PlatformCorrectionGroup::Ready => format!("would become {}", row.proposed),
+        PlatformCorrectionGroup::NeedsReview => {
+            format!(
+                "the catalogue suggests {} (not changed automatically)",
+                row.proposed
+            )
+        }
+        PlatformCorrectionGroup::Ambiguous => {
+            "the evidence does not name one system (not changed)".to_string()
+        }
+    }
+}
+
 pub(crate) const DISCOVERY_UNDO_WARNING: &str = "Correcting this game ends the Undo of the Discovery Import that added it. That Undo cannot be offered again, even after this correction is undone.";
 
 fn group_title(group: PlatformCorrectionGroup) -> &'static str {
@@ -537,11 +562,11 @@ pub(crate) fn show(ui: &mut egui::Ui, view: &PlatformCorrectionsView) -> Option<
                     }
                 }
                 ui.label(format!(
-                    "{} — now {} ({}), corrected to {} · {}{}",
+                    "{} — now {} ({}), {} · {}{}",
                     row.path,
                     row.current,
                     row.current_source,
-                    row.proposed,
+                    proposal_text(row),
                     row.evidence,
                     row.game_name
                         .as_deref()
@@ -781,6 +806,40 @@ mod review_tests {
             sender.send(result).unwrap();
             let (_, library_changed) = state.poll(None);
             assert!(library_changed, "an error result reloads the library");
+        }
+    }
+
+    /// Review 4 C1: only a Ready row says what the game "would become";
+    /// review and ambiguous rows never read as corrected.
+    #[test]
+    fn rows_say_what_their_group_means() {
+        let row = |group| CorrectionRowView {
+            archive_id: 1,
+            path: "/g/a.nes".into(),
+            game_name: None,
+            current: "SNES".into(),
+            current_source: "folder_alias".into(),
+            proposed: "NES".into(),
+            evidence: "exact SHA-1 match".into(),
+            reason: String::new(),
+            group,
+            selected: false,
+            loses_discovery_import_undo: false,
+        };
+        assert_eq!(
+            proposal_text(&row(PlatformCorrectionGroup::Ready)),
+            "would become NES"
+        );
+        for group in [
+            PlatformCorrectionGroup::NeedsReview,
+            PlatformCorrectionGroup::Ambiguous,
+        ] {
+            let text = proposal_text(&row(group));
+            assert!(
+                !text.contains("corrected") && !text.contains("would become"),
+                "{text}"
+            );
+            assert!(text.contains("not changed"), "{text}");
         }
     }
 
