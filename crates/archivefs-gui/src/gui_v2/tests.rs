@@ -12363,3 +12363,17 @@ fn a_window_resize_requests_a_repaint_but_the_first_frame_does_not() {
     assert!(resize_needs_repaint(Some(a), egui::vec2(1800.0, 820.0)));
     assert!(resize_needs_repaint(Some(a), egui::vec2(1280.0, 1000.0)));
 }
+
+/// Stage B B5: on a short window the Organisation landing keeps Rename
+/// verified games visible as a header button.
+#[test]
+fn compact_organisation_landing_keeps_rename_visible() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Build);
+    let output = frame(&context, &mut app, [1024.0, 520.0]);
+    assert!(organisation_label_is_visible(
+        &output,
+        "Rename verified games"
+    ));
+}

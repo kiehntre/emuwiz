@@ -483,6 +483,11 @@ impl App {
                             if primary(ui, "Preview Playing Library") {
                                 selected = Some(Some(PlayingLibraryDestination::Generic));
                             }
+                            // Stage B B5: on a short window Rename stays above
+                            // the fold, next to the first action.
+                            if compact && ui.button(ACTIONS[0].title).clicked() {
+                                selected = Some(ACTIONS[0].destination);
+                            }
                             if ui.button("Frontend export profiles").clicked() { self.organisation.view = OrganisationView::FrontendExport; }
                             if ui.button("Repair Review").clicked() { self.organisation.view = OrganisationView::RepairReview; }
                             if ui.button("Repair History").clicked() { self.organisation.view = OrganisationView::RepairHistory; }
@@ -495,7 +500,7 @@ impl App {
                     // Stage B (owner 2026-11-26): Rename verified games is a
                     // prominent top-level feature, not inside "Other output
                     // destinations".
-                    {
+                    if !compact {
                         let card = ACTIONS[0];
                         widgets::workflow_card(ui, card.kind.accent(), |ui| {
                             ui.horizontal_wrapped(|ui| {

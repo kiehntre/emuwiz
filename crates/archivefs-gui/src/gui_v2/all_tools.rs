@@ -158,8 +158,8 @@ pub(super) fn groups() -> Vec<ToolGroup> {
     );
     verification.tools.push(Tool {
         route: Route::QuickRename,
-        title: "Quick Rename",
-        purpose: "Preview safe rename decisions from verified evidence.",
+        title: "Rename verified games",
+        purpose: "Rename files to their verified catalogue names after a preview; Undo available.",
         safety: ToolSafety::AsksFirst,
     });
     let mut health = group(

@@ -419,7 +419,7 @@ pub(super) fn family_children(family: FeatureFamily) -> Vec<FamilyAction> {
             action(
                 "quick-rename",
                 "Quick Rename",
-                "Rename verified games through the existing easy organisation workflow.",
+                "Rename files to their verified catalogue names after a preview.",
                 Route::QuickRename,
                 Easy,
             ),
