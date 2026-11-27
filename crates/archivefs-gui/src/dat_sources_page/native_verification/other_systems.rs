@@ -82,6 +82,10 @@ pub(crate) fn unmatched_games(totals: &VerificationTotals, platform: &str) -> Ve
 impl OtherSystems {
     /// A finished check of `platform`: offer the search for its unmatched games.
     pub(crate) fn offer(&mut self, totals: &VerificationTotals, platform: &str, generation: u64) {
+        // A search or correction still running keeps its state and result.
+        if self.busy() {
+            return;
+        }
         self.reset();
         self.platform = platform.to_string();
         self.unmatched = unmatched_games(totals, platform);
@@ -352,6 +356,19 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
 
     const NES: &str = "Nintendo - Nintendo Entertainment System";
+
+    /// Review 1 M4: a check finishing while the search (or a correction)
+    /// runs never wipes that work or its result.
+    #[test]
+    fn a_finished_check_never_wipes_a_running_search() {
+        let mut other = OtherSystems::default();
+        other.platform = "SNES".into();
+        let (_sender, receiver) = mpsc::channel();
+        other.receiver = Some(receiver);
+        other.offer(&VerificationTotals::default(), "GB", 9);
+        assert!(other.busy());
+        assert_eq!(other.platform, "SNES");
+    }
 
     #[test]
     fn only_unmatched_and_uncheckable_games_are_offered() {

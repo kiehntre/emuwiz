@@ -12,17 +12,22 @@
 //!   applicable). Each candidate binds the current assignment row, the file's
 //!   on-disk identity and the existing result row; the catalogue is bound by
 //!   the SHA-256 of its bytes.
-//! * **Apply** re-checks every binding inside one immediate transaction,
-//!   makes the changes, writes the complete receipt and fsyncs it (file and
-//!   folder) **before** the commit. A committed correction therefore always
-//!   has a durable receipt; a receipt left pending by a crash is resolved
-//!   against the database when receipts are listed (applied if its rows are
-//!   there, void if not).
-//! * **Undo** (one game or the batch) refuses a game whose system or result
-//!   changed after the correction, so a later change is never overwritten.
-//!   It deletes exactly the applied assignment row and makes the previous
-//!   one current again (the organisation precedent), restores the previous
-//!   result and the scanner's cached system.
+//! * **Apply** re-reads each selected file and compares it with the hash the
+//!   catalogue matched, then re-checks every binding inside one immediate
+//!   transaction, makes the changes, and writes the complete, sealed receipt
+//!   and fsyncs it (file and folder) **before** the commit. The receipt is
+//!   never rewritten: what it records is resolved against the database every
+//!   time it is read (in place, undone, changed, or never applied), so a
+//!   committed correction always has its Undo, whatever was interrupted,
+//!   failed or ran at the same time. A commit error never removes it.
+//! * **Undo** (one game or the batch) refuses a game whose system, result or
+//!   later system-dependent evidence changed after the correction, so a later
+//!   change is never overwritten or left on the wrong system. It deletes
+//!   exactly the applied assignment row and makes the previous one current
+//!   again (the organisation precedent), restores the previous result, its
+//!   re-check note, the history and the scanner's cached system. A durable
+//!   marker beside the receipt, written before the commit, tells "undone"
+//!   from "never applied" (display only: the database decides).
 //!
 //! No game file is ever moved, renamed, written or deleted: the only files
 //! written are the receipts beside the database. No schema change: the
@@ -81,6 +86,9 @@ pub struct AssignmentBinding {
 pub struct FileBinding {
     pub size: u64,
     pub modified_ns: i128,
+    /// Change time: a rewrite that restores size and mtime (`touch -r`,
+    /// `cp -p`, `rsync --inplace -t`) still changes it.
+    pub changed_ns: i128,
     pub device: u64,
     pub inode: u64,
 }
@@ -94,6 +102,7 @@ impl FileBinding {
         Some(Self {
             size: meta.len(),
             modified_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+            changed_ns: i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec()),
             device: meta.dev(),
             inode: meta.ino(),
         })
@@ -112,8 +121,9 @@ pub struct CatalogueBinding {
     pub sha256: Option<String>,
 }
 
-/// One proposed correction.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One proposed correction. Built only by [`Database::preview_platform_corrections`]
+/// (never deserialised: its evidence must come from a real check).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PlatformCorrectionCandidate {
     pub archive_id: i64,
     pub path: String,
@@ -137,11 +147,11 @@ pub struct PlatformCorrectionCandidate {
 }
 
 /// A read-only preview of corrections from one completed catalogue check.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PlatformCorrectionPreview {
     pub database_path: PathBuf,
     pub created_at: String,
-    #[serde(skip, default = "std::time::SystemTime::now")]
+    #[serde(skip)]
     pub(crate) made: std::time::SystemTime,
     pub catalogue: CatalogueBinding,
     pub candidates: Vec<PlatformCorrectionCandidate>,
@@ -219,6 +229,10 @@ pub struct PlatformCorrectionReceiptSummary {
     pub undone: Vec<i64>,
     /// Games changed since the correction (Undo would overwrite something).
     pub changed: Vec<PlatformCorrectionRefusal>,
+    /// Set when the receipt cannot be read or trusted: nothing in it can be
+    /// undone from here, and the person is told rather than the receipt
+    /// being hidden.
+    pub problem: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,7 +254,7 @@ impl Database {
     pub fn preview_platform_corrections(
         &self,
         outcome: &crate::dat::sources::audit_run::DatAuditOutcome,
-        generation: u64,
+        _generation: u64,
     ) -> Result<PlatformCorrectionPreview> {
         let now = now_utc_string();
         let catalogue = CatalogueBinding {
@@ -278,7 +292,7 @@ impl Database {
                 continue;
             }
             if let Some(candidate) =
-                self.classify_correction(archive_id, item, &preview.catalogue, generation)?
+                self.classify_correction(archive_id, item, &preview.catalogue)?
             {
                 preview.candidates.push(candidate);
             }
@@ -291,7 +305,6 @@ impl Database {
         archive_id: i64,
         item: &crate::dat::library_identity_projection::ProjectedLibraryDatIdentity,
         catalogue: &CatalogueBinding,
-        generation: u64,
     ) -> Result<Option<PlatformCorrectionCandidate>> {
         use PlatformCorrectionGroup as G;
         // A game with no system is identified by the ordinary save; a
@@ -372,11 +385,10 @@ impl Database {
         } else {
             match provenance {
                 PlatformProvenanceClass::Inferred => {
-                    if self.resolver_conflicts(archive_id, &platform, generation)? {
-                        (
-                            G::Ambiguous,
-                            "other evidence about this game disagrees with the catalogue".to_string(),
-                        )
+                    if let Some(other) =
+                        other_strong_result(&self.connection, archive_id, &identity.source.source_id, &platform)?
+                    {
+                        (G::Ambiguous, other)
                     } else if catalogue.sha256.is_none() {
                         (
                             G::NeedsReview,
@@ -459,23 +471,48 @@ impl Database {
             identity: item.identity.clone(),
         })
     }
+}
 
-    /// Would the platform resolver call this a conflict, given everything
-    /// else known about the game?
-    fn resolver_conflicts(&self, archive_id: i64, platform: &str, generation: u64) -> Result<bool> {
-        let mut evidence = self.current_platform_identity_evidence(archive_id, generation)?;
-        evidence.push(crate::platform::identity::PlatformIdentityEvidence {
-            platform: platform.to_string(),
-            source: crate::platform::identity::PlatformIdentitySource::VerifiedDat,
-            confidence: crate::platform::identity::PlatformIdentityConfidence::Verified,
-            generation,
-            detail: "preview".into(),
-        });
-        Ok(matches!(
-            crate::platform::identity::resolve_platform_identity(generation, evidence),
-            crate::platform::identity::PlatformIdentityResolution::Conflict { .. }
-        ))
+/// A saved exact result from another catalogue that identifies this game as
+/// a different system than `proposed`: the evidence then points at two
+/// systems, and the correction is ambiguous. `None` when there is none.
+fn other_strong_result(
+    conn: &Connection,
+    archive_id: i64,
+    source_id: &str,
+    proposed: &str,
+) -> Result<Option<String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT dat_source_id, facts_json FROM library_dat_identities \
+             WHERE archive_id = ?1 AND dat_source_id <> ?2 ORDER BY dat_source_id",
+        )
+        .map_err(|error| db_error("failed to read the game's other results", error))?;
+    let rows = stmt
+        .query_map(params![archive_id, source_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(|error| db_error("failed to read the game's other results", error))?;
+    for row in rows {
+        let (other, facts) =
+            row.map_err(|error| db_error("failed to read the game's other results", error))?;
+        let Ok(saved) = serde_json::from_slice::<PersistedLibraryDatIdentity>(&facts) else {
+            return Ok(Some(format!(
+                "a saved result from another catalogue ({other}) cannot be read, so it cannot be ruled out"
+            )));
+        };
+        if !identifies_system(&saved) {
+            continue;
+        }
+        if let CatalogueSystems::One(system) = catalogue_systems(&saved.source)
+            && !same_system(&system, proposed)
+        {
+            return Ok(Some(format!(
+                "another catalogue ({other}) also matched this file exactly, as {system}: the evidence points at two systems"
+            )));
+        }
     }
+    Ok(None)
 }
 
 fn same_system(current: &str, platform: &str) -> bool {
@@ -497,13 +534,14 @@ impl Database {
         selected: &[i64],
         when_changed: WhenSomeChanged,
     ) -> Result<PlatformCorrectionsApplied> {
-        if preview.database_path != self.path {
+        if !same_database(&preview.database_path, &self.path) {
             return Err(stale("the preview belongs to another library"));
         }
-        if preview
+        // A clock that moved backwards counts as out of date too.
+        if !preview
             .made
             .elapsed()
-            .is_ok_and(|age| age > PLATFORM_CORRECTION_PREVIEW_MAX_AGE)
+            .is_ok_and(|age| age <= PLATFORM_CORRECTION_PREVIEW_MAX_AGE)
         {
             return Err(stale("the preview is more than an hour old"));
         }
@@ -529,12 +567,34 @@ impl Database {
                 refused: Vec::new(),
             });
         }
-        // The catalogue evidence: its bytes are still the ones checked.
         let expected = preview
             .catalogue
             .sha256
             .as_deref()
             .ok_or_else(|| stale("the catalogue cannot be re-checked"))?;
+        // Game identity, just before applying: each selected file is read
+        // again and must still be the bytes the catalogue matched. Done
+        // before the write lock; the file binding (size, times, device,
+        // inode) is checked again inside it.
+        let mut refused = Vec::new();
+        let mut content_ok = Vec::new();
+        for candidate in &chosen {
+            match content_still_matches(candidate) {
+                Ok(()) => content_ok.push(*candidate),
+                Err(reason) => refused.push(PlatformCorrectionRefusal {
+                    archive_id: candidate.archive_id,
+                    reason,
+                }),
+            }
+        }
+
+        let receipt_dir = receipt_dir(&self.path);
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| db_error("failed to start the platform corrections", error))?;
+        // The catalogue evidence, under the write lock: its bytes are still
+        // the ones checked.
         match fs::read(&preview.catalogue.dat_path) {
             Ok(bytes) if hex(&Sha256::digest(&bytes)) == expected => {}
             Ok(_) => return Err(stale("the catalogue file changed since the preview")),
@@ -544,15 +604,8 @@ impl Database {
                 )));
             }
         }
-
-        let receipt_dir = receipt_dir(&self.path);
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| db_error("failed to start the platform corrections", error))?;
-        let mut refused = Vec::new();
         let mut ready = Vec::new();
-        for candidate in &chosen {
+        for candidate in &content_ok {
             match recheck(&tx, candidate)? {
                 Ok(()) => ready.push(*candidate),
                 Err(reason) => refused.push(PlatformCorrectionRefusal {
@@ -561,6 +614,7 @@ impl Database {
                 }),
             }
         }
+        refused.sort_by_key(|r| r.archive_id);
         if !refused.is_empty() && when_changed == WhenSomeChanged::RefuseAll {
             return Ok(PlatformCorrectionsApplied {
                 receipt_path: None,
@@ -575,44 +629,52 @@ impl Database {
                 refused,
             });
         }
+        refused.sort_by_key(|r| r.archive_id);
         let stamp = now_utc_string();
         let mut records = Vec::new();
         for candidate in &ready {
             records.push(apply_one(&tx, candidate, &stamp)?);
         }
-        let receipt = Receipt {
-            version: 1,
-            state: ReceiptState::Pending,
+        let mut receipt = Receipt {
+            version: RECEIPT_VERSION,
             database_path: self.path.clone(),
             created_at: stamp.clone(),
             preview_token: preview.token(),
             catalogue: preview.catalogue.clone(),
             files_untouched: true,
             records,
+            seal: String::new(),
         };
+        receipt.seal = receipt.compute_seal();
         // Durable before the commit: a committed correction always has its
         // receipt. If this fails the transaction is rolled back.
         let receipt_path = write_new_receipt(&receipt_dir, &self.path, &receipt)?;
         #[cfg(test)]
+        seams::run_hook(seams::Point::AfterReceiptBeforeCommit);
+        #[cfg(test)]
         if seams::stop_at(seams::Point::AfterReceiptBeforeCommit) {
-            // Simulated crash: the transaction is dropped (rolled back) and
-            // the receipt stays pending.
+            // Simulated crash: the transaction is dropped (rolled back); the
+            // receipt stays and resolves to "never applied".
             drop(tx);
             return Err(ArchiveFsError::Database("simulated termination".into()));
         }
-        if let Err(error) = tx.commit() {
-            // Nothing was applied: the receipt is void. If it cannot be
-            // removed it stays pending and resolves to void when listed.
-            let _ = fs::remove_file(&receipt_path);
-            return Err(db_error("failed to commit the platform corrections", error));
-        }
+        // A commit error is not proof that nothing was committed (a WAL
+        // frame may already be on disk): the receipt is kept either way and
+        // resolved against the database whenever it is read.
+        #[cfg(test)]
+        let commit = if seams::stop_at(seams::Point::CommitThenError) {
+            tx.commit()
+                .and(Err(rusqlite::Error::ExecuteReturnedResults))
+        } else {
+            tx.commit()
+        };
+        #[cfg(not(test))]
+        let commit = tx.commit();
+        commit.map_err(|error| db_error("failed to commit the platform corrections", error))?;
         #[cfg(test)]
         if seams::stop_at(seams::Point::AfterCommitBeforeMark) {
             return Err(ArchiveFsError::Database("simulated termination".into()));
         }
-        // Marking it applied is a convenience; a pending receipt whose rows
-        // are present is read as applied.
-        let _ = update_receipt(&receipt_path, |r| r.state = ReceiptState::Applied);
         Ok(PlatformCorrectionsApplied {
             receipt_path: Some(receipt_path),
             corrected: ready.iter().map(|c| c.archive_id).collect(),
@@ -671,7 +733,53 @@ fn recheck(
     {
         return Ok(Err("the evidence no longer identifies one system".into()));
     }
+    if let Some(other) = other_strong_result(
+        conn,
+        id,
+        &candidate.identity.source.source_id,
+        &candidate.proposed_platform,
+    )? {
+        return Ok(Err(other));
+    }
     Ok(Ok(()))
+}
+
+/// The selected file is still the bytes the catalogue matched: it is read
+/// again and compared with the strongest hash the check recorded for it.
+fn content_still_matches(
+    candidate: &PlatformCorrectionCandidate,
+) -> std::result::Result<(), String> {
+    use std::io::Read;
+    let hashes = &candidate.identity.audited_hashes;
+    let (expected_sha256, expected_sha1) = (hashes.sha256.as_deref(), hashes.sha1.as_deref());
+    if expected_sha256.is_none() && expected_sha1.is_none() {
+        return Err("the check did not record a SHA-1 or SHA-256 of this file, so it cannot be compared again".into());
+    }
+    let mut file = fs::File::open(&candidate.path)
+        .map_err(|error| format!("the game file cannot be read now ({error})"))?;
+    let mut sha256 = Sha256::new();
+    let mut sha1 = <sha1::Sha1 as sha1::Digest>::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("the game file cannot be read now ({error})"))?;
+        if read == 0 {
+            break;
+        }
+        sha256.update(&buffer[..read]);
+        sha1::Digest::update(&mut sha1, &buffer[..read]);
+    }
+    let same = match (expected_sha256, expected_sha1) {
+        (Some(expected), _) => hex(&sha256.finalize()).eq_ignore_ascii_case(expected),
+        (None, Some(expected)) => hex(&sha1::Digest::finalize(sha1)).eq_ignore_ascii_case(expected),
+        (None, None) => false,
+    };
+    if same {
+        Ok(())
+    } else {
+        Err("the game file changed since the preview: its content is no longer what the catalogue matched".into())
+    }
 }
 
 fn apply_one(
@@ -715,6 +823,13 @@ fn apply_one(
         .map_err(|error| db_error("failed to update the scanner's cached system", error))?;
     }
 
+    let history_before: i64 = conn
+        .query_row(
+            "SELECT coalesce(max(id), 0) FROM library_dat_identity_history",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| db_error("failed to read the result history", error))?;
     let written = persist_library_dat_identity_row(conn, id, &candidate.identity, stamp)?;
     if !matches!(
         written,
@@ -727,6 +842,15 @@ fn apply_one(
     }
     let applied_result = result_row(conn, id, &candidate.identity.source.source_id)?
         .ok_or_else(|| ArchiveFsError::Database("the saved result cannot be read back".into()))?;
+    // History rows the save added (the replaced result); Undo removes them.
+    let applied_history_ids: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT id FROM library_dat_identity_history WHERE id > ?1 AND archive_id = ?2 ORDER BY id")
+            .map_err(|error| db_error("failed to read the result history", error))?;
+        stmt.query_map(params![history_before, id], |row| row.get(0))
+            .and_then(|rows| rows.collect())
+            .map_err(|error| db_error("failed to read the result history", error))?
+    };
     Ok(ReceiptRecord {
         archive_id: id,
         path: candidate.path.clone(),
@@ -744,7 +868,8 @@ fn apply_one(
         previous_recheck,
         applied_result_id: applied_result.id,
         applied_result_digest: applied_result.digest(),
-        undone: false,
+        applied_history_ids,
+        dependents_after_apply: dependents_digest(conn, id)?,
     })
 }
 
@@ -771,11 +896,12 @@ impl Database {
         when_changed: WhenSomeChanged,
     ) -> Result<PlatformCorrectionsUndone> {
         let receipt = read_receipt(receipt_path)?;
-        if receipt.database_path != self.path {
+        if !same_database(&receipt.database_path, &self.path) {
             return Err(ArchiveFsError::Database(
                 "the receipt belongs to another library".into(),
             ));
         }
+        let marked = undone_marks(receipt_path);
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -786,8 +912,11 @@ impl Database {
             if only.is_some_and(|only| !only.contains(&record.archive_id)) {
                 continue;
             }
-            match record_state(&tx, &receipt, record)? {
+            match record_state(&tx, &receipt, record, &marked)? {
                 RecordState::InPlace => doable.push(record),
+                // Undo all: games already undone (or never applied) are not
+                // a reason to refuse the others.
+                RecordState::Undone | RecordState::NeverApplied if only.is_none() => {}
                 RecordState::Undone => refused.push(PlatformCorrectionRefusal {
                     archive_id: record.archive_id,
                     reason: "already undone".into(),
@@ -820,8 +949,12 @@ impl Database {
             });
         }
         for record in &doable {
-            undo_one(&tx, record)?;
+            undo_one(&tx, &receipt, record)?;
         }
+        let undone: Vec<i64> = doable.iter().map(|r| r.archive_id).collect();
+        // Durable before the commit, like the receipt. Display only: a game
+        // whose applied row is still there is "in place" whatever a mark says.
+        write_undone_mark(receipt_path, &undone)?;
         #[cfg(test)]
         if seams::stop_at(seams::Point::UndoBeforeCommit) {
             drop(tx);
@@ -829,23 +962,13 @@ impl Database {
         }
         tx.commit()
             .map_err(|error| db_error("failed to commit the Undo", error))?;
-        let undone: Vec<i64> = doable.iter().map(|r| r.archive_id).collect();
-        // The database is the authority (an undone record is recognised from
-        // it); the receipt mark is kept in step when it can be.
-        let _ = update_receipt(receipt_path, |r| {
-            r.state = ReceiptState::Applied;
-            for record in &mut r.records {
-                if undone.contains(&record.archive_id) {
-                    record.undone = true;
-                }
-            }
-        });
         Ok(PlatformCorrectionsUndone { undone, refused })
     }
 
     /// Every correction receipt of this library, resolved against the
-    /// database. A receipt left pending by an interruption is settled here:
-    /// applied when its rows are in place, void when they never were.
+    /// database. Read-only: receipts are never rewritten; a receipt whose
+    /// Apply never committed lists nothing, one that cannot be read or
+    /// trusted is listed with its problem, never hidden.
     pub fn platform_correction_receipts(&self) -> Result<Vec<PlatformCorrectionReceiptSummary>> {
         let mut summaries = Vec::new();
         let dir = receipt_dir(&self.path);
@@ -865,12 +988,32 @@ impl Database {
             .collect();
         paths.sort();
         for path in paths {
-            let Ok(receipt) = read_receipt(&path) else {
-                continue;
+            let empty = |problem: String| PlatformCorrectionReceiptSummary {
+                receipt_path: path.clone(),
+                created_at: String::new(),
+                catalogue: String::new(),
+                undoable: Vec::new(),
+                undone: Vec::new(),
+                changed: Vec::new(),
+                problem: Some(problem),
             };
-            if receipt.database_path != self.path || receipt.state == ReceiptState::Void {
+            let receipt = match read_receipt(&path) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    summaries.push(empty(format!(
+                        "An earlier correction's receipt cannot be used ({error}). Nothing in it can be undone from here; keep the file."
+                    )));
+                    continue;
+                }
+            };
+            if !same_database(&receipt.database_path, &self.path) {
+                summaries.push(empty(format!(
+                    "This receipt belongs to another library ({}).",
+                    receipt.database_path.display()
+                )));
                 continue;
             }
+            let marked = undone_marks(&path);
             let mut summary = PlatformCorrectionReceiptSummary {
                 receipt_path: path.clone(),
                 created_at: receipt.created_at.clone(),
@@ -878,10 +1021,11 @@ impl Database {
                 undoable: Vec::new(),
                 undone: Vec::new(),
                 changed: Vec::new(),
+                problem: None,
             };
             let mut never = 0;
             for record in &receipt.records {
-                match record_state(&self.connection, &receipt, record)? {
+                match record_state(&self.connection, &receipt, record, &marked)? {
                     RecordState::InPlace => {
                         summary.undoable.push(PlatformCorrectionRecordSummary {
                             archive_id: record.archive_id,
@@ -901,13 +1045,10 @@ impl Database {
                     RecordState::NeverApplied => never += 1,
                 }
             }
-            if receipt.state == ReceiptState::Pending {
-                if never == receipt.records.len() {
-                    // Interrupted before the commit: nothing was applied.
-                    let _ = update_receipt(&path, |r| r.state = ReceiptState::Void);
-                    continue;
-                }
-                let _ = update_receipt(&path, |r| r.state = ReceiptState::Applied);
+            // An Apply that never committed (or is still committing) has
+            // nothing to show yet; it is resolved again next time.
+            if never == receipt.records.len() {
+                continue;
             }
             summaries.push(summary);
         }
@@ -919,6 +1060,7 @@ fn record_state(
     conn: &Connection,
     receipt: &Receipt,
     record: &ReceiptRecord,
+    marked_undone: &std::collections::BTreeSet<i64>,
 ) -> Result<RecordState> {
     let applied: Option<(i64, String, String, i64, String)> = conn
         .query_row(
@@ -938,20 +1080,14 @@ fn record_state(
         });
     let current = current_assignment(conn, record.archive_id)?;
     if !ours {
-        // The applied row is gone (or the id belongs to another row).
-        if current.as_ref().map(|c| c.id) == Some(record.previous.id) {
-            return Ok(if record.undone || receipt.state != ReceiptState::Pending {
-                RecordState::Undone
-            } else {
-                RecordState::NeverApplied
-            });
-        }
-        if receipt.state == ReceiptState::Pending && !record.undone {
-            return Ok(RecordState::NeverApplied);
-        }
-        return Ok(RecordState::Changed(
-            "its system was changed after the correction".into(),
-        ));
+        // The applied row is gone (or the id belongs to another row): only
+        // Undo deletes it, so this is an Undo or an Apply that never
+        // committed. Nothing is left to undo either way.
+        return Ok(if marked_undone.contains(&record.archive_id) {
+            RecordState::Undone
+        } else {
+            RecordState::NeverApplied
+        });
     }
     if applied.as_ref().is_some_and(|a| a.3 != 1)
         || current.as_ref().map(|c| c.id) != Some(record.applied_assignment_id)
@@ -980,10 +1116,15 @@ fn record_state(
                 .into(),
         ));
     }
+    if dependents_digest(conn, record.archive_id)? != record.dependents_after_apply {
+        return Ok(RecordState::Changed(
+            "results or facts were saved for this game on its corrected system after the correction; Undo would leave them on the wrong system".into(),
+        ));
+    }
     Ok(RecordState::InPlace)
 }
 
-fn undo_one(conn: &Connection, record: &ReceiptRecord) -> Result<()> {
+fn undo_one(conn: &Connection, receipt: &Receipt, record: &ReceiptRecord) -> Result<()> {
     let removed = conn
         .execute(
             "DELETE FROM platform_assignments WHERE id = ?1 AND archive_id = ?2 AND is_current = 1 AND source = ?3",
@@ -1036,7 +1177,31 @@ fn undo_one(conn: &Connection, record: &ReceiptRecord) -> Result<()> {
                 ));
             }
         }
-        Some(previous) => previous.restore(conn)?,
+        Some(previous) => {
+            previous.check_belongs(
+                conn,
+                "library_dat_identities",
+                record.archive_id,
+                &receipt.catalogue.source_id,
+            )?;
+            if previous.id != record.applied_result_id {
+                return Err(malformed());
+            }
+            previous.restore(conn)?
+        }
+    }
+    for history in &record.applied_history_ids {
+        let n = conn
+            .execute(
+                "DELETE FROM library_dat_identity_history WHERE id = ?1 AND archive_id = ?2",
+                params![history, record.archive_id],
+            )
+            .map_err(|error| db_error("failed to remove the correction's history entry", error))?;
+        if n != 1 {
+            return Err(ArchiveFsError::Database(
+                "the correction's history entry changed during the Undo; nothing was undone".into(),
+            ));
+        }
     }
     if let Some(recheck) = &record.previous_recheck {
         let exists: i64 = conn
@@ -1048,6 +1213,12 @@ fn undo_one(conn: &Connection, record: &ReceiptRecord) -> Result<()> {
             .map_err(|error| db_error("failed to read a re-check note", error))?;
         // A newer note is never overwritten.
         if exists == 0 {
+            recheck.check_belongs(
+                conn,
+                "dat_recheck_attempts",
+                record.archive_id,
+                &receipt.catalogue.source_id,
+            )?;
             recheck.insert_into(conn, "dat_recheck_attempts")?;
         }
     }
@@ -1099,6 +1270,54 @@ fn fingerprint_platform(conn: &Connection, archive_id: i64) -> Result<Option<Fin
     )
     .optional()
     .map_err(|error| db_error("failed to read the scanner's cached system", error))
+}
+
+/// Every per-game row that depends on the game's system, as it stands:
+/// results, their history, set results and verified facts. Recorded after
+/// Apply; a difference at Undo means later evidence would be left on the
+/// wrong system.
+fn dependents_digest(conn: &Connection, archive_id: i64) -> Result<String> {
+    let mut hash = Sha256::new();
+    for table in [
+        "library_dat_identities",
+        "library_dat_identity_history",
+        "dat_set_audit_results",
+        "verified_identity_facts",
+    ] {
+        hash.update(table.as_bytes());
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT * FROM {table} WHERE archive_id = ?1 ORDER BY id"
+            ))
+            .map_err(|error| db_error("failed to read the game's results", error))?;
+        let width = stmt.column_count();
+        let mut rows = stmt
+            .query([archive_id])
+            .map_err(|error| db_error("failed to read the game's results", error))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| db_error("failed to read the game's results", error))?
+        {
+            for index in 0..width {
+                let value: SqlValue = row
+                    .get(index)
+                    .map_err(|error| db_error("failed to read the game's results", error))?;
+                hash.update(format!("{value:?}").as_bytes());
+                hash.update([0]);
+            }
+            hash.update([1]);
+        }
+    }
+    Ok(hex(&hash.finalize()))
+}
+
+/// The same library file, however its path is spelled.
+fn same_database(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (fs::canonicalize(a), fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 /// One `library_dat_identities` row, every column, as stored.
@@ -1169,6 +1388,44 @@ impl ResultRow {
         .map_err(|error| db_error("failed to read a verification result", error))
     }
 
+    /// A row from a receipt is used only if its columns are exactly the
+    /// table's, and it is the expected game's row for the expected catalogue.
+    fn check_belongs(
+        &self,
+        conn: &Connection,
+        table: &str,
+        archive_id: i64,
+        source_id: &str,
+    ) -> Result<()> {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+            ))
+            .map_err(|error| db_error("failed to read a table's columns", error))?;
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .and_then(|rows| rows.collect())
+            .map_err(|error| db_error("failed to read a table's columns", error))?;
+        if columns != self.columns || self.values.len() != self.columns.len() {
+            return Err(malformed());
+        }
+        let value = |name: &str| {
+            self.columns
+                .iter()
+                .position(|c| c == name)
+                .and_then(|i| self.values[i].get(1).cloned())
+        };
+        if value("archive_id") != Some(archive_id.to_string())
+            || value("dat_source_id").as_deref() != Some(source_id)
+        {
+            return Err(malformed());
+        }
+        if self.columns.iter().any(|c| c == "id") && value("id") != Some(self.id.to_string()) {
+            return Err(malformed());
+        }
+        Ok(())
+    }
+
     fn sql_values(&self) -> Result<Vec<SqlValue>> {
         let mut values = Vec::new();
         for value in &self.values {
@@ -1197,7 +1454,7 @@ impl ResultRow {
     /// Inserts this row into `table` again, every column as it was.
     fn insert_into(&self, conn: &Connection, table: &str) -> Result<()> {
         let values = self.sql_values()?;
-        let columns: Vec<String> = self.columns.iter().map(|c| format!("\"{c}\"")).collect();
+        let columns: Vec<String> = self.columns.iter().map(|c| quote_identifier(c)).collect();
         let marks: Vec<String> = (1..=values.len()).map(|i| format!("?{i}")).collect();
         let args: Vec<&dyn rusqlite::ToSql> =
             values.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
@@ -1220,7 +1477,7 @@ impl ResultRow {
             .columns
             .iter()
             .enumerate()
-            .map(|(i, c)| format!("\"{c}\" = ?{}", i + 1))
+            .map(|(i, c)| format!("{} = ?{}", quote_identifier(c), i + 1))
             .collect();
         let sql = format!(
             "UPDATE library_dat_identities SET {} WHERE id = ?{}",
@@ -1240,6 +1497,10 @@ impl ResultRow {
         }
         Ok(())
     }
+}
+
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 fn recheck_source(row: &ResultRow) -> String {
@@ -1264,15 +1525,8 @@ fn result_row_by_id(conn: &Connection, id: i64) -> Result<Option<ResultRow>> {
 
 // --- receipt ---------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ReceiptState {
-    /// Written before the commit; settled when listed.
-    Pending,
-    Applied,
-    /// Interrupted before the commit: nothing was applied.
-    Void,
-}
+/// Receipts are written once and never rewritten (version 2).
+const RECEIPT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FingerprintRecord {
@@ -1294,13 +1548,15 @@ struct ReceiptRecord {
     previous_recheck: Option<ResultRow>,
     applied_result_id: i64,
     applied_result_digest: String,
-    undone: bool,
+    /// History rows the correction's save added; Undo removes exactly these.
+    applied_history_ids: Vec<i64>,
+    /// [`dependents_digest`] right after Apply.
+    dependents_after_apply: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Receipt {
     version: u32,
-    state: ReceiptState,
     database_path: PathBuf,
     created_at: String,
     preview_token: String,
@@ -1308,6 +1564,18 @@ struct Receipt {
     /// Always true: corrections change library records only.
     files_untouched: bool,
     records: Vec<ReceiptRecord>,
+    /// SHA-256 over everything above; a receipt that does not match it is
+    /// not used.
+    seal: String,
+}
+
+impl Receipt {
+    fn compute_seal(&self) -> String {
+        let mut unsealed = self.clone();
+        unsealed.seal = String::new();
+        let bytes = serde_json::to_vec(&unsealed).unwrap_or_default();
+        hex(&Sha256::digest(&bytes))
+    }
 }
 
 fn receipt_dir(db: &Path) -> PathBuf {
@@ -1362,31 +1630,77 @@ fn write_new_receipt(dir: &Path, db: &Path, receipt: &Receipt) -> Result<PathBuf
 fn read_receipt(path: &Path) -> Result<Receipt> {
     let bytes = fs::read(path).map_err(|e| receipt_error("read", e))?;
     let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|e| receipt_error("parse", e))?;
-    if receipt.version != 1 || !receipt.files_untouched {
+    if receipt.version != RECEIPT_VERSION || !receipt.files_untouched {
         return Err(receipt_error("use", "unknown receipt version"));
+    }
+    if receipt.seal != receipt.compute_seal() {
+        return Err(receipt_error("use", "its contents do not match its seal"));
     }
     Ok(receipt)
 }
 
-/// Rewrites a receipt atomically and durably (temporary file, fsync,
-/// rename, folder fsync).
-fn update_receipt(path: &Path, change: impl FnOnce(&mut Receipt)) -> Result<()> {
-    let mut receipt = read_receipt(path)?;
-    change(&mut receipt);
-    let bytes = serde_json::to_vec_pretty(&receipt).map_err(|e| receipt_error("encode", e))?;
-    let tmp = path.with_extension("json.tmp");
-    (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        fs::rename(&tmp, path)?;
-        sync_dir(&receipt_dir(path))
-    })()
-    .map_err(|e| receipt_error("update", e))
+/// Undo marks for a receipt: `<receipt>.<stamp>-<n>.undone`, each written
+/// once (create-new, fsync file and folder) before its Undo commits.
+fn write_undone_mark(receipt: &Path, archive_ids: &[i64]) -> Result<()> {
+    let name = receipt
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let dir = receipt_dir(receipt);
+    let stamp = now_utc_string().replace([':', '-'], "");
+    let bytes = serde_json::to_vec(archive_ids).map_err(|e| receipt_error("encode", e))?;
+    for n in 0..1000u32 {
+        let path = dir.join(format!("{name}.{stamp}-{}-{n}.undone", std::process::id()));
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(undo_mark_error(error)),
+        };
+        let written = (|| {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            sync_dir(&dir)
+        })();
+        if let Err(error) = written {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(undo_mark_error(error));
+        }
+        return Ok(());
+    }
+    Err(undo_mark_error("no free name"))
+}
+
+fn undo_mark_error(error: impl std::fmt::Display) -> ArchiveFsError {
+    ArchiveFsError::Database(format!(
+        "platform correction Undo: could not record the Undo ({error}); nothing was undone"
+    ))
+}
+
+/// Games an Undo of this receipt recorded. Unreadable marks are ignored:
+/// they only tell "undone" from "never applied" for display.
+fn undone_marks(receipt: &Path) -> std::collections::BTreeSet<i64> {
+    let mut ids = std::collections::BTreeSet::new();
+    let name = receipt
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let Ok(entries) = fs::read_dir(receipt_dir(receipt)) else {
+        return ids;
+    };
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        if file.starts_with(&format!("{name}."))
+            && file.ends_with(".undone")
+            && let Ok(bytes) = fs::read(entry.path())
+            && let Ok(list) = serde_json::from_slice::<Vec<i64>>(&bytes)
+        {
+            ids.extend(list);
+        }
+    }
+    ids
 }
 
 fn stale(why: &str) -> ArchiveFsError {
@@ -1420,11 +1734,17 @@ pub(crate) mod seams {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum Point {
         AfterReceiptBeforeCommit,
+        /// The commit succeeds but reports an error (a WAL frame on disk
+        /// whose fsync failed).
+        CommitThenError,
         AfterCommitBeforeMark,
         UndoBeforeCommit,
     }
 
+    type Hook = Box<dyn Fn()>;
+
     thread_local! {
+        static HOOK: std::cell::RefCell<Option<(Point, Hook)>> = const { std::cell::RefCell::new(None) };
         static STOP: Cell<Option<Point>> = const { Cell::new(None) };
         static WRITE_ERROR: Cell<Option<i32>> = const { Cell::new(None) };
         static ABORT: Cell<bool> = const { Cell::new(false) };
@@ -1443,6 +1763,22 @@ pub(crate) mod seams {
             std::process::abort();
         }
         hit
+    }
+
+    /// Run `hook` when Apply reaches `point` (e.g. another connection lists
+    /// the receipts while the Apply holds its transaction).
+    pub(crate) fn set_hook(hook: Option<(Point, Hook)>) {
+        HOOK.with(|h| *h.borrow_mut() = hook);
+    }
+
+    pub(crate) fn run_hook(point: Point) {
+        HOOK.with(|h| {
+            if let Some((at, hook)) = h.borrow().as_ref()
+                && *at == point
+            {
+                hook();
+            }
+        });
     }
 
     /// Make the receipt write fail with this OS error (e.g. ENOSPC).

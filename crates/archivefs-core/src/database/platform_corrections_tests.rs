@@ -80,6 +80,21 @@ impl Library {
 
     fn audit(&self, entries: Vec<AuditEntry>) -> DatAuditOutcome {
         let bytes = fs::read(&self.dat).unwrap();
+        // As a real check does: the hashes it computed for each file.
+        let known_hashes = entries
+            .iter()
+            .filter_map(|e| {
+                let content = fs::read(&e.local_path).ok()?;
+                Some((
+                    e.local_path.clone(),
+                    crate::dat::sources::audit_run::AuditedFileHashes {
+                        size_bytes: Some(content.len() as u64),
+                        sha1: Some(hex(&<sha1::Sha1 as sha1::Digest>::digest(&content))),
+                        ..Default::default()
+                    },
+                ))
+            })
+            .collect();
         DatAuditOutcome {
             population: Default::default(),
             source_id: "nes".to_string(),
@@ -113,7 +128,7 @@ impl Library {
             content: Default::default(),
             platform: Some("NES".to_string()),
             cache: Default::default(),
-            known_hashes: Default::default(),
+            known_hashes,
             loose_discs: Default::default(),
         }
     }
@@ -132,6 +147,9 @@ impl Library {
             ("library_dat_identities", "id"),
             ("scan_fingerprints", "relative_path"),
             ("dat_recheck_attempts", "archive_id"),
+            ("library_dat_identity_history", "id"),
+            ("dat_set_audit_results", "id"),
+            ("verified_identity_facts", "id"),
         ] {
             let mut stmt = self
                 .db
@@ -601,7 +619,11 @@ fn an_interruption_before_the_commit_applies_nothing() {
     assert_eq!(lib.state(), before);
     assert_eq!(lib.receipts().len(), 1, "the pending receipt is on disk");
     assert!(lib.db.platform_correction_receipts().unwrap().is_empty());
-    assert!(read_receipt(&lib.receipts()[0]).unwrap().state == ReceiptState::Void);
+    // Never rewritten: it stays exactly as written and keeps resolving to
+    // "never applied".
+    let written = fs::read(&lib.receipts()[0]).unwrap();
+    assert!(lib.db.platform_correction_receipts().unwrap().is_empty());
+    assert_eq!(fs::read(&lib.receipts()[0]).unwrap(), written);
 }
 
 /// Interrupted after the commit but before the receipt was marked: the
@@ -812,4 +834,362 @@ fn emulator_choices_follow_the_system_through_apply_and_undo() {
         Some((LaunchChoiceSource::Game, "snes9x".to_string()))
     );
     assert_eq!(fs::read(&prefs).unwrap(), prefs_bytes);
+}
+
+// --- review 1 (2026-11-27) ---------------------------------------------------
+
+/// A saved exact result for `id` from another system's catalogue.
+fn save_other_system_result(lib: &Library, id: i64, path: &str, header: &str, source: &str) {
+    let mut outcome = lib.audit(vec![exact(path, "SHA-1")]);
+    outcome.source_id = source.to_string();
+    outcome.source_display_name = format!("No-Intro: {header}");
+    outcome.catalogue_names = vec![header.to_string()];
+    outcome.platform = None;
+    let projection =
+        crate::dat::library_identity_projection::project_dat_audit_for_library_identity(
+            &outcome,
+            "2026-01-04T00:00:00Z",
+        )
+        .unwrap();
+    let identity = &projection.items[0].identity;
+    assert!(identifies_system(identity));
+    persist_library_dat_identity_row(&lib.db.connection, id, identity, "2026-01-04T00:00:00Z")
+        .unwrap();
+}
+
+/// B1: a commit that reports an error is not proof that nothing was
+/// committed. The receipt is kept, and when the correction did commit its
+/// Undo is still offered.
+#[test]
+fn a_commit_error_never_removes_the_receipt() {
+    let mut lib = Library::new();
+    let game = lib.game(1, "SNES", "folder_alias");
+    let before = lib.state();
+    let preview = lib.preview(vec![exact(&game, "SHA-1")]);
+    seams::set_stop(Some(Point::CommitThenError), false);
+    let error = lib
+        .db
+        .apply_platform_corrections(&preview, &[1], WhenSomeChanged::RefuseAll)
+        .unwrap_err();
+    seams::set_stop(None, false);
+    assert!(error.to_string().contains("commit"), "{error}");
+    assert!(
+        is_nes(&lib.current(1).unwrap().0),
+        "the commit went through"
+    );
+    assert_eq!(lib.receipts().len(), 1, "the receipt is kept");
+    let listed = lib.db.platform_correction_receipts().unwrap();
+    assert_eq!(listed[0].undoable.len(), 1);
+    lib.db
+        .undo_platform_corrections(&listed[0].receipt_path, None, WhenSomeChanged::RefuseAll)
+        .unwrap();
+    assert_eq!(lib.state(), before);
+}
+
+/// B1: another window lists the receipts while Apply holds its transaction
+/// (the receipt is written, the rows not yet committed). That must not
+/// settle the receipt as void: after the commit the Undo is offered.
+#[test]
+fn listing_receipts_during_an_apply_never_loses_its_undo() {
+    let mut lib = Library::new();
+    let game = lib.game(1, "SNES", "folder_alias");
+    let before = lib.state();
+    let preview = lib.preview(vec![exact(&game, "SHA-1")]);
+    let db_path = lib.dir.path().join("library.sqlite3");
+    let seen = std::rc::Rc::new(std::cell::Cell::new(usize::MAX));
+    let seen_in_hook = seen.clone();
+    seams::set_hook(Some((
+        Point::AfterReceiptBeforeCommit,
+        Box::new(move || {
+            let other = Database::open_read_only(&db_path).unwrap();
+            seen_in_hook.set(other.platform_correction_receipts().unwrap().len());
+        }),
+    )));
+    let applied = lib
+        .db
+        .apply_platform_corrections(&preview, &[1], WhenSomeChanged::RefuseAll);
+    seams::set_hook(None);
+    applied.unwrap();
+    assert_eq!(seen.get(), 0, "nothing committed yet, so nothing listed");
+    let listed = lib.db.platform_correction_receipts().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].undoable.len(), 1, "the Undo survived the listing");
+    lib.db
+        .undo_platform_corrections(&listed[0].receipt_path, None, WhenSomeChanged::RefuseAll)
+        .unwrap();
+    assert_eq!(lib.state(), before);
+}
+
+/// B1: a receipt that cannot be read is shown with its problem, not hidden.
+#[test]
+fn an_unreadable_receipt_is_listed_with_its_problem() {
+    let mut lib = Library::new();
+    let game = lib.game(1, "SNES", "folder_alias");
+    let preview = lib.preview(vec![exact(&game, "SHA-1")]);
+    let receipt = lib
+        .db
+        .apply_platform_corrections(&preview, &[1], WhenSomeChanged::RefuseAll)
+        .unwrap()
+        .receipt_path
+        .unwrap();
+    fs::write(&receipt, b"{ not json").unwrap();
+    let listed = lib.db.platform_correction_receipts().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].undoable.is_empty());
+    assert!(
+        listed[0]
+            .problem
+            .as_deref()
+            .unwrap()
+            .contains("cannot be used")
+    );
+}
+
+/// m3: an edited receipt (one value changed) fails its seal: it is listed
+/// with its problem and Undo refuses it, changing nothing.
+#[test]
+fn an_edited_receipt_is_never_used() {
+    let mut lib = Library::new();
+    let game = lib.game(1, "SNES", "folder_alias");
+    let preview = lib.preview(vec![exact(&game, "SHA-1")]);
+    let receipt = lib
+        .db
+        .apply_platform_corrections(&preview, &[1], WhenSomeChanged::RefuseAll)
+        .unwrap()
+        .receipt_path
+        .unwrap();
+    let applied = lib.state();
+    let text = fs::read_to_string(&receipt).unwrap();
+    let edited = text.replacen("\"folder_alias\"", "\"registry_detector\"", 1);
+    assert_ne!(text, edited);
+    fs::write(&receipt, edited).unwrap();
+    let listed = lib.db.platform_correction_receipts().unwrap();
+    assert!(
+        listed[0].problem.as_deref().unwrap().contains("seal"),
+        "{:?}",
+        listed[0].problem
+    );
+    let error = lib
+        .db
+        .undo_platform_corrections(&receipt, None, WhenSomeChanged::RefuseAll)
+        .unwrap_err();
+    assert!(error.to_string().contains("seal"), "{error}");
+    assert_eq!(lib.state(), applied);
+}
+
+/// M1: another catalogue already matched this file exactly as a different
+/// system. The evidence points at two systems, so the correction is
+/// ambiguous, never Ready; and Apply refuses it when that result was saved
+/// after the preview.
+#[test]
+fn a_game_matched_exactly_by_two_systems_catalogues_is_ambiguous() {
+    const SNES_HEADER: &str = "Nintendo - Super Nintendo Entertainment System";
+    let mut lib = Library::new();
+    let game = lib.game(1, "SNES", "folder_alias");
+    save_other_system_result(&lib, 1, &game, SNES_HEADER, "snes");
+    let preview = lib.preview(vec![exact(&game, "SHA-1")]);
+    assert_eq!(
+        group_of(&preview, 1),
+        Some(PlatformCorrectionGroup::Ambiguous)
+    );
+    assert!(preview.preselected().is_empty());
+
+    let mut lib = Library::new();
+    let game = lib.game(1, "SNES", "folder_alias");
+    let preview = lib.preview(vec![exact(&game, "SHA-1")]);
+    assert_eq!(group_of(&preview, 1), Some(PlatformCorrectionGroup::Ready));
+    save_other_system_result(&lib, 1, &game, SNES_HEADER, "snes");
+    let before = lib.state();
+    let applied = lib
+        .db
+        .apply_platform_corrections(&preview, &[1], WhenSomeChanged::RefuseAll)
+        .unwrap();
+    assert!(applied.corrected.is_empty());
+    assert!(
+        applied.refused[0].reason.contains("two systems"),
+        "{:?}",
+        applied.refused
+    );
+    assert_eq!(lib.state(), before);
+}
+
+/// M2: results or facts saved for the game on its corrected system after the
+/// correction would be left on the wrong system by Undo: refused.
+#[test]
+fn undo_is_refused_when_later_evidence_depends_on_the_corrected_system() {
+    let mut lib = Library::new();
+    let game = lib.game(1, "SNES", "folder_alias");
+    let preview = lib.preview(vec![exact(&game, "SHA-1")]);
+    let receipt = lib
+        .db
+        .apply_platform_corrections(&preview, &[1], WhenSomeChanged::RefuseAll)
+        .unwrap()
+        .receipt_path
+        .unwrap();
+    lib.db
+        .connection
+        .execute(
+            "INSERT INTO verified_identity_facts(archive_id,kind,value,confidence,observed_at,file_device,\
+             file_inode,file_size_bytes,created_at,updated_at) \
+             VALUES(1,'title','Later','verified','2026-01-05',1,1,9,'2026-01-05','2026-01-05')",
+            [],
+        )
+        .unwrap();
+    let later = lib.state();
+    let undone = lib
+        .db
+        .undo_platform_corrections(&receipt, None, WhenSomeChanged::RefuseAll)
+        .unwrap();
+    assert!(undone.undone.is_empty());
+    assert!(
+        undone.refused[0].reason.contains("wrong system"),
+        "{:?}",
+        undone.refused
+    );
+    assert_eq!(lib.state(), later);
+}
+
+/// M3: after one game was undone on its own, "Undo all" undoes the others
+/// rather than refusing because one is already undone.
+#[test]
+fn undo_all_after_a_single_undo_undoes_the_rest() {
+    let mut lib = Library::new();
+    let one = lib.game(1, "SNES", "folder_alias");
+    let two = lib.game(2, "SNES", "folder_alias");
+    let before = lib.state();
+    let preview = lib.preview(vec![exact(&one, "SHA-1"), exact(&two, "SHA-1")]);
+    let receipt = lib
+        .db
+        .apply_platform_corrections(&preview, &[1, 2], WhenSomeChanged::RefuseAll)
+        .unwrap()
+        .receipt_path
+        .unwrap();
+    lib.db
+        .undo_platform_corrections(&receipt, Some(&[1]), WhenSomeChanged::RefuseAll)
+        .unwrap();
+    let rest = lib
+        .db
+        .undo_platform_corrections(&receipt, None, WhenSomeChanged::RefuseAll)
+        .unwrap();
+    assert_eq!(rest.undone, vec![2]);
+    assert!(rest.refused.is_empty(), "{:?}", rest.refused);
+    assert_eq!(lib.state(), before);
+    let listed = lib.db.platform_correction_receipts().unwrap();
+    assert_eq!(listed[0].undone, vec![1, 2]);
+}
+
+/// m1: correcting over an existing result adds a history row; Undo removes
+/// it, so every table is back exactly as before.
+#[test]
+fn undo_over_an_earlier_result_also_removes_its_history_entry() {
+    let mut lib = Library::new();
+    // An earlier, weaker result from the same catalogue, saved while the
+    // game was on NES (or before results were guarded by system); then the
+    // scanner guessed SNES.
+    let game = lib.game(1, "NES", "folder_alias");
+    let mut weak = lib.audit(vec![exact(&game, "CRC32")]);
+    weak.platform = None;
+    let projection =
+        crate::dat::library_identity_projection::project_dat_audit_for_library_identity(
+            &weak,
+            "2026-01-04T00:00:00Z",
+        )
+        .unwrap();
+    let saved = persist_library_dat_identity_row(
+        &lib.db.connection,
+        1,
+        &projection.items[0].identity,
+        "2026-01-04T00:00:00Z",
+    )
+    .unwrap();
+    assert_eq!(
+        saved,
+        super::super::LibraryDatIdentityPersistOutcome::Inserted
+    );
+    lib.db
+        .connection
+        .execute_batch(
+            "UPDATE platform_assignments SET platform = 'SNES' WHERE archive_id = 1; \
+             UPDATE scan_fingerprints SET platform = 'SNES';",
+        )
+        .unwrap();
+    let before = lib.state();
+    let preview = lib.preview(vec![exact(&game, "SHA-1")]);
+    let receipt = lib
+        .db
+        .apply_platform_corrections(&preview, &[1], WhenSomeChanged::RefuseAll)
+        .unwrap()
+        .receipt_path
+        .unwrap();
+    let history: i64 = lib
+        .db
+        .connection
+        .query_row(
+            "SELECT count(*) FROM library_dat_identity_history",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(history >= 1, "the replaced result went to the history");
+    lib.db
+        .undo_platform_corrections(&receipt, None, WhenSomeChanged::RefuseAll)
+        .unwrap();
+    assert_eq!(lib.state(), before);
+}
+
+/// m2: the file's bytes changed but its size and modification time were put
+/// back (`touch -r`): Apply reads the file again and refuses it.
+#[test]
+fn a_rewritten_file_with_its_old_times_is_refused() {
+    let mut lib = Library::new();
+    let game = lib.game(1, "SNES", "folder_alias");
+    let preview = lib.preview(vec![exact(&game, "SHA-1")]);
+    let modified = fs::metadata(&game).unwrap().modified().unwrap();
+    let old = fs::read(&game).unwrap();
+    let mut new = old.clone();
+    new[0] ^= 0xff;
+    fs::write(&game, &new).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&game)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let before = lib.state();
+    let applied = lib
+        .db
+        .apply_platform_corrections(&preview, &[1], WhenSomeChanged::RefuseAll)
+        .unwrap();
+    assert!(applied.corrected.is_empty());
+    assert!(
+        applied.refused[0].reason.contains("content"),
+        "{:?}",
+        applied.refused
+    );
+    assert_eq!(lib.state(), before);
+    assert!(lib.receipts().is_empty());
+}
+
+/// Nits: a preview from the future (the clock moved backwards) is out of
+/// date; the same library under another spelling of its path is accepted.
+#[test]
+fn preview_age_fails_closed_and_the_library_path_is_compared_as_a_file() {
+    let mut lib = Library::new();
+    let game = lib.game(1, "SNES", "folder_alias");
+    let mut preview = lib.preview(vec![exact(&game, "SHA-1")]);
+    preview.made = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    let error = lib
+        .db
+        .apply_platform_corrections(&preview, &[1], WhenSomeChanged::RefuseAll)
+        .unwrap_err();
+    assert!(error.to_string().contains("hour old"), "{error}");
+
+    preview.made = std::time::SystemTime::now();
+    fs::create_dir_all(lib.dir.path().join("sub")).unwrap();
+    preview.database_path = lib.dir.path().join("sub/../library.sqlite3");
+    let applied = lib
+        .db
+        .apply_platform_corrections(&preview, &[1], WhenSomeChanged::RefuseAll)
+        .unwrap();
+    assert_eq!(applied.corrected, vec![1]);
 }

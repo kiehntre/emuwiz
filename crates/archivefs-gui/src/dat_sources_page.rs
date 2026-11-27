@@ -6828,6 +6828,8 @@ impl DatSourcesPageState {
         platform_display: Option<String>,
     ) {
         self.audit = None;
+        // The old audit's corrections are not offered beside a new check.
+        self.platform_corrections.drop_preview();
         self.identity_enrichment_completed = false;
         self.identity_enrichment = None;
         self.audit_error = None;

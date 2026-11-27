@@ -172,6 +172,11 @@ impl Controller {
         }
     }
     fn start_preview(&mut self, inventory: CatalogueInventorySnapshot, database: PathBuf) {
+        // Never while a search or a correction runs: that work's result
+        // (and its Undo) would be dropped with it.
+        if self.other_systems.busy() {
+            return;
+        }
         let Some(selection) = self.selection.clone() else {
             return;
         };
@@ -382,7 +387,7 @@ impl Controller {
         } else if crate::simple_mode::primary_button(
             ui,
             "Preview verification",
-            enabled && inventory.is_some() && database.is_some(),
+            enabled && inventory.is_some() && database.is_some() && !self.other_systems.busy(),
         )
         .clicked()
         {
@@ -392,6 +397,9 @@ impl Controller {
         }
         if database.is_none() {
             ui.label("Open a library database to verify assigned games.");
+        }
+        if self.other_systems.busy() {
+            ui.label("A new check can start when the other-systems search or the platform corrections have finished.");
         }
     }
 }

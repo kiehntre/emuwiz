@@ -226,7 +226,38 @@ pub fn discover_other_system_matches(
             outcome.previews.push(preview);
         }
     }
+    mark_games_found_by_several_systems(&mut outcome.previews);
     Ok(outcome)
+}
+
+/// A game proposed for different systems by different catalogues: the
+/// evidence points at several systems, so it is Ambiguous in every preview
+/// (never Ready, never applicable).
+fn mark_games_found_by_several_systems(previews: &mut [PlatformCorrectionPreview]) {
+    let mut systems: std::collections::BTreeMap<i64, BTreeSet<String>> = Default::default();
+    for preview in previews.iter() {
+        for candidate in &preview.candidates {
+            if !candidate.proposed_platform.is_empty() {
+                systems
+                    .entry(candidate.archive_id)
+                    .or_default()
+                    .insert(candidate.proposed_platform.clone());
+            }
+        }
+    }
+    for preview in previews.iter_mut() {
+        for candidate in &mut preview.candidates {
+            if let Some(found) = systems.get(&candidate.archive_id)
+                && found.len() > 1
+            {
+                candidate.group = crate::database::PlatformCorrectionGroup::Ambiguous;
+                candidate.reason = format!(
+                    "catalogues for several systems matched this file ({}): the evidence points at more than one system",
+                    found.iter().cloned().collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -61,9 +61,20 @@ impl Fixture {
 
     /// A trusted NES catalogue listing `games` (name, file, bytes).
     fn nes_catalogue(&self, games: &[(&str, &str, &[u8])]) -> DiscoveryCatalogue {
-        let dat = self.dir.path().join("nes.dat");
+        self.catalogue("nes", NES_HEADER, "NES", games)
+    }
+
+    /// A trusted catalogue `id` for `platform`, named `header`.
+    fn catalogue(
+        &self,
+        id: &str,
+        header: &str,
+        platform: &str,
+        games: &[(&str, &str, &[u8])],
+    ) -> DiscoveryCatalogue {
+        let dat = self.dir.path().join(format!("{id}.dat"));
         let mut body = format!(
-            "<datafile><header><name>{NES_HEADER}</name><description>{NES_HEADER}</description><version>20260101</version><author>No-Intro</author></header>"
+            "<datafile><header><name>{header}</name><description>{header}</description><version>20260101</version><author>No-Intro</author></header>"
         );
         for (game, file, bytes) in games {
             let sha1: String = Sha1::digest(bytes)
@@ -79,16 +90,16 @@ impl Fixture {
         std::fs::write(&dat, body).unwrap();
         let mut registry = DatSourceRegistry::default();
         let mut entry = DatSourceEntry::new(
-            "nes".into(),
-            "No-Intro NES".into(),
+            id.into(),
+            format!("No-Intro {platform}"),
             dat,
             DatSourceKind::File,
         );
-        entry.platform = Some("NES".into());
+        entry.platform = Some(platform.into());
         entry.platform_chosen_by_person = true;
         registry.add(entry).unwrap();
         let resolved = resolve_catalogue(
-            &CatalogueRef::local("nes"),
+            &CatalogueRef::local(id),
             CatalogueInventoryInputs {
                 local_registry: &registry,
                 managed_sources: &Default::default(),
@@ -99,7 +110,7 @@ impl Fixture {
         .unwrap();
         DiscoveryCatalogue {
             resolved,
-            platform: crate::canonical_platform_for_alias("NES")
+            platform: crate::canonical_platform_for_alias(platform)
                 .unwrap()
                 .to_string(),
         }
@@ -292,4 +303,36 @@ fn only_other_systems_enabled_catalogues_are_chosen() {
         .map(|c| c.resolved.source_id.as_str())
         .collect();
     assert_eq!(names, vec!["nes"]);
+}
+
+/// Review 1 M1: two other systems' catalogues both match the same file
+/// exactly. The evidence points at two systems, so neither preview offers it
+/// as Ready.
+#[test]
+fn a_game_found_by_two_other_systems_is_ambiguous_in_both() {
+    let fixture = Fixture::new();
+    let body: &[u8] = b"a file listed by two systems";
+    let game = fixture.game(1, "both.nes", body, "SNES", "folder_alias");
+    let nes = fixture.nes_catalogue(&[("Both (USA)", "both.nes", body)]);
+    let gb = fixture.catalogue(
+        "gb",
+        "Nintendo - Game Boy",
+        "GB",
+        &[("Both (World)", "both.nes", body)],
+    );
+    let outcome = fixture.discover(&[game], &[nes, gb]);
+    assert_eq!(outcome.previews.len(), 2);
+    for preview in &outcome.previews {
+        assert_eq!(preview.candidates.len(), 1);
+        assert_eq!(
+            preview.candidates[0].group,
+            PlatformCorrectionGroup::Ambiguous
+        );
+        assert!(
+            preview.candidates[0].reason.contains("several systems"),
+            "{}",
+            preview.candidates[0].reason
+        );
+        assert!(preview.preselected().is_empty());
+    }
 }

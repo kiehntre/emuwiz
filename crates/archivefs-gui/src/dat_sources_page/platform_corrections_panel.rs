@@ -89,6 +89,8 @@ pub(crate) struct ReceiptView {
     pub(crate) undoable: Vec<(i64, String, String, String)>,
     pub(crate) undone: usize,
     pub(crate) changed: Vec<(i64, String)>,
+    /// The receipt cannot be read or trusted: shown, never hidden.
+    pub(crate) problem: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +134,19 @@ impl PlatformCorrectionsState {
         self.refresh(database);
     }
 
+    /// A new check started: its old preview is no longer offered. An Apply
+    /// or Undo already running keeps going (its result and Undo are kept);
+    /// the receipts stay listed.
+    pub(crate) fn drop_preview(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+        self.preview = None;
+        self.selected.clear();
+        self.confirming = false;
+        self.offer_rest = None;
+    }
+
     pub(crate) fn clear(&mut self) {
         *self = Self::default();
     }
@@ -149,7 +164,8 @@ impl PlatformCorrectionsState {
         };
         let (sender, receiver) = channel();
         std::thread::spawn(move || {
-            let result = Database::open_or_create(&database)
+            // Listing is read-only: it never creates or migrates a library.
+            let result = Database::open_read_only(&database)
                 .and_then(|db| db.platform_correction_receipts())
                 .map_err(|error| error.to_string());
             let _ = sender.send(WorkerResult::Receipts(result));
@@ -229,7 +245,8 @@ impl PlatformCorrectionsState {
                 } else {
                     WhenSomeChanged::RefuseAll
                 };
-                self.offer_rest = Some(OfferRest::Undo {
+                // A single game's Undo has no "other games" to go ahead with.
+                self.offer_rest = game.is_none().then(|| OfferRest::Undo {
                     receipt: receipt.clone(),
                     game,
                 });
@@ -375,7 +392,7 @@ impl PlatformCorrectionsState {
         let receipts: Vec<ReceiptView> = self
             .receipts
             .iter()
-            .filter(|r| !r.undoable.is_empty() || !r.changed.is_empty())
+            .filter(|r| !r.undoable.is_empty() || !r.changed.is_empty() || r.problem.is_some())
             .map(|r| ReceiptView {
                 path: r.receipt_path.clone(),
                 created_at: r.created_at.clone(),
@@ -401,6 +418,7 @@ impl PlatformCorrectionsState {
                     .iter()
                     .map(|c| (c.archive_id, c.reason.clone()))
                     .collect(),
+                problem: r.problem.clone(),
             })
             .collect();
         if rows.is_empty() && receipts.is_empty() && self.status.is_none() {
@@ -584,6 +602,15 @@ pub(crate) fn show(ui: &mut egui::Ui, view: &PlatformCorrectionsView) -> Option<
         ui.add_space(8.0);
         ui.strong("Corrections you can undo");
         for receipt in &view.receipts {
+            if let Some(problem) = &receipt.problem {
+                widgets::banner(
+                    ui,
+                    "A correction receipt cannot be used",
+                    &format!("{}: {problem}", receipt.path.display()),
+                    widgets::StatusTone::Blocked,
+                );
+                continue;
+            }
             ui.label(format!(
                 "{} · {} · {} in place, {} undone",
                 receipt.created_at,
@@ -623,4 +650,91 @@ pub(crate) fn show(ui: &mut egui::Ui, view: &PlatformCorrectionsView) -> Option<
         }
     }
     action
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    fn summary(problem: Option<&str>) -> PlatformCorrectionReceiptSummary {
+        PlatformCorrectionReceiptSummary {
+            receipt_path: PathBuf::from("/library.sqlite3.platform-corrections-x.json"),
+            created_at: String::new(),
+            catalogue: String::new(),
+            undoable: Vec::new(),
+            undone: Vec::new(),
+            changed: Vec::new(),
+            problem: problem.map(str::to_string),
+        }
+    }
+
+    /// A receipt that cannot be used is shown with its problem, never hidden.
+    #[test]
+    fn an_unusable_receipt_is_shown() {
+        let state = PlatformCorrectionsState {
+            receipts: vec![summary(Some("its contents do not match its seal"))],
+            ..Default::default()
+        };
+        let view = state.view().unwrap();
+        assert_eq!(view.receipts.len(), 1);
+        assert!(
+            view.receipts[0]
+                .problem
+                .as_deref()
+                .unwrap()
+                .contains("seal")
+        );
+    }
+
+    /// One game's Undo has no other games: "go ahead with the others" is
+    /// never offered for it; Undo all still can be.
+    #[test]
+    fn a_single_game_undo_never_offers_the_others() {
+        let mut state = PlatformCorrectionsState::default();
+        let missing = tempfile::tempdir().unwrap();
+        let db = missing.path().join("none.sqlite3");
+        state.handle(
+            CorrectionsAction::Undo {
+                receipt: PathBuf::from("/r.json"),
+                game: Some(1),
+                proceed_with_rest: false,
+            },
+            Some(&db),
+        );
+        assert_eq!(state.offer_rest, None);
+        state.worker = None;
+        state.handle(
+            CorrectionsAction::Undo {
+                receipt: PathBuf::from("/r.json"),
+                game: None,
+                proceed_with_rest: false,
+            },
+            Some(&db),
+        );
+        assert!(matches!(
+            state.offer_rest,
+            Some(OfferRest::Undo { game: None, .. })
+        ));
+    }
+
+    /// A new check drops the old preview but keeps the receipts (and an
+    /// Apply already running).
+    #[test]
+    fn a_new_check_drops_the_old_preview_only() {
+        let mut state = PlatformCorrectionsState {
+            receipts: vec![summary(Some("x"))],
+            selected: [1].into_iter().collect(),
+            confirming: true,
+            ..Default::default()
+        };
+        state.drop_preview();
+        assert!(state.selected.is_empty());
+        assert!(!state.confirming);
+        assert_eq!(state.receipts.len(), 1);
+        let (_sender, receiver) = channel();
+        state.worker = Some(receiver);
+        state.selected.insert(2);
+        state.drop_preview();
+        assert_eq!(state.selected.len(), 1, "a running Apply keeps its state");
+    }
 }
