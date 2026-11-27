@@ -150,6 +150,33 @@ overrides it (and prints a one-line note), so using the wrapper is always safe. 
 interactive shell you can also run `unset CARGO_TARGET_DIR`. Once the global defaults are
 removed (a separate, coordinated step), new shells no longer carry it.
 
+### Development worktrees and full local test passes
+
+- **New development worktrees build on `/mnt/nvme2`**, keeping the root disk free. Right
+  after `git worktree add`, before the first build, create the worktree's ignored
+  `.claude/settings.local.json` with
+  `{ "env": { "EMUWIZ_TARGET_ROOT": "/mnt/nvme2/emuwiz-cargo-targets" } }`; check with
+  `scripts/cargo-iso --print-target`, then `--designate-dev` if you build there all day
+  (the two-worktree limit applies). Shell commands outside the agent session need the same
+  `EMUWIZ_TARGET_ROOT`. Never repoint a worktree that already has a target: two same-named
+  targets on different roots make `--finish-task` and the cleaner's `--only` refuse. The
+  default root stays `~/.cache` (the only root the automatic cleaner covers).
+- **Full local test pass:** `scripts/emuwiz-test-lanes` builds the workspace tests once,
+  then runs the CI shard partition (`scripts/ci_test_shards.py`, full tier) from a shared
+  queue in parallel lanes sharing one thread budget (default 2 lanes, 20 threads, leaving
+  four CPUs free on larger machines; `-l`, `-t`, `-c` to change). It goes through
+  `cargo-iso`, so the two-build limit applies. Measured on Saltbox (2026-11-27): 1,260 s
+  against 3,253 s running the shards one after another; edit-to-rebuild of one
+  archivefs-core line 392 s -> ~131 s in a designated worktree. Run it for a completed
+  change, not after every edit.
+- **Targeted tests:** keep the package selection the worktree was built with. After a
+  `--workspace` build, run `scripts/cargo-iso test --workspace --lib -- <test filter>`
+  (2 s); switching to `-p <crate>` changes feature unification and rebuilt 40 crates (7 min).
+- **Keep `TMPDIR` under `/tmp`**: several sandbox tests require their temp files there
+  (9 fail under `/mnt`). The `launch::amiga_hdf_working_copy` tests need about 77 GB free
+  on TMPDIR's filesystem; below that they fail with "not enough free space", which is the
+  machine, not the code.
+
 ## Coding sessions and code indexing
 
 Start every coding session at the root of the worktree assigned to the task

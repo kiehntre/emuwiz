@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# emuwiz-test-lanes - full local test pass: build the workspace tests once, then run
+# the CI shard partition (scripts/ci_test_shards.py, full tier) in parallel lanes that
+# share one thread budget. Run it from inside an EmuWiz worktree.
+#
+# usage: scripts/emuwiz-test-lanes [-l LANES] [-t THREADS] [-c CPUS] [-o OUTDIR]
+#   -l  parallel lanes (default 2)
+#   -t  total test threads across all lanes (default: 20, at most the CPUs used)
+#   -c  CPU list for taskset, e.g. 4-23 (default: on machines with more than 8 CPUs,
+#       every CPU except the first four, which stay free for other services;
+#       otherwise all CPUs, no pinning). Also EMUWIZ_TEST_LANES_CPUS / _THREADS.
+#   -o  log directory (default ${XDG_CACHE_HOME:-~/.cache}/emuwiz-test-lanes/<worktree>-<time>)
+# Every build and test command goes through scripts/cargo-iso, so its build-slot limit
+# and target rules apply; the shard selections are exactly CI's. TMPDIR is a fresh
+# directory under /tmp per lane: several tests require their temp files under /tmp.
+# Exit status 0 only if the build and every shard passed.
+set -uo pipefail
+ncpu=$(nproc)
+if (( ncpu > 8 )); then cpus=${EMUWIZ_TEST_LANES_CPUS:-4-$((ncpu - 1))}; used=$((ncpu - 4))
+else cpus=${EMUWIZ_TEST_LANES_CPUS:-}; used=$ncpu; fi
+threads=${EMUWIZ_TEST_LANES_THREADS:-$(( used < 20 ? used : 20 ))}
+lanes=2 out=
+while getopts l:t:c:o: o; do case $o in l) lanes=$OPTARG;; t) threads=$OPTARG;; c) cpus=$OPTARG;;
+  o) out=$OPTARG;; *) sed -n '2,16p' "$0"; exit 2;; esac; done
+root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "run this inside an EmuWiz worktree" >&2; exit 2; }
+cd "$root" || exit 2
+SH=scripts/ci_test_shards.py
+[[ -x scripts/cargo-iso && -f $SH ]] || { echo "not an EmuWiz worktree: $root" >&2; exit 2; }
+out=${out:-${XDG_CACHE_HOME:-$HOME/.cache}/emuwiz-test-lanes/$(basename "$root")-$(date +%Y%m%dT%H%M%S)}
+mkdir -p "$out" || exit 2; umask 022
+per=$(( threads / lanes )); (( per >= 1 )) || per=1
+export EMUWIZ_R2_REQUIRE_QUALIFIED=1 CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-$threads}
+pin=(); [[ -n $cpus ]] && command -v taskset >/dev/null && pin=(taskset -c "$cpus")
+ci() { "${pin[@]}" scripts/cargo-iso --low-debug "$@"; }
+mapfile -t pk < <(python3 -I "$SH" packages full)
+mapfile -t shards < <(python3 -I -c 'import json,sys; print("\n".join(json.loads(sys.argv[1])))' "$(python3 -I "$SH" shards full)")
+echo "worktree $root | ${#shards[@]} shards, $lanes lanes x $per threads, cpus ${cpus:-all} | logs $out"
+s=$(date +%s)
+ci test "${pk[@]}" --locked --no-run > "$out/build.log" 2>&1 || { echo "BUILD FAILED (see $out/build.log)"; exit 1; }
+echo "build: $(( $(date +%s) - s ))s"
+# A shared queue, longest shard first (rest is by far the largest, gui-v2 the smallest);
+# each lane takes the next shard as soon as it is free. Shards not named here (a changed
+# partition) run after these.
+order=(); for sh in rest dat recovery gui-v2 "${shards[@]}"; do
+  [[ " ${shards[*]} " == *" $sh "* && " ${order[*]} " != *" $sh "* ]] && order+=("$sh"); done
+printf '%s\n' "${order[@]}" > "$out/queue"; : > "$out/queue.taken"
+next() { flock "$out/queue.lock" bash -c 'n=$(wc -l < "$1"); sed -n "$((n+1))p" "$2" | tee -a "$1"' _ "$out/queue.taken" "$out/queue"; }
+lane() {
+  local n=$1 tmp rc=0 sh; tmp=$(mktemp -d /tmp/etl.XXXXXX) || return 1
+  while sh=$(next) && [[ -n $sh ]]; do
+    local t0=$(date +%s); mapfile -t sel < <(python3 -I "$SH" selection "$sh")
+    TMPDIR=$tmp ci test "${pk[@]}" --locked --no-fail-fast -- --test-threads "$per" "${sel[@]}" > "$out/$sh.log" 2>&1
+    local r=$?; (( r )) && rc=1
+    echo "lane $n: $sh rc=$r $(( $(date +%s) - t0 ))s failed=$(grep -cE '^test .* FAILED$' "$out/$sh.log")"
+  done
+  chmod -R u+rwx "$tmp"; rm -rf "$tmp"; return $rc
+}
+t0=$(date +%s); pids=()
+for ((n=0; n<lanes; n++)); do lane $n & pids+=($!); done
+rc=0; for p in "${pids[@]}"; do wait "$p" || rc=1; done
+echo "tests: $(( $(date +%s) - t0 ))s; total $(( $(date +%s) - s ))s; $( ((rc)) && echo FAILED || echo PASSED)"
+grep -hE '^test .* FAILED$' "$out"/*.log | sort -u | head -30
+exit $rc
