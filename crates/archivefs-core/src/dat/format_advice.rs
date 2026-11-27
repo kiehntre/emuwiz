@@ -45,9 +45,12 @@ pub fn format_gaps(preview: &VerificationPreview) -> Vec<FormatGap> {
     gaps
 }
 
-/// Plain explanation of a preview in which nothing can be checked.
+/// Plain explanation of a preview in which nothing can be checked because
+/// the catalogue lists none of the files' formats. Any other reason (a
+/// missing or unreadable file, an ambiguous path) gets no such advice: the
+/// exclusion rows say why, and "nothing is wrong" would be untrue.
 pub fn nothing_eligible_explanation(preview: &VerificationPreview) -> Option<String> {
-    if preview.eligible_games > 0 || preview.selected_games == 0 {
+    if preview.selected_games == 0 || !preview.lists_none_of_these_formats() {
         return None;
     }
     let listed = if preview.formats.is_empty() {
