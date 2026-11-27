@@ -3,6 +3,7 @@ use super::{
     library::Game,
     routes::{Route, Section},
 };
+use crate::gui_v2::backend::SpawnWorkerThread as _;
 use archivefs_core::gamecube_wii_boot_evidence::nkit::{
     self, NkitHeaderObservation, NkitInspectionError, NkitPlatform,
 };
@@ -97,7 +98,7 @@ fn start(
     let repaint = context.clone();
     if let Err(error) = std::thread::Builder::new()
         .name("nkit-header-inspection".into())
-        .spawn(move || {
+        .spawn_worker_thread(move || {
             let result = nkit::inspect(&path);
             let after = SourceStamp::capture(&path);
             worker

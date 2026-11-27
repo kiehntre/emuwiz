@@ -4,6 +4,7 @@
 use super::documents::{
     DocumentOpenCapability, GameDocument, GameDocumentAssociation, GameDocumentFormat,
 };
+use crate::gui_v2::backend::SpawnWorkerThread as _;
 use archivefs_core::manual_document::{
     ManualDocumentId, ManualViewerError,
     text_guide::{TextGuide, read_text_guide},
@@ -51,7 +52,7 @@ impl TextGuideViewer {
         let repaint = context.clone();
         let started = std::thread::Builder::new()
             .name("emuwiz-text-guide".into())
-            .spawn(move || {
+            .spawn_worker_thread(move || {
                 let _ = sender.send(read_text_guide(&path, Some(&id)));
                 repaint.request_repaint();
             });

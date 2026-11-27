@@ -455,6 +455,32 @@ pub(super) struct Backend {
 /// test's own data directory (`archivefs_core::test_environment::
 /// isolate_test_data`), so work a test starts reads and writes that test's
 /// library database - never one another test left in the shared test home.
+/// [`spawn_worker`] for a configured (for example named) `thread::Builder`:
+/// `builder.spawn_worker_thread(f)` is exactly `builder.spawn(f)` in shipped
+/// builds; test builds also hand the worker the test's data scope.
+pub(crate) trait SpawnWorkerThread {
+    fn spawn_worker_thread<F, T>(self, work: F) -> std::io::Result<std::thread::JoinHandle<T>>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static;
+}
+
+impl SpawnWorkerThread for std::thread::Builder {
+    fn spawn_worker_thread<F, T>(self, work: F) -> std::io::Result<std::thread::JoinHandle<T>>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        #[cfg(test)]
+        let data_scope = archivefs_core::test_environment::current_test_data_scope();
+        self.spawn(move || {
+            #[cfg(test)]
+            archivefs_core::test_environment::enter_test_data_scope(data_scope);
+            work()
+        })
+    }
+}
+
 pub(crate) fn spawn_worker<F, T>(work: F) -> std::thread::JoinHandle<T>
 where
     F: FnOnce() -> T + Send + 'static,

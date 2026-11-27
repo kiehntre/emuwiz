@@ -132,6 +132,11 @@ fn drop_cargo_loader_path() {
 /// Isolates this process. Idempotent. Must run before any other thread starts;
 /// [`install_test_environment!`] guarantees that by running it before `main`.
 pub fn isolate_process_environment() {
+    // Taken first, on every path (owned, adopted or real-machine), so it can
+    // never pass on to this process's own children.
+    let report = std::env::var_os(REPORT_ROOT_ENVIRONMENT);
+    // SAFETY: the constructor runs before `main`, single-threaded.
+    unsafe { std::env::remove_var(REPORT_ROOT_ENVIRONMENT) };
     ISOLATION.get_or_init(|| {
         if std::env::var_os(REAL_ENVIRONMENT_OPT_IN).is_some_and(|value| value == "1") {
             return None;
@@ -238,7 +243,9 @@ pub fn isolate_process_environment() {
             std::env::remove_var(crate::app_dirs::CONFIG_ROOT_OVERRIDE_ENV);
             libc::atexit(finish_isolation);
         }
-        report_root_to_parent(&root);
+        if let Some(report) = &report {
+            report_root_to_parent(&root, Path::new(report));
+        }
         Some(Isolation {
             root,
             owned: true,
@@ -320,28 +327,28 @@ fn try_lock(file: &std::fs::File) -> std::io::Result<bool> {
     }
 }
 
-/// Child side of [`REPORT_ROOT_ENVIRONMENT`]: write the created tree's path
-/// into the parent's new report file (never following or replacing anything),
-/// then forget the variable so this process's own children cannot reuse it.
-/// Runs in the constructor, so it never panics.
-fn report_root_to_parent(root: &Path) {
+/// Child side of [`REPORT_ROOT_ENVIRONMENT`]: publish the created tree's path
+/// at the parent's report name atomically (written beside it, then hard-linked
+/// into place, which never replaces anything), so the parent sees either no
+/// report or the whole path. Runs in the constructor, so it never panics.
+fn report_root_to_parent(root: &Path, report: &Path) {
     use std::io::Write;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
-    let Some(report) = std::env::var_os(REPORT_ROOT_ENVIRONMENT) else {
-        return;
-    };
-    // SAFETY: still the single-threaded constructor (see above).
-    unsafe { std::env::remove_var(REPORT_ROOT_ENVIRONMENT) };
-    if let Ok(mut file) = std::fs::OpenOptions::new()
+    let mut partial = report.as_os_str().to_os_string();
+    partial.push(format!(".{}.partial", std::process::id()));
+    let partial = PathBuf::from(partial);
+    let written = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(report)
-    {
-        let _ = file.write_all(root.as_os_str().as_bytes());
+        .open(&partial)
+        .and_then(|mut file| file.write_all(root.as_os_str().as_bytes()));
+    if written.is_ok() {
+        let _ = std::fs::hard_link(&partial, report);
     }
+    let _ = std::fs::remove_file(&partial);
 }
 
 /// Creates and locks a fresh `<name>.lock`, then the tree `<name>`, with a
@@ -610,11 +617,10 @@ pub fn reported_child_tree(report: &Path) -> Option<PathBuf> {
     let bytes = std::fs::read(report).ok()?;
     let tree = PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
     let base = isolated_root()?.parent()?;
-    assert!(
-        tree.parent() == Some(base) && tree.file_name().is_some(),
-        "a child reported a tree outside the test environment: {tree:?}"
-    );
-    Some(tree)
+    // Reports are published atomically, so anything else was not written by
+    // a child of this binary: never act on it (and never panic, since this
+    // runs from a fixture's drop, possibly while unwinding).
+    (tree.parent() == Some(base) && tree.file_name().is_some()).then_some(tree)
 }
 
 /// Removes every test environment tree beside this process's own whose owner

@@ -20,6 +20,7 @@
 //! always rebuilds the plan and refuses when it differs from the one the
 //! person reviewed; it never substitutes a newer plan behind their back.
 
+use crate::gui_v2::backend::SpawnWorkerThread as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, mpsc};
@@ -1824,7 +1825,7 @@ impl MameReconstructionPanel {
         let environment = self.environment.clone();
         let spawned = std::thread::Builder::new()
             .name("emuwiz-mame-reconstruction".into())
-            .spawn(move || {
+            .spawn_worker_thread(move || {
                 let phase_sender = sender.clone();
                 let mut phase = |text: &str| {
                     let _ = phase_sender.send(JobEvent::Phase(text.to_string()));

@@ -5,6 +5,7 @@ use super::{
     library::Game,
     media_sources::MediaIndex,
 };
+use crate::gui_v2::backend::SpawnWorkerThread as _;
 use eframe::egui;
 use std::{
     sync::{
@@ -57,7 +58,7 @@ impl DocumentRefresh {
         let repaint = context.clone();
         if std::thread::Builder::new()
             .name("manual-document-refresh".into())
-            .spawn(move || {
+            .spawn_worker_thread(move || {
                 while let Ok(request) = requests.recv() {
                     let (documents, issue) = discover_game_documents(
                         &request.game,

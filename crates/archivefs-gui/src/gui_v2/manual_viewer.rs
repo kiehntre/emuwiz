@@ -3,6 +3,7 @@ use super::documents::{
     DocumentFitMode, DocumentOpenCapability, DocumentReadingState, GameDocument,
     GameDocumentAssociation,
 };
+use crate::gui_v2::backend::SpawnWorkerThread as _;
 use archivefs_core::manual_document::{
     ManualCancellation, ManualDocument, ManualDocumentId, ManualDocumentKind, ManualLimits,
     ManualPageImage, ManualReadiness, ManualViewerAction as Action, ManualViewerState, ManualZoom,
@@ -124,7 +125,7 @@ impl Worker {
         let worker = shared.clone();
         std::thread::Builder::new()
             .name("manual-page-reader".into())
-            .spawn(move || {
+            .spawn_worker_thread(move || {
                 loop {
                     let (lock, wake) = &*worker;
                     let mut mailbox = lock.lock().unwrap_or_else(|error| error.into_inner());
