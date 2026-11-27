@@ -11,6 +11,7 @@
 //! and never grabbed, so emulators see the controller as usual.
 
 use super::nav::{Button, Control, Direction, PadEvent};
+#[cfg(target_os = "linux")]
 use crate::gui_v2::backend::SpawnWorkerThread as _;
 
 const STICK_ON: f32 = 0.55;

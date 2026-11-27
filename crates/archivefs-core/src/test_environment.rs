@@ -132,12 +132,13 @@ fn drop_cargo_loader_path() {
 /// Isolates this process. Idempotent. Must run before any other thread starts;
 /// [`install_test_environment!`] guarantees that by running it before `main`.
 pub fn isolate_process_environment() {
-    // Taken first, on every path (owned, adopted or real-machine), so it can
-    // never pass on to this process's own children.
-    let report = std::env::var_os(REPORT_ROOT_ENVIRONMENT);
-    // SAFETY: the constructor runs before `main`, single-threaded.
-    unsafe { std::env::remove_var(REPORT_ROOT_ENVIRONMENT) };
     ISOLATION.get_or_init(|| {
+        // Taken first, on every path (owned, adopted or real-machine), so it
+        // can never pass on to this process's own children.
+        let report = std::env::var_os(REPORT_ROOT_ENVIRONMENT);
+        // SAFETY: the one-time init runs from the pre-`main` constructor,
+        // single-threaded.
+        unsafe { std::env::remove_var(REPORT_ROOT_ENVIRONMENT) };
         if std::env::var_os(REAL_ENVIRONMENT_OPT_IN).is_some_and(|value| value == "1") {
             return None;
         }
@@ -345,8 +346,13 @@ fn report_root_to_parent(root: &Path, report: &Path) {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&partial)
         .and_then(|mut file| file.write_all(root.as_os_str().as_bytes()));
-    if written.is_ok() {
-        let _ = std::fs::hard_link(&partial, report);
+    match written.and_then(|()| std::fs::hard_link(&partial, report)) {
+        Ok(()) => {}
+        // Already reported (never replaced).
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => eprintln!(
+            "test environment: could not report this child's tree {root:?} to its parent at {report:?}: {error}"
+        ),
     }
     let _ = std::fs::remove_file(&partial);
 }
@@ -620,7 +626,11 @@ pub fn reported_child_tree(report: &Path) -> Option<PathBuf> {
     // Reports are published atomically, so anything else was not written by
     // a child of this binary: never act on it (and never panic, since this
     // runs from a fixture's drop, possibly while unwinding).
-    (tree.parent() == Some(base) && tree.file_name().is_some()).then_some(tree)
+    let valid = tree.parent() == Some(base) && tree.file_name().is_some();
+    if !valid {
+        eprintln!("test environment: ignored an invalid child tree report {report:?}: {tree:?}");
+    }
+    valid.then_some(tree)
 }
 
 /// Removes every test environment tree beside this process's own whose owner

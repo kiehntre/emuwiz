@@ -450,11 +450,6 @@ pub(super) struct Backend {
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Starts a GUI v2 background worker thread. In the application this is
-/// exactly `std::thread::spawn`. In tests the worker also inherits the calling
-/// test's own data directory (`archivefs_core::test_environment::
-/// isolate_test_data`), so work a test starts reads and writes that test's
-/// library database - never one another test left in the shared test home.
 /// [`spawn_worker`] for a configured (for example named) `thread::Builder`:
 /// `builder.spawn_worker_thread(f)` is exactly `builder.spawn(f)` in shipped
 /// builds; test builds also hand the worker the test's data scope.
@@ -481,6 +476,11 @@ impl SpawnWorkerThread for std::thread::Builder {
     }
 }
 
+/// Starts a GUI v2 background worker thread. In the application this is
+/// exactly `std::thread::spawn`. In tests the worker also inherits the calling
+/// test's own data directory (`archivefs_core::test_environment::
+/// isolate_test_data`), so work a test starts reads and writes that test's
+/// library database - never one another test left in the shared test home.
 pub(crate) fn spawn_worker<F, T>(work: F) -> std::thread::JoinHandle<T>
 where
     F: FnOnce() -> T + Send + 'static,
