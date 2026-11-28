@@ -181,6 +181,15 @@ pub(super) fn arcade_label(entry: &DatSourceEntry) -> Option<String> {
     })
 }
 
+/// Whether a catalogue's stored platform names the same system as `platform`,
+/// using the core's equivalences (PC Engine is TurboGrafx-16), as the preview
+/// and the core verification already do.
+pub(super) fn same_system(stored: Option<&str>, platform: &str) -> bool {
+    stored
+        .and_then(archivefs_core::canonical_platform_for_alias)
+        .is_some_and(|p| archivefs_core::dat::catalogue_recognition::same_platform(p, platform))
+}
+
 fn row_metadata_ready(row: &DatSourceRowView) -> bool {
     row.enabled
         && !row.health_stale
@@ -226,11 +235,7 @@ fn choices_for_selection(
         .iter()
         .filter(|row| {
             row.enabled
-                && (row
-                    .platform_id
-                    .as_deref()
-                    .and_then(archivefs_core::canonical_platform_for_alias)
-                    == Some(platform)
+                && (same_system(row.platform_id.as_deref(), platform)
                     || platform != "Arcade"
                         && row.platform_id.is_none()
                         && selected == Some(&CatalogueRef::local(&row.id)))
@@ -262,11 +267,7 @@ fn choices_for_selection(
                 matches!(row.reference, CatalogueRef::ManagedCurrent { .. })
                     && row.enabled
                     && row.variant.confirmed() != Some(&CatalogueVariant::Bios)
-                    && row
-                        .platform
-                        .confirmed()
-                        .and_then(|p| archivefs_core::canonical_platform_for_alias(p))
-                        == Some(platform)
+                    && same_system(row.platform.confirmed().map(String::as_str), platform)
             })
             .map(|row| Choice {
                 reference: row.reference.clone(),
@@ -559,14 +560,10 @@ pub(super) fn show_with_inputs(
         .iter()
         .find(|row| row.platform == platform)
         .is_none_or(|row| !row.expected_sources.is_empty());
-    let installed_unused = view.rows.iter().any(|row| {
-        !row.enabled
-            && row
-                .platform_id
-                .as_deref()
-                .and_then(archivefs_core::canonical_platform_for_alias)
-                == Some(platform.as_str())
-    });
+    let installed_unused = view
+        .rows
+        .iter()
+        .any(|row| !row.enabled && same_system(row.platform_id.as_deref(), &platform));
     if std::mem::take(&mut state.open_setup_if_not_ready) {
         state.setup = !ready && supported;
     }
@@ -618,14 +615,18 @@ pub(super) fn show_with_inputs(
                 egui::TextEdit::singleline(&mut state.catalogue_query)
                     .hint_text("Find an installed catalogue"),
             );
-            egui::ComboBox::from_id_salt(("simple-catalogue", &platform))
+            let query = state.catalogue_query.to_lowercase();
+            let matches: Vec<_> = candidates
+                .iter()
+                .filter(|c| c.label.to_lowercase().contains(&query))
+                .collect();
+            // egui keeps a closed popup's size and reuses it as the space for
+            // the next opening, so a list that grew after a narrower search
+            // stayed one row tall. A list of another length is another popup.
+            egui::ComboBox::from_id_salt(("simple-catalogue", &platform, matches.len()))
                 .selected_text(chosen.map_or("Choose verification data", |c| c.label.as_str()))
                 .show_ui(ui, |ui| {
-                    for choice in candidates.iter().filter(|c| {
-                        c.label
-                            .to_lowercase()
-                            .contains(&state.catalogue_query.to_lowercase())
-                    }) {
+                    for choice in matches {
                         if ui
                             .selectable_label(
                                 chosen.is_some_and(|c| c.reference == choice.reference),

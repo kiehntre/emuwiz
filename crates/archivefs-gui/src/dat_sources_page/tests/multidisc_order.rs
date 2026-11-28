@@ -188,7 +188,9 @@ fn verified_dat_order_reaches_game_details_and_preview_without_database_edits() 
             .technical_details
             .iter()
             .any(|d| d.contains("3 disc/disk/tape image(s) numbered")
-                && d.contains("1 game(s) saved")),
+                && d.contains(
+                    "saved disc order for 1 game(s); 0 game(s) already had the same disc order"
+                )),
         "{:?}",
         saved.technical_details
     );
@@ -349,10 +351,8 @@ fn audit_before_validation_saves_its_exact_inventory_and_order() {
         DatSaveOutcome::Success | DatSaveOutcome::SuccessWithWarnings
     ));
     assert!(
-        audited
-            .technical_details
-            .iter()
-            .any(|detail| detail.contains("1 game(s) saved")),
+        audited.technical_details.iter().any(|detail| detail
+            .contains("saved disc order for 1 game(s); 0 game(s) already had the same disc order")),
         "{:?}",
         audited.technical_details
     );
@@ -368,10 +368,8 @@ fn audit_before_validation_saves_its_exact_inventory_and_order() {
     );
     let audited = library.audit();
     assert!(
-        audited
-            .technical_details
-            .iter()
-            .any(|d| d.contains("1 game(s) saved")),
+        audited.technical_details.iter().any(|d| d
+            .contains("saved disc order for 0 game(s); 1 game(s) already had the same disc order")),
         "{:?}",
         audited.technical_details
     );
@@ -397,10 +395,8 @@ fn a_changed_dat_is_flagged_and_an_audit_saves_the_new_exact_inventory() {
     );
     let audit = library.audit();
     assert!(
-        audit
-            .technical_details
-            .iter()
-            .any(|detail| detail.contains("1 game(s) saved")),
+        audit.technical_details.iter().any(|detail| detail
+            .contains("saved disc order for 1 game(s); 0 game(s) already had the same disc order")),
         "{:?}",
         audit.technical_details
     );

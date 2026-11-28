@@ -24,8 +24,12 @@ pub struct DatDiscOrderOutcome {
     /// are ambiguous, the platform is unknown, the file changed since the
     /// scan, or the entry is not in the same revision's saved inventory.
     pub refused: usize,
-    /// Verified releases saved or refreshed.
+    /// Verified releases saved or refreshed. The refresh covers the whole
+    /// library, so this includes releases saved by earlier checks.
     pub written: usize,
+    /// Of `written`, releases whose saved evidence was already identical and
+    /// was left untouched. `written - unchanged` is what this refresh changed.
+    pub unchanged: usize,
     /// Saved releases kept because the new claim disagrees with them.
     pub conflicts_kept: usize,
     /// Sources with no saved complete entry list, including legacy audits.
@@ -229,6 +233,7 @@ impl Database {
             generation,
         )?;
         outcome.written = saved.written;
+        outcome.unchanged = saved.unchanged;
         outcome.conflicts_kept = saved.conflicts_kept;
         Ok(outcome)
     }

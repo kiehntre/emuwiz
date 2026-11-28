@@ -8959,6 +8959,34 @@ pub(crate) fn local_dat_row_visible(
         )
 }
 
+/// Whether the "Installed DATs" list shows `row`. A typed search reaches
+/// every catalogue, including unassigned ones the relevant-only view hides:
+/// someone searching for a catalogue by name, path or id must find it.
+pub(crate) fn local_dat_row_listed(
+    row: &DatSourceRowView,
+    show_all: bool,
+    show_unassigned: bool,
+    query: &str,
+    status: LocalDatStatusFilter,
+) -> bool {
+    (!query.trim().is_empty() || local_dat_row_visible(row, show_all, show_unassigned))
+        && local_dat_row_matches_filter(row, query, status)
+}
+
+/// `Some(true)` on the first frame a search changes to a non-empty text, or
+/// when its matches were asked for, so the collapsed list holding them opens;
+/// `None` otherwise, leaving the list as the person left it.
+fn local_dat_search_opens_list(ui: &egui::Ui, query: &str, show_matches: bool) -> Option<bool> {
+    let id = egui::Id::new("local-dat-search-last-query");
+    let query = query.trim().to_string();
+    let last = ui.data(|d| d.get_temp::<String>(id)).unwrap_or_default();
+    let changed = last != query;
+    if changed {
+        ui.data_mut(|d| d.insert_temp(id, query.clone()));
+    }
+    (show_matches || changed && !query.is_empty()).then_some(true)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum LocalDatStatusFilter {
     #[default]
@@ -8976,6 +9004,7 @@ pub(crate) fn local_dat_row_matches_filter(
     let query = query.trim().to_lowercase();
     let text_matches = query.is_empty()
         || row.display_name.to_lowercase().contains(&query)
+        || row.id.to_lowercase() == query
         || row.path.to_lowercase().contains(&query)
         || row
             .platform_display
@@ -9146,8 +9175,33 @@ pub(crate) fn show_dat_sources_page(
                     "Not configured",
                 );
             });
-        ui.label("Searches name, path and platform.");
+        ui.label("Searches name, path, platform and catalogue id.");
     });
+    let searching = !ui_state.local_source_query.trim().is_empty();
+    let mut show_matches = false;
+    if searching {
+        let matches = view
+            .rows
+            .iter()
+            .filter(|row| {
+                local_dat_row_listed(
+                    row,
+                    ui_state.show_all_local_dat_sources,
+                    ui_state.show_unassigned_local_dat_sources,
+                    &ui_state.local_source_query,
+                    ui_state.local_source_status,
+                )
+            })
+            .count();
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(if matches == 0 {
+                "No installed catalogue matches this search.".to_string()
+            } else {
+                format!("{matches} matching catalogue(s), including unassigned ones.")
+            });
+            show_matches = matches > 0 && ui.button("Show matches").clicked();
+        });
+    }
     ui.add_space(6.0);
 
     if action.is_none()
@@ -9193,12 +9247,19 @@ pub(crate) fn show_dat_sources_page(
         .rows
         .iter()
         .any(|row| row.mame_replacement_available && row.current_file_missing_or_invalid);
-    egui::CollapsingHeader::new("Installed DATs — local files")
+    let installed = egui::CollapsingHeader::new("Installed DATs — local files")
         // Keep the established small-source workflow expanded; the wall of
         // rows is the large-registry case this wrapper is meant to contain.
         // A broken MAME source is different: its recovery action must be
         // visible without making the user discover two disclosure controls.
         .default_open(view.rows.len() < 10 || has_mame_recovery)
+        // A new search opens the list its matches are in; the person can
+        // still close it again without the search reopening it every frame.
+        .open(local_dat_search_opens_list(
+            ui,
+            &ui_state.local_source_query,
+            show_matches,
+        ))
         .show(ui, |ui| {
     ui.label(egui::RichText::new("User-added DAT files and folders. These stay local-only and are never updateable.").color(theme::muted(ui)).small());
     ui.horizontal(|ui| {
@@ -9248,12 +9309,10 @@ pub(crate) fn show_dat_sources_page(
             .rows
             .iter()
             .filter(|row| {
-                local_dat_row_visible(
+                local_dat_row_listed(
                     row,
                     ui_state.show_all_local_dat_sources,
                     ui_state.show_unassigned_local_dat_sources,
-                ) && local_dat_row_matches_filter(
-                    row,
                     &ui_state.local_source_query,
                     ui_state.local_source_status,
                 )
@@ -9261,18 +9320,33 @@ pub(crate) fn show_dat_sources_page(
             .collect::<Vec<_>>();
         if visible_rows.is_empty() {
             ui.label(
-                egui::RichText::new(
-                    "No assigned DATs are in the main view. Use Show unassigned or Show all DATs to browse the rest.",
-                )
+                egui::RichText::new(if searching {
+                    "No installed catalogue matches this search."
+                } else {
+                    "No assigned DATs are in the main view. Use Show unassigned or Show all DATs to browse the rest."
+                })
                 .color(theme::muted(ui))
                 .small(),
             );
         }
+        // Catalogues that share a name are told apart by their id.
+        let mut names = std::collections::HashSet::new();
+        let shared_names: std::collections::HashSet<&str> = view
+            .rows
+            .iter()
+            .map(|row| row.display_name.as_str())
+            .filter(|name| !names.insert(*name))
+            .collect();
         for row in visible_rows {
             let open = ui_state
                 .local_sources_expanded
                 .unwrap_or(view.rows.len() < 10 || row.current_file_missing_or_invalid);
-            egui::CollapsingHeader::new(format!("{} · {}", row.display_name, row.kind_label))
+            let title = if shared_names.contains(row.display_name.as_str()) {
+                format!("{} · {} · id {}", row.display_name, row.kind_label, row.id)
+            } else {
+                format!("{} · {}", row.display_name, row.kind_label)
+            };
+            egui::CollapsingHeader::new(title)
                 .id_salt(("local-dat-source", row.id.as_str()))
                 .default_open(open)
                 .show(ui, |ui| {
@@ -9286,6 +9360,11 @@ pub(crate) fn show_dat_sources_page(
         }
     }
     });
+    if show_matches {
+        installed
+            .header_response
+            .scroll_to_me(Some(egui::Align::TOP));
+    }
 
     ui.add_space(12.0);
     if action.is_none()

@@ -212,9 +212,16 @@ fn verified_discs_save_catalogue_order_despite_misleading_local_names() {
         "{note:?}"
     );
 
-    // Running it again changes nothing and reports no conflict.
+    assert_eq!(outcome.unchanged, 0, "the first refresh saves new order");
+
+    // Running it again changes nothing and reports no conflict. The release
+    // is still counted in `written` (the refresh covers the whole library),
+    // and `unchanged` says that this run changed none of it.
     let again = lib.audit_and_refresh();
-    assert_eq!((again.written, again.conflicts_kept), (1, 0));
+    assert_eq!(
+        (again.written, again.unchanged, again.conflicts_kept),
+        (1, 1, 0)
+    );
     assert_eq!(Library::order(&lib.sets()[0]), Library::order(&sets[0]));
 
     // Saved order is bound to the catalogue: once a rescan records a changed

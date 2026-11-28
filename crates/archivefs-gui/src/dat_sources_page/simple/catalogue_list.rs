@@ -80,7 +80,9 @@ impl CatalogueList {
                         .and_then(archivefs_core::canonical_platform_for_alias);
                     let group = if !row.enabled {
                         Group::Disabled
-                    } else if row.platform_id.is_some() && known != Some(platform) {
+                    } else if row.platform_id.is_some()
+                        && !same_system(row.platform_id.as_deref(), platform)
+                    {
                         Group::Incompatible
                     } else if !row_metadata_ready(row) {
                         Group::NeedsChecking
@@ -147,11 +149,7 @@ pub(super) fn show(
                             .unwrap_or("Platform not established"),
                         state.catalogue_list.providers[index]
                     ));
-                    let compatible = row
-                        .platform_id
-                        .as_deref()
-                        .and_then(archivefs_core::canonical_platform_for_alias)
-                        == Some(platform);
+                    let compatible = same_system(row.platform_id.as_deref(), platform);
                     let unknown = row.platform_id.is_none();
                     if !row.enabled {
                         ui.label(
