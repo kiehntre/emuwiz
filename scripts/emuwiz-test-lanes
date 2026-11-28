@@ -10,8 +10,9 @@
 #       every CPU except the first four, which stay free for other services;
 #       otherwise all CPUs, no pinning). Also EMUWIZ_TEST_LANES_CPUS / _THREADS.
 #   -o  log directory (default ${XDG_CACHE_HOME:-~/.cache}/emuwiz-test-lanes/<worktree>-<time>)
-# Every build and test command goes through scripts/cargo-iso, so its build-slot limit
-# and target rules apply; the shard selections are exactly CI's. TMPDIR is a fresh
+# Every build and test command goes through scripts/cargo-iso, so its build-slot limit,
+# target rules and the target's recorded debug mode apply (nothing is switched); the
+# shard selections are exactly CI's. TMPDIR is a fresh
 # directory under /tmp per lane: several tests require their temp files under /tmp.
 # Exit status 0 only if the build and every shard passed.
 set -uo pipefail
@@ -21,17 +22,18 @@ else cpus=${EMUWIZ_TEST_LANES_CPUS:-}; used=$ncpu; fi
 threads=${EMUWIZ_TEST_LANES_THREADS:-$(( used < 20 ? used : 20 ))}
 lanes=2 out=
 while getopts l:t:c:o: o; do case $o in l) lanes=$OPTARG;; t) threads=$OPTARG;; c) cpus=$OPTARG;;
-  o) out=$OPTARG;; *) sed -n '2,16p' "$0"; exit 2;; esac; done
+  o) out=$OPTARG;; *) sed -n '2,17p' "$0"; exit 2;; esac; done
 root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "run this inside an EmuWiz worktree" >&2; exit 2; }
 cd "$root" || exit 2
 SH=scripts/ci_test_shards.py
 [[ -x scripts/cargo-iso && -f $SH ]] || { echo "not an EmuWiz worktree: $root" >&2; exit 2; }
+command -v flock >/dev/null || { echo "emuwiz-test-lanes needs flock (util-linux)" >&2; exit 2; }
 out=${out:-${XDG_CACHE_HOME:-$HOME/.cache}/emuwiz-test-lanes/$(basename "$root")-$(date +%Y%m%dT%H%M%S)}
 mkdir -p "$out" || exit 2; umask 022
 per=$(( threads / lanes )); (( per >= 1 )) || per=1
 export EMUWIZ_R2_REQUIRE_QUALIFIED=1 CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-$threads}
 pin=(); [[ -n $cpus ]] && command -v taskset >/dev/null && pin=(taskset -c "$cpus")
-ci() { "${pin[@]}" scripts/cargo-iso --low-debug "$@"; }
+ci() { "${pin[@]}" scripts/cargo-iso "$@"; }
 mapfile -t pk < <(python3 -I "$SH" packages full)
 mapfile -t shards < <(python3 -I -c 'import json,sys; print("\n".join(json.loads(sys.argv[1])))' "$(python3 -I "$SH" shards full)")
 echo "worktree $root | ${#shards[@]} shards, $lanes lanes x $per threads, cpus ${cpus:-all} | logs $out"
@@ -47,7 +49,9 @@ printf '%s\n' "${order[@]}" > "$out/queue"; : > "$out/queue.taken"
 next() { flock "$out/queue.lock" bash -c 'n=$(wc -l < "$1"); sed -n "$((n+1))p" "$2" | tee -a "$1"' _ "$out/queue.taken" "$out/queue"; }
 lane() {
   local n=$1 tmp rc=0 sh; tmp=$(mktemp -d /tmp/etl.XXXXXX) || return 1
-  while sh=$(next) && [[ -n $sh ]]; do
+  while :; do
+    sh=$(next) || { echo "lane $n: shard queue error"; rc=1; break; }
+    [[ -n $sh ]] || break
     local t0=$(date +%s); mapfile -t sel < <(python3 -I "$SH" selection "$sh")
     TMPDIR=$tmp ci test "${pk[@]}" --locked --no-fail-fast -- --test-threads "$per" "${sel[@]}" > "$out/$sh.log" 2>&1
     local r=$?; (( r )) && rc=1
@@ -58,6 +62,10 @@ lane() {
 t0=$(date +%s); pids=()
 for ((n=0; n<lanes; n++)); do lane $n & pids+=($!); done
 rc=0; for p in "${pids[@]}"; do wait "$p" || rc=1; done
+# Every shard must have been taken and run, so a queue failure can never look like a pass.
+taken=$(wc -l < "$out/queue.taken")
+if (( taken != ${#order[@]} )); then echo "only $taken of ${#order[@]} shards ran"; rc=1; fi
+for sh in "${order[@]}"; do [[ -s $out/$sh.log ]] || { echo "shard $sh has no log"; rc=1; }; done
 echo "tests: $(( $(date +%s) - t0 ))s; total $(( $(date +%s) - s ))s; $( ((rc)) && echo FAILED || echo PASSED)"
 grep -hE '^test .* FAILED$' "$out"/*.log | sort -u | head -30
 exit $rc
