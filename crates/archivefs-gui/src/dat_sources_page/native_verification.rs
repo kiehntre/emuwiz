@@ -271,6 +271,9 @@ impl Controller {
                 "Verification complete"
             });
             ui.label(format!("Verified: {} · No catalogue match: {} · Ambiguous: {} · Not checked: {} · Errors: {}",t.verified,t.no_match,t.ambiguous,t.not_checked,t.errors));
+            if let Some(withheld) = &t.save_withheld {
+                ui.label(withheld);
+            }
             ui.label(&t.catalogue);
             ui.small(format!("Catalogue SHA-256: {}", t.catalogue_sha256));
             if !t.unchecked.is_empty() {

@@ -717,6 +717,12 @@ fn header_segments(text: &str) -> Vec<String> {
 ///    while a single generic word (`"Commodore"`, `"Software"`) is never
 ///    trimmed down to nothing and invented into a platform.
 fn resolve_segment(segment: &str) -> Option<&'static str> {
+    // A reviewed TOSEC system ("MSX MSX2") names one machine; trimming its
+    // last word would name a different one ("MSX").
+    if let Some(platform) = crate::dat::catalogue_recognition::reviewed_tosec_system(segment.trim())
+    {
+        return Some(platform);
+    }
     if let Some(platform) = platform_for_alias(segment) {
         return Some(platform.id);
     }

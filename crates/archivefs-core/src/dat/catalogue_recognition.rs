@@ -588,11 +588,22 @@ fn no_intro_system_platform(
     decide(candidates, system).map(|platform| (platform, unknown))
 }
 
+/// The machine a hand-reviewed TOSEC system name names, if it is one of
+/// [`REVIEWED_TOSEC_SYSTEMS`]. The save guard reads headers with this table
+/// too, so admission and save never disagree about these names.
+pub(crate) fn reviewed_tosec_system(system: &str) -> Option<&'static str> {
+    REVIEWED_TOSEC_SYSTEMS
+        .iter()
+        .find(|(exact, _)| *exact == system)
+        .map(|(_, platform)| *platform)
+}
+
 /// TOSEC system names whose second part the alias registry does not spell,
 /// reviewed by hand: each names one machine.
 const REVIEWED_TOSEC_SYSTEMS: &[(&str, &str)] = &[
     ("Nintendo Famicom & Entertainment System", "NES"),
     ("Atari 2600 & VCS", "Atari2600"),
+    ("MSX MSX2", "MSX2"),
 ];
 
 /// Reviewed makers that lead a No-Intro / Redump style name. Any other
