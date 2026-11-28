@@ -54,6 +54,32 @@ pub(crate) enum OrganisationScope {
 }
 
 impl OrganisationScope {
+    /// Stage B (owner 2026-11-26): "Make the active platform, folder and
+    /// rename scope unmistakable." One line naming what kind of scope is
+    /// active and exactly which platforms, folder(s) or games it covers.
+    pub(crate) fn banner(scope: Option<&Self>) -> String {
+        const KEEP: &str = "Files stay in their folders; only their names change.";
+        match scope {
+            None => "Renaming: nothing chosen yet. Choose platforms, folders or games below; nothing is renamed until you preview and confirm.".into(),
+            Some(scope @ Self::Games { .. }) => format!("Renaming {}. {KEEP}", scope.label()),
+            Some(Self::Platforms { names, games }) => format!(
+                "Renaming platform{} {} ({} game{}). {KEEP}",
+                if names.len() == 1 { "" } else { "s" },
+                names.iter().cloned().collect::<Vec<_>>().join(", "),
+                games.len(),
+                if games.len() == 1 { "" } else { "s" },
+            ),
+            Some(Self::Folders(folders)) => match folders.as_slice() {
+                [one] => format!("Renaming the folder {}. {KEEP}", one.display()),
+                many => format!(
+                    "Renaming {} folders: {}. {KEEP}",
+                    many.len(),
+                    many.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(", ")
+                ),
+            },
+        }
+    }
+
     pub(crate) fn label(&self) -> String {
         fn plural(n: usize, one: &str, many: &str) -> String {
             format!("{n} {}", if n == 1 { one } else { many })
@@ -520,33 +546,39 @@ pub(crate) fn evidence_candidates(
     Some(Ok(out))
 }
 
-/// How one preview row is presented, in the owner's five groups. Display
-/// only: Apply decides from the plan and live checks, never from this.
+/// How one preview row is presented, in the owner's six groups (2026-11-26):
+/// the one classification shared by the summary counts, the filters, the row
+/// status and selection eligibility (only Ready rows can be selected; Ready
+/// is exactly the plan's Suggested status). Display only: Apply decides from
+/// the plan and live checks, never from this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum RenameGroup {
     Ready,
     AlreadyCorrect,
     NeedsVerification,
     NoCatalogueMatch,
+    Conflict,
     Blocked,
 }
 
 impl RenameGroup {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::Ready => "Verified and ready to rename",
+            Self::Ready => "Ready to rename",
             Self::AlreadyCorrect => "Already correctly named",
             Self::NeedsVerification => "Needs verification",
             Self::NoCatalogueMatch => "No reliable catalogue match",
-            Self::Blocked => "Blocked by a safety or file problem",
+            Self::Conflict => "Destination conflict",
+            Self::Blocked => "Safety or file blocker",
         }
     }
 
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::Ready,
         Self::AlreadyCorrect,
         Self::NeedsVerification,
         Self::NoCatalogueMatch,
+        Self::Conflict,
         Self::Blocked,
     ];
 }
@@ -600,13 +632,24 @@ pub(crate) fn rename_group(
         // it has no verified name for the archive itself.
         OrganisationStatus::AlreadyOrganised if verified => RenameGroup::AlreadyCorrect,
         OrganisationStatus::AlreadyOrganised => unverified(saved_check),
-        OrganisationStatus::Conflict | OrganisationStatus::Unsupported => RenameGroup::Blocked,
+        OrganisationStatus::Conflict => RenameGroup::Conflict,
+        OrganisationStatus::Unsupported => RenameGroup::Blocked,
         OrganisationStatus::Blocked => {
             if entry.reason.as_deref() == Some(NEEDS_VERIFICATION_REASON) {
                 RenameGroup::NeedsVerification
             } else if verified {
                 // A verified name was found, but a guard refused the row.
                 RenameGroup::Blocked
+            } else if matches!(
+                entry.reason.as_deref(),
+                Some(
+                    super::hint_gate::UNVERIFIED_HINT_REASON
+                        | super::hint_gate::UNVERIFIED_NAME_REASON
+                )
+            ) {
+                // Held back only because its name is a hint (review C5): the
+                // group is what the saved check says, as without the hint.
+                unverified(saved_check)
             } else {
                 match saved_check {
                     SavedCheck::NoMatch => RenameGroup::NoCatalogueMatch,

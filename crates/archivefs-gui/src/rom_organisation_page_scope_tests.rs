@@ -283,7 +283,7 @@ fn saved_checks_map_to_honest_groups() {
 }
 
 #[test]
-fn rows_fall_into_the_five_groups() {
+fn rows_fall_into_the_six_groups() {
     use archivefs_core::dat::rom_organisation::{
         NEEDS_VERIFICATION_REASON, OrganisationPlanEntry, OrganisationStatus,
     };
@@ -380,8 +380,14 @@ fn rows_fall_into_the_five_groups() {
         group(S::Blocked, Some("save"), SavedCheck::Other),
         RenameGroup::Blocked
     );
+    // Owner 2026-11-26: a destination conflict is its own group, separate
+    // from safety or file blockers.
     assert_eq!(
         group(S::Conflict, None, SavedCheck::Other),
+        RenameGroup::Conflict
+    );
+    assert_eq!(
+        group(S::Unsupported, None, SavedCheck::Other),
         RenameGroup::Blocked
     );
 }
@@ -478,4 +484,81 @@ fn idle_disk_priority_is_restored_afterwards() {
     }
     let after = unsafe { libc::syscall(libc::SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0) };
     assert_eq!(before, after);
+}
+
+/// Stage B (owner 2026-11-26): the banner names the kind of scope and exactly
+/// what it covers, and says files keep their folders.
+#[test]
+fn the_scope_banner_names_the_platform_folder_or_games() {
+    use std::collections::BTreeSet;
+    let game = |id: i64| ScopedGame {
+        archive_id: id,
+        path: PathBuf::from(format!("/roms/gbc/{id}.gbc")),
+        known_missing: false,
+    };
+    assert!(OrganisationScope::banner(None).starts_with("Renaming: nothing chosen yet"));
+    let platforms = OrganisationScope::Platforms {
+        names: BTreeSet::from(["Game Boy Color".to_string()]),
+        games: vec![game(1), game(2)],
+    };
+    assert_eq!(
+        OrganisationScope::banner(Some(&platforms)),
+        "Renaming platform Game Boy Color (2 games). Files stay in their folders; only their names change."
+    );
+    let folder = OrganisationScope::Folders(vec![PathBuf::from("/roms/gbc")]);
+    assert!(OrganisationScope::banner(Some(&folder)).starts_with("Renaming the folder /roms/gbc."));
+    let folders =
+        OrganisationScope::Folders(vec![PathBuf::from("/roms/a"), PathBuf::from("/roms/b")]);
+    assert!(
+        OrganisationScope::banner(Some(&folders))
+            .starts_with("Renaming 2 folders: /roms/a, /roms/b.")
+    );
+    let games = OrganisationScope::Games {
+        games: vec![game(3)],
+        hidden_by_filter: 0,
+    };
+    assert!(OrganisationScope::banner(Some(&games)).starts_with("Renaming 1 selected game."));
+}
+
+/// Stage B review C5: a RomM hint never moves a row between groups. An
+/// ambiguous check stays "No reliable catalogue match" with or without it.
+#[test]
+fn a_romm_hint_does_not_change_a_rows_group() {
+    use archivefs_core::dat::rom_organisation::{OrganisationPlanEntry, OrganisationStatus as S};
+    let row = |status, reason: Option<&str>| OrganisationPlanEntry {
+        source_identity: None,
+        catalogue_binding: None,
+        disc_set: None,
+        source_path: PathBuf::from("/g/a.gbc"),
+        destination_path: PathBuf::from("/g/a.gbc"),
+        platform: None,
+        platform_display_name: String::new(),
+        platform_source: String::new(),
+        slug: None,
+        layout_folder: None,
+        mode: archivefs_core::dat::rom_organisation::OrganisationMode::RenameInPlace,
+        content_classification: None,
+        original_metadata: Default::default(),
+        status,
+        reason: reason.map(str::to_string),
+        deferred_capture: None,
+    };
+    let hinted = row(S::Blocked, Some(super::hint_gate::UNVERIFIED_HINT_REASON));
+    let plain = row(S::AlreadyOrganised, None);
+    for check in [
+        SavedCheck::Other,
+        SavedCheck::NoMatch,
+        SavedCheck::Missing,
+        SavedCheck::NotCurrent,
+    ] {
+        assert_eq!(
+            rename_group(&hinted, None, check),
+            rename_group(&plain, None, check),
+            "{check:?}"
+        );
+    }
+    assert_eq!(
+        rename_group(&hinted, None, SavedCheck::Other),
+        RenameGroup::NoCatalogueMatch
+    );
 }

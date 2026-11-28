@@ -1704,12 +1704,14 @@ fn gui_v2_organisation_landing_shows_the_plain_english_explainer_alongside_actio
             .iter()
             .any(|value| value == "Preview Playing Library")
     );
-    assert!(!strings.iter().any(|value| value == "Rename verified games"));
+    // Stage B (owner 2026-11-26): Rename verified games is top-level,
+    // visible without expanding anything.
+    assert!(strings.iter().any(|value| value == "Rename verified games"));
     let mut strings = text(&click_label(
         &context,
         &mut app,
         [1280.0, 1800.0],
-        "Other output destinations and verified-file naming",
+        "Other output destinations",
     ));
     strings.extend(text(&scroll_page(&context, &mut app, [1280.0, 1800.0])));
     // All five existing backed actions remain accessible after expansion and scrolling.
@@ -1749,13 +1751,8 @@ fn gui_v2_organisation_each_target_card_routes_to_its_own_destination() {
         let mut app = fixture(&context);
         let size = [1280.0, 2200.0];
         app.router.current = Route::Section(Section::Build);
-        if title != "Preview Playing Library" {
-            click_label(
-                &context,
-                &mut app,
-                size,
-                "Other output destinations and verified-file naming",
-            );
+        if !matches!(title, "Preview Playing Library" | "Rename verified games") {
+            click_label(&context, &mut app, size, "Other output destinations");
         }
         // Cards repeat their title as a heading. Click the last matching text,
         // which belongs to the actual action button, rather than its heading.
@@ -12392,4 +12389,18 @@ fn a_window_resize_requests_a_repaint_but_the_first_frame_does_not() {
     assert!(!resize_needs_repaint(Some(a), a));
     assert!(resize_needs_repaint(Some(a), egui::vec2(1800.0, 820.0)));
     assert!(resize_needs_repaint(Some(a), egui::vec2(1280.0, 1000.0)));
+}
+
+/// Stage B B5: on a short window the Organisation landing keeps Rename
+/// verified games visible as a header button.
+#[test]
+fn compact_organisation_landing_keeps_rename_visible() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Build);
+    let output = frame(&context, &mut app, [1024.0, 520.0]);
+    assert!(organisation_label_is_visible(
+        &output,
+        "Rename verified games"
+    ));
 }

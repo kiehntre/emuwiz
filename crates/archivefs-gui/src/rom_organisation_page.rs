@@ -70,6 +70,9 @@ pub(crate) struct RomOrganisationPageState {
     /// Source paths the user has approved (checked) for apply.
     approved: BTreeSet<String>,
     filter: Option<OrganisationStatus>,
+    /// Verified Rename (a scoped preview): the row filter is one of the six
+    /// result groups instead of a plan status.
+    group_filter: Option<scope::RenameGroup>,
     applied: Option<archivefs_core::dat::rename_apply::RenameTransaction>,
     applied_journal: PathBuf,
     /// Set when the data folder (and so the journal folder) could not be
@@ -263,6 +266,7 @@ impl RomOrganisationPageState {
             advanced_r2_selected: false,
             approved: BTreeSet::new(),
             filter: None,
+            group_filter: None,
             applied: None,
             applied_journal,
             applied_journal_unavailable: applied_journal_unavailable.clone(),
@@ -961,7 +965,7 @@ impl RomOrganisationPageState {
             .filter(|entry| {
                 self.approved
                     .contains(entry.source_path.to_string_lossy().as_ref())
-                    && !self.filter.is_none_or(|f| entry.status == f)
+                    && !self.shows(entry)
             })
             .count()
     }
@@ -971,7 +975,7 @@ impl RomOrganisationPageState {
         let Some(plan) = &self.plan else { return };
         let hidden: Vec<String> = plan
             .suggested()
-            .filter(|entry| !self.filter.is_none_or(|f| entry.status == f))
+            .filter(|entry| !self.shows(entry))
             .map(|entry| entry.source_path.to_string_lossy().into_owned())
             .collect();
         for path in hidden {
@@ -1016,7 +1020,34 @@ impl RomOrganisationPageState {
         self.persist_approved_set();
     }
 
+    /// The one result group of a row (verified Rename's classification).
+    pub(crate) fn group_of(&self, entry: &OrganisationPlanEntry) -> scope::RenameGroup {
+        let check = self
+            .saved_checks
+            .get(&entry.source_path)
+            .copied()
+            .unwrap_or(scope::SavedCheck::Missing);
+        scope::rename_group(entry, self.name_choices.get(&entry.source_path), check)
+    }
+
+    /// Whether the current filter shows this row: the single predicate for
+    /// the row list, hidden approvals and the Apply confirmation.
+    pub(crate) fn shows(&self, entry: &OrganisationPlanEntry) -> bool {
+        match self.group_filter {
+            Some(group) => self.group_of(entry) == group,
+            None => self.filter.is_none_or(|f| entry.status == f),
+        }
+    }
+
+    /// Filter verified Rename's rows to one result group (or all).
+    pub(crate) fn set_group_filter(&mut self, group: Option<scope::RenameGroup>) {
+        self.filter = None;
+        self.group_filter = group;
+        self.plan_page = 0;
+    }
+
     pub(crate) fn set_filter(&mut self, filter: Option<OrganisationStatus>) {
+        self.group_filter = None;
         self.filter = filter;
     }
 
@@ -2155,10 +2186,34 @@ pub(crate) fn undo_availability(status: OrganisationStatus) -> &'static str {
     }
 }
 
+/// A file name that is itself an archive (a nested container).
+fn is_container_name(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .as_deref(),
+        Some("zip" | "7z" | "rar")
+    )
+}
+
+/// Shown with every archive renamed by its verified game name.
+pub(crate) const ARCHIVE_RENAME_NOTE: &str = "The archive holds one verified game (every game file in it matched that one game exactly), so it takes the game's catalogue name. Only the archive's own name changes; nothing inside it is touched.";
+
 /// The owner's rule (S1, 2026-11-16): a verified catalogue name wins; RomM is
 /// the fallback; otherwise the file keeps its name. A catalogue name is used
-/// only when it names a file of the same kind (same extension): a match made
-/// through an archive member never renames the archive here.
+/// only when it names a file of the same kind (same extension).
+///
+/// Archives (owner decision 2026-11-26): an outer ZIP is renamed to the
+/// verified catalogue *game* name, keeping its own extension, when its saved
+/// check matched it through its members. That provenance is recorded only
+/// when the check read the whole archive and every member is safe and is the
+/// same single, exactly matched game (a one-file game, or a complete
+/// multi-file set; never a partial set, several games, ambiguity or a nested
+/// archive: `library_identity_projection::parent_representative_member`).
+/// Weak evidence and RomM never rename an archive, and the contents are
+/// never touched: only the outer file's name changes. Other containers
+/// (7z, RAR) keep their name. This is the one rule for single-game Rename,
+/// bulk Rename, preview and Apply.
 pub(crate) fn choose_name(
     dat: archivefs_core::VerifiedDatName,
     romm: Option<String>,
@@ -2171,17 +2226,51 @@ pub(crate) fn choose_name(
     };
     let mut skipped_archive = false;
     let dat_refusal = match dat {
+        V::Usable {
+            through_archive_member: true,
+            game_name,
+            dat_source_id,
+            rom_name,
+        } if extension(source).as_deref() == Some("zip")
+            && !is_container_name(Path::new(&rom_name)) =>
+        {
+            // The source's own extension text, as written (".zip" or ".ZIP").
+            let own = source
+                .extension()
+                .map(|e| e.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let note = romm.as_ref().map(|romm| {
+                format!("RomM suggests '{romm}'; the verified catalogue name is used instead")
+            });
+            return NameChoice {
+                name: Some(format!("{game_name}.{own}")),
+                source: NameSource::VerifiedDat {
+                    catalogue: dat_source_id,
+                },
+                note: Some(match note {
+                    Some(romm) => format!("{ARCHIVE_RENAME_NOTE} {romm}"),
+                    None => ARCHIVE_RENAME_NOTE.to_string(),
+                }),
+                skipped_archive: false,
+            };
+        }
         // Recorded provenance, not an extension guess: a member's name never
-        // renames its archive, even when the member is itself a .zip.
+        // renames a 7z or RAR archive.
         V::Usable {
             through_archive_member: true,
             rom_name,
             ..
         } => {
             skipped_archive = true;
-            Some(format!(
-                "the catalogue matched '{rom_name}', a file inside this archive; archives are not renamed with an inner file's name"
-            ))
+            Some(if is_container_name(Path::new(&rom_name)) {
+                format!(
+                    "the catalogue matched '{rom_name}', an archive inside this archive; an archive is never renamed after an archive it holds"
+                )
+            } else {
+                format!(
+                    "the catalogue matched '{rom_name}', a file inside this archive; only ZIP archives are renamed with their verified game's name"
+                )
+            })
         }
         V::Usable {
             rom_name,
@@ -3521,37 +3610,15 @@ fn show_plan(
         // needs attention, using only the plan's own existing statuses.
         ui.horizontal_wrapped(|ui| {
             if let Some(groups) = &groups {
-                let count = |group| groups.get(&group).copied().unwrap_or(0);
-                let unverified = count(scope::RenameGroup::NeedsVerification)
-                    + count(scope::RenameGroup::NoCatalogueMatch);
-                let blocked = count(scope::RenameGroup::Blocked);
-                widgets::status_badge(
-                    ui,
-                    format!(
-                        "{} already correct",
-                        count(scope::RenameGroup::AlreadyCorrect)
-                    ),
-                    widgets::StatusTone::Success,
-                );
-                widgets::status_badge(
-                    ui,
-                    format!("{} will change", count(scope::RenameGroup::Ready)),
-                    widgets::StatusTone::Info,
-                );
-                widgets::status_badge(
-                    ui,
-                    format!("{unverified} need verification or have no catalogue match"),
-                    widgets::StatusTone::Pending,
-                );
-                widgets::status_badge(
-                    ui,
-                    format!("{blocked} blocked"),
-                    if blocked == 0 {
-                        widgets::StatusTone::Success
-                    } else {
-                        widgets::StatusTone::Blocked
-                    },
-                );
+                // The six result groups, as the filter and the rows use them.
+                for group in scope::RenameGroup::ALL {
+                    let count = groups.get(&group).copied().unwrap_or(0);
+                    widgets::status_badge(
+                        ui,
+                        format!("{}: {count}", group.label()),
+                        scope_group_tone(group, count),
+                    );
+                }
             } else if quick_only {
                 widgets::status_badge(
                     ui,
@@ -3631,31 +3698,68 @@ fn show_plan(
     let entries: Vec<&OrganisationPlanEntry> = plan
         .entries
         .iter()
-        .filter(|entry| state.filter.is_none_or(|f| entry.status == f))
+        .filter(|entry| state.shows(entry))
         .collect();
+    // Verified Rename: each row's status is its result group, from the same
+    // classification as the counts and filters (owner 2026-11-26).
+    let row_groups: Option<std::collections::HashMap<PathBuf, scope::RenameGroup>> =
+        state.uses_scope().then(|| {
+            entries
+                .iter()
+                .map(|entry| (entry.source_path.clone(), state.group_of(entry)))
+                .collect()
+        });
 
     // Both pages show the filter (D2): rows it hides are never out of sight
     // without saying so.
     {
-        ui.horizontal(|ui| {
-            ui.label("Filter:");
-            let all = state.filter.is_none();
-            if ui.selectable_label(all, "All").clicked() {
-                state.set_filter(None);
-            }
-            for status in [
-                OrganisationStatus::Suggested,
-                OrganisationStatus::AlreadyOrganised,
-                OrganisationStatus::Conflict,
-                OrganisationStatus::Blocked,
-                OrganisationStatus::Unsupported,
-            ] {
-                let selected = state.filter == Some(status);
-                if ui.selectable_label(selected, status.label()).clicked() {
-                    state.set_filter(if selected { None } else { Some(status) });
+        if state.uses_scope() {
+            // Verified Rename: the six result groups, each with the same
+            // count as the summary (one classification).
+            let counts = scope_group_counts(plan, state);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Show:");
+                if ui
+                    .selectable_label(
+                        state.group_filter.is_none(),
+                        format!("All ({})", plan.entries.len()),
+                    )
+                    .clicked()
+                {
+                    state.set_group_filter(None);
                 }
-            }
-        });
+                for group in scope::RenameGroup::ALL {
+                    let count = counts.get(&group).copied().unwrap_or(0);
+                    let selected = state.group_filter == Some(group);
+                    if ui
+                        .selectable_label(selected, format!("{} ({count})", group.label()))
+                        .clicked()
+                    {
+                        state.set_group_filter(if selected { None } else { Some(group) });
+                    }
+                }
+            });
+        } else {
+            ui.horizontal(|ui| {
+                ui.label("Filter:");
+                let all = state.filter.is_none();
+                if ui.selectable_label(all, "All").clicked() {
+                    state.set_filter(None);
+                }
+                for status in [
+                    OrganisationStatus::Suggested,
+                    OrganisationStatus::AlreadyOrganised,
+                    OrganisationStatus::Conflict,
+                    OrganisationStatus::Blocked,
+                    OrganisationStatus::Unsupported,
+                ] {
+                    let selected = state.filter == Some(status);
+                    if ui.selectable_label(selected, status.label()).clicked() {
+                        state.set_filter(if selected { None } else { Some(status) });
+                    }
+                }
+            });
+        }
     }
     ui.add_space(4.0);
     let pages = entries.len().div_ceil(PLAN_PAGE_ROWS).max(1);
@@ -3716,11 +3820,19 @@ fn show_plan(
                     ui,
                     if quick_mame {
                         "MAME tools"
+                    } else if let Some(group) =
+                        row_groups.as_ref().and_then(|g| g.get(&entry.source_path))
+                    {
+                        group.label()
                     } else {
                         entry.status.label()
                     },
                     if quick_mame {
                         widgets::StatusTone::Pending
+                    } else if let Some(group) =
+                        row_groups.as_ref().and_then(|g| g.get(&entry.source_path))
+                    {
+                        scope_group_tone(*group, 1)
                     } else {
                         status_tone(entry.status)
                     },
@@ -3776,7 +3888,13 @@ fn show_plan(
                             show_name_choice(ui, name_choices.get(&entry.source_path));
                             ui.label(format!("Identity: Verified by {}", entry.platform_source));
                         }
-                        ui.label(format!("Status: {}", entry.status.label()));
+                        ui.label(format!(
+                            "Status: {}",
+                            row_groups
+                                .as_ref()
+                                .and_then(|g| g.get(&entry.source_path))
+                                .map_or(entry.status.label(), |group| group.label())
+                        ));
                         ui.label(undo_availability(entry.status));
                         if let Some(reason) = &entry.reason {
                             ui.label(
@@ -3950,7 +4068,7 @@ fn show_plan(
             let changes = approved_changes(plan, &state.approved);
             let hidden = changes
                 .iter()
-                .filter(|(entry, _)| !state.filter.is_none_or(|f| entry.status == f))
+                .filter(|(entry, _)| !state.shows(entry))
                 .count();
             ui.label(match &state.scope {
                 Some(scope) if state.uses_scope() => format!("Scope: {}", scope.label()),
@@ -3963,7 +4081,7 @@ fn show_plan(
                 .max_height(260.0)
                 .show_rows(ui, row_height, changes.len(), |ui, range| {
                     for (entry, line) in &changes[range] {
-                        let shown = state.filter.is_none_or(|f| entry.status == f);
+                        let shown = state.shows(entry);
                         ui.label(if shown {
                             line.clone()
                         } else {
@@ -4058,15 +4176,25 @@ fn scope_group_counts(
 ) -> std::collections::BTreeMap<scope::RenameGroup, usize> {
     let mut counts = std::collections::BTreeMap::new();
     for entry in &plan.entries {
-        let check = state
-            .saved_checks
-            .get(&entry.source_path)
-            .copied()
-            .unwrap_or(scope::SavedCheck::Missing);
-        let group = scope::rename_group(entry, state.name_choices.get(&entry.source_path), check);
-        *counts.entry(group).or_insert(0_usize) += 1;
+        *counts.entry(state.group_of(entry)).or_insert(0_usize) += 1;
     }
     counts
+}
+
+/// The badge tone of one result group.
+fn scope_group_tone(group: scope::RenameGroup, count: usize) -> widgets::StatusTone {
+    match group {
+        scope::RenameGroup::Ready => widgets::StatusTone::Info,
+        scope::RenameGroup::AlreadyCorrect => widgets::StatusTone::Success,
+        scope::RenameGroup::NeedsVerification | scope::RenameGroup::NoCatalogueMatch => {
+            widgets::StatusTone::Pending
+        }
+        scope::RenameGroup::Conflict | scope::RenameGroup::Blocked if count == 0 => {
+            widgets::StatusTone::Success
+        }
+        scope::RenameGroup::Conflict => widgets::StatusTone::Warning,
+        scope::RenameGroup::Blocked => widgets::StatusTone::Blocked,
+    }
 }
 
 fn show_scope_result_summary(
@@ -4079,16 +4207,11 @@ fn show_scope_result_summary(
         ui.label(egui::RichText::new("Result").strong());
         for group in scope::RenameGroup::ALL {
             let count = counts.get(&group).copied().unwrap_or(0);
-            let tone = match group {
-                scope::RenameGroup::Ready => widgets::StatusTone::Info,
-                scope::RenameGroup::AlreadyCorrect => widgets::StatusTone::Success,
-                scope::RenameGroup::NeedsVerification | scope::RenameGroup::NoCatalogueMatch => {
-                    widgets::StatusTone::Pending
-                }
-                scope::RenameGroup::Blocked if count == 0 => widgets::StatusTone::Success,
-                scope::RenameGroup::Blocked => widgets::StatusTone::Blocked,
-            };
-            widgets::status_badge(ui, format!("{}: {count}", group.label()), tone);
+            widgets::status_badge(
+                ui,
+                format!("{}: {count}", group.label()),
+                scope_group_tone(group, count),
+            );
         }
         if counts
             .get(&scope::RenameGroup::NeedsVerification)
@@ -4938,19 +5061,25 @@ mod tests {
             generation: 1,
             entries,
         };
+        // disk.zip holds one verified game, so it takes the game's name
+        // (owner zip rule 2026-11-26): a verified change, not a RomM fallback
+        // and not a skipped archive.
         assert_eq!(
             name_counts(&plan, &choices),
             NameCounts {
-                dat_changes: 1,
+                dat_changes: 2,
                 dat_already_correct: 1,
-                romm_fallbacks: 2,
-                archives_skipped: 1
+                romm_fallbacks: 1,
+                archives_skipped: 0
             }
         );
     }
 
+    /// Owner zip rule 2026-11-26: a match through a member renames a ZIP to
+    /// the verified game's name (never the member's name); a 7z or RAR, or a
+    /// ZIP whose matched member is itself an archive, keeps its name.
     #[test]
-    fn a_match_through_an_archive_member_never_renames_the_archive() {
+    fn a_match_through_an_archive_member_renames_only_a_zip_and_only_by_game() {
         use archivefs_core::VerifiedDatName as V;
         let member = || V::Usable {
             rom_name: "Lemmings (1991).adf".into(),
@@ -4960,6 +5089,34 @@ mod tests {
         };
         let zip = Path::new("/roms/amiga/lemmings.zip");
         let choice = choose_name(member(), None, zip);
+        assert_eq!(
+            (choice.name.as_deref(), &choice.source),
+            (
+                Some("Lemmings (1991).zip"),
+                &NameSource::VerifiedDat {
+                    catalogue: "tosec-amiga".into()
+                }
+            )
+        );
+        assert!(!choice.skipped_archive);
+        assert!(
+            choice
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("nothing inside it is touched"))
+        );
+        // The verified name wins over RomM, which is only mentioned.
+        let with_romm = choose_name(member(), Some("Lemmings.zip".into()), zip);
+        assert_eq!(with_romm.name.as_deref(), Some("Lemmings (1991).zip"));
+        assert!(
+            with_romm
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("RomM suggests"))
+        );
+        // A 7z keeps its name; RomM is its fallback as before.
+        let seven = Path::new("/roms/amiga/lemmings.7z");
+        let choice = choose_name(member(), None, seven);
         assert_eq!((choice.name, choice.source), (None, NameSource::Original));
         assert!(
             choice
@@ -4968,10 +5125,10 @@ mod tests {
                 .is_some_and(|n| n.contains("file inside this archive"))
         );
         assert!(choice.skipped_archive);
-        let with_romm = choose_name(member(), Some("Lemmings.zip".into()), zip);
+        let with_romm = choose_name(member(), Some("Lemmings.7z".into()), seven);
         assert_eq!(
             (with_romm.name.as_deref(), with_romm.source),
-            (Some("Lemmings.zip"), NameSource::Romm)
+            (Some("Lemmings.7z"), NameSource::Romm)
         );
         // Even an inner .zip never renames the outer .zip.
         let inner_zip = V::Usable {
@@ -4980,9 +5137,14 @@ mod tests {
             dat_source_id: "x".into(),
             through_archive_member: true,
         };
-        assert_eq!(
-            choose_name(inner_zip, None, zip).source,
-            NameSource::Original
+        let nested = choose_name(inner_zip, None, zip);
+        assert_eq!(nested.source, NameSource::Original);
+        assert!(nested.skipped_archive);
+        assert!(
+            nested
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("an archive inside this archive"))
         );
         // A loose file of another kind is refused but is not an archive.
         let other_kind = V::Usable {
@@ -5672,13 +5834,195 @@ mod tests {
                 show_rom_organisation_page(ui, &mut state);
             });
         });
+        // The summary shows the six groups by their own names (owner
+        // 2026-11-26), with the result card's counts.
         assert!(rendered_text_contains(&output, "Needs verification: 2"));
-        assert!(rendered_text_contains(&output, "0 already correct"));
         assert!(rendered_text_contains(
             &output,
-            "2 need verification or have no catalogue match"
+            "Already correctly named: 0"
         ));
-        assert!(!rendered_text_contains(&output, "2 already correct"));
+        assert!(!rendered_text_contains(
+            &output,
+            "Already correctly named: 2"
+        ));
+    }
+
+    /// Stage B (owner 2026-11-26): one classification for the summary
+    /// counts, the filters, the row status and selection. For each of the six
+    /// groups the count equals the rows its filter shows; only Ready rows can
+    /// be selected; an approval a group filter hides is counted as hidden.
+    #[test]
+    fn counts_filters_and_selection_use_one_classification() {
+        use scope::RenameGroup as G;
+        let mut state = RomOrganisationPageState::default();
+        state.ensure_mode(OrganisationMode::RenameInPlace);
+        let verified = |name: &str| NameChoice {
+            name: Some(name.to_string()),
+            source: NameSource::VerifiedDat {
+                catalogue: "no-intro".into(),
+            },
+            note: None,
+            skipped_archive: false,
+        };
+        let row = |name: &str, status: OrganisationStatus| OrganisationPlanEntry {
+            source_path: PathBuf::from(format!("/g/{name}")),
+            destination_path: PathBuf::from(format!("/g/{name}")),
+            mode: OrganisationMode::RenameInPlace,
+            status,
+            ..linked_library_plan_entry(status)
+        };
+        let rows = [
+            (
+                "ready-1.gbc",
+                OrganisationStatus::Suggested,
+                Some(verified("Ready 1.gbc")),
+                scope::SavedCheck::Other,
+                G::Ready,
+            ),
+            (
+                "ready-2.gbc",
+                OrganisationStatus::Suggested,
+                Some(verified("Ready 2.gbc")),
+                scope::SavedCheck::Other,
+                G::Ready,
+            ),
+            (
+                "right.gbc",
+                OrganisationStatus::AlreadyOrganised,
+                Some(verified("right.gbc")),
+                scope::SavedCheck::Other,
+                G::AlreadyCorrect,
+            ),
+            (
+                "unchecked.gbc",
+                OrganisationStatus::AlreadyOrganised,
+                None,
+                scope::SavedCheck::Missing,
+                G::NeedsVerification,
+            ),
+            (
+                "nomatch.gbc",
+                OrganisationStatus::AlreadyOrganised,
+                None,
+                scope::SavedCheck::NoMatch,
+                G::NoCatalogueMatch,
+            ),
+            (
+                "clash.gbc",
+                OrganisationStatus::Conflict,
+                Some(verified("Clash.gbc")),
+                scope::SavedCheck::Other,
+                G::Conflict,
+            ),
+            (
+                "odd.gbc",
+                OrganisationStatus::Unsupported,
+                None,
+                scope::SavedCheck::Other,
+                G::Blocked,
+            ),
+        ];
+        let mut entries = Vec::new();
+        for (name, status, choice, check, _) in &rows {
+            let path = PathBuf::from(format!("/g/{name}"));
+            if let Some(choice) = choice {
+                state.name_choices.insert(path.clone(), choice.clone());
+            }
+            state.saved_checks.insert(path, *check);
+            entries.push(row(name, *status));
+        }
+        state.plan_generation = 1;
+        state.plan = Some(OrganisationPlan {
+            master_root: PathBuf::from("/g"),
+            mode: OrganisationMode::RenameInPlace,
+            content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
+            classifier_version: String::new(),
+            generation: 1,
+            entries,
+        });
+        let plan = state.plan.clone().unwrap();
+        for (name, _, _, _, group) in &rows {
+            let entry = plan
+                .entries
+                .iter()
+                .find(|e| e.source_path.ends_with(name))
+                .unwrap();
+            assert_eq!(state.group_of(entry), *group, "{name}");
+        }
+        let counts = scope_group_counts(&plan, &state);
+        for group in G::ALL {
+            state.set_group_filter(Some(group));
+            let shown = plan.entries.iter().filter(|e| state.shows(e)).count();
+            assert_eq!(counts.get(&group).copied().unwrap_or(0), shown, "{group:?}");
+            let selectable = plan
+                .entries
+                .iter()
+                .filter(|e| state.shows(e) && e.status == OrganisationStatus::Suggested)
+                .count();
+            assert_eq!(
+                selectable,
+                if group == G::Ready { shown } else { 0 },
+                "{group:?}"
+            );
+        }
+        assert_eq!(counts.values().sum::<usize>(), plan.entries.len());
+        // Approve both ready rows, then show only conflicts: both are hidden.
+        state.set_group_filter(None);
+        state.approved.insert("/g/ready-1.gbc".into());
+        state.approved.insert("/g/ready-2.gbc".into());
+        assert_eq!(state.hidden_approved(), 0);
+        state.set_group_filter(Some(G::Conflict));
+        assert_eq!(state.hidden_approved(), 2);
+        state.set_group_filter(Some(G::Ready));
+        assert_eq!(state.hidden_approved(), 0);
+        // The page renders the six groups with these counts (all rows shown).
+        state.set_group_filter(None);
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_rom_organisation_page(ui, &mut state);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Ready to rename: 2"));
+        assert!(rendered_text_contains(&output, "Destination conflict: 1"));
+        assert!(rendered_text_contains(&output, "Safety or file blocker: 1"));
+        assert!(rendered_text_contains(&output, "Ready to rename (2)"));
+        // Each row's status chip is its group (exact text: the badges and
+        // filters carry a count), never the plan status.
+        fn exact(output: &egui::FullOutput, needle: &str) -> bool {
+            fn walk(shape: &egui::Shape, needle: &str) -> bool {
+                match shape {
+                    // A badge may draw its tone glyph first ("· Label").
+                    egui::Shape::Text(t) => {
+                        let text = t.galley.text();
+                        text == needle
+                            || text.strip_suffix(needle).is_some_and(|glyph| {
+                                glyph.chars().count() <= 2 && glyph.ends_with(' ')
+                            })
+                    }
+                    egui::Shape::Vec(v) => v.iter().any(|s| walk(s, needle)),
+                    _ => false,
+                }
+            }
+            output.shapes.iter().any(|c| walk(&c.shape, needle))
+        }
+        for group in [
+            G::NoCatalogueMatch,
+            G::NeedsVerification,
+            G::Conflict,
+            G::Blocked,
+        ] {
+            assert!(exact(&output, group.label()), "{group:?} row chip");
+        }
+        for status in [
+            OrganisationStatus::Conflict,
+            OrganisationStatus::Unsupported,
+        ] {
+            assert!(
+                !exact(&output, status.label()),
+                "{status:?} plan label on a row"
+            );
+        }
     }
 
     #[test]
@@ -5894,3 +6238,10 @@ mod hint_gate_runtime_tests;
 #[cfg(test)]
 #[path = "rom_organisation_page_undo_tests.rs"]
 mod undo_tests;
+
+#[cfg(test)]
+#[path = "rom_organisation_page_real_db_preview_tests.rs"]
+mod real_db_preview_tests;
+#[cfg(test)]
+#[path = "rom_organisation_page_zip_policy_tests.rs"]
+mod zip_policy_tests;

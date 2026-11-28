@@ -344,9 +344,19 @@ fn child_both_apply_paths_refuse_a_stale_romm_row() {
     );
     assert_eq!(row(&hint).status, OrganisationStatus::Blocked);
     assert_eq!(row(&hint).reason.as_deref(), Some(UNVERIFIED_HINT_REASON));
+    // Owner 2026-11-26: the RomM title is never the row's destination in
+    // verified Rename (no actionable name, no conflict it could cause); it
+    // stays visible as the row's hint.
     assert_eq!(
         row(&hint).destination_path.file_name().unwrap(),
-        "Hint One (USA).gba",
+        HINT_FILE,
+        "the RomM title is not the destination"
+    );
+    let hint_choice = state.name_choices.get(&hint).expect("the hint is kept");
+    assert_eq!(hint_choice.source, NameSource::Romm);
+    assert_eq!(
+        hint_choice.name.as_deref(),
+        Some("Hint One (USA).gba"),
         "the hint stays visible"
     );
     assert_eq!(row(&kept).status, OrganisationStatus::AlreadyOrganised);
@@ -368,6 +378,8 @@ fn child_both_apply_paths_refuse_a_stale_romm_row() {
             .unwrap();
         entry.status = OrganisationStatus::Suggested;
         entry.reason = None;
+        // That preview named the file with the RomM title.
+        entry.destination_path = entry.source_path.with_file_name("Hint One (USA).gba");
         // Re-bound below together, as that preview's own binding pass did.
         for entry in &mut plan.entries {
             entry.catalogue_binding = None;
@@ -427,9 +439,20 @@ fn child_both_apply_paths_refuse_a_stale_romm_row() {
         crate::gui_v2::validate_selection_for_test(plan.clone(), BTreeSet::from([key(&hint)]))
             .expect_err("Advanced Protection must refuse the stale RomM row");
     assert!(alone.contains("verified catalogue names only"), "{alone}");
-    // The verified game alone is eligible, with its sealed library binding.
-    let eligible =
+    // A preview that still holds the stale RomM row is stale as a whole
+    // (owner 2026-11-26: verified Rename never plans a RomM destination, so
+    // the live re-plan disagrees with it) and is refused even for the
+    // verified game alone: regenerate.
+    let stale_alone =
         crate::gui_v2::validate_selection_for_test(plan.clone(), BTreeSet::from([key(&verified)]))
+            .expect_err("a preview holding a stale row is refused whole");
+    assert!(stale_alone.contains("regenerate the plan"), "{stale_alone}");
+    // Without the stale row (as a regenerated preview), the verified game
+    // alone is eligible, with its sealed library binding.
+    let mut regenerated = plan.clone();
+    regenerated.entries.retain(|e| e.source_path != hint);
+    let eligible =
+        crate::gui_v2::validate_selection_for_test(regenerated, BTreeSet::from([key(&verified)]))
             .expect("a current verified game is eligible for Advanced Protection");
     assert!(
         eligible
