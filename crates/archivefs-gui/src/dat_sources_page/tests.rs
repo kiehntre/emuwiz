@@ -70,6 +70,49 @@ fn local_dat_navigation_filters_by_name_platform_and_status() {
     ));
 }
 
+#[test]
+fn a_typed_search_finds_unassigned_catalogues_by_name_path_or_id() {
+    // Stage D production: catalogues 196/197 and 200/201 share a name, and
+    // the unassigned twin was hidden until "Show unassigned" was pressed.
+    let unassigned = DatSourceRowView {
+        id: "200".into(),
+        display_name: "No-Intro: Nintendo - Nintendo DSi (Digital)".into(),
+        path: "/packs/dats/200.dat".into(),
+        platform_display: None,
+        ..Default::default()
+    };
+    let all = LocalDatStatusFilter::All;
+    // Without a search the relevant-only view still hides it, as before.
+    assert!(!local_dat_row_listed(&unassigned, false, false, "", all));
+    // A search by name, path or exact id lists it without any other toggle.
+    for query in ["dsi (digital)", "/200.dat", "200"] {
+        assert!(
+            local_dat_row_listed(&unassigned, false, false, query, all),
+            "{query}"
+        );
+    }
+    // An id is matched exactly, so "20" does not list catalogue 200 by id
+    // (only names or paths that contain it).
+    assert!(!local_dat_row_matches_filter(
+        &DatSourceRowView {
+            id: "200".into(),
+            display_name: "x".into(),
+            path: "/p/x.dat".into(),
+            ..Default::default()
+        },
+        "20",
+        all
+    ));
+    // A search that matches nothing lists nothing.
+    assert!(!local_dat_row_listed(
+        &unassigned,
+        true,
+        true,
+        "spectrum",
+        all
+    ));
+}
+
 fn row_for_visibility(
     platform_display: Option<&str>,
     platform_unresolved: bool,
@@ -2075,6 +2118,118 @@ fn render(view: &DatSourcesPageView, ui_state: &mut DatSourcesPageUi) -> egui::F
             let _ = show_dat_sources_page(ui, view, ui_state);
         });
     })
+}
+
+#[test]
+fn show_matches_opens_the_list_and_scrolls_to_an_unassigned_catalogue() {
+    let twin = |id: &str| DatSourceRowView {
+        id: id.into(),
+        display_name: "No-Intro: Nintendo - Nintendo DSi (Digital)".into(),
+        path: format!("/packs/dats/{id}.dat"),
+        kind_label: "File",
+        enabled: true,
+        ..Default::default()
+    };
+    let fixture = Fixture::new();
+    let mut view = fixture.page().view();
+    view.rows = (0..30)
+        .map(|i| DatSourceRowView {
+            id: format!("other-{i}"),
+            display_name: format!("Other catalogue {i}"),
+            kind_label: "File",
+            ..Default::default()
+        })
+        .chain([twin("200"), twin("201")])
+        .collect();
+    let mut state = DatSourcesPageUi {
+        local_source_query: "dsi (digital)".into(),
+        ..Default::default()
+    };
+    let context = egui::Context::default();
+    let mut time = 0.0;
+    // Every text that is wholly inside its visible area, with its centre.
+    let mut frame = |state: &mut DatSourcesPageUi, events: Vec<egui::Event>| {
+        time += 0.1;
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100.0, 500.0),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        let _ = show_dat_sources_page(ui, &view, state);
+                    });
+                });
+            },
+        );
+        let mut texts = Vec::new();
+        for clipped in output.shapes {
+            if let egui::Shape::Text(text) = &clipped.shape {
+                let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                if clipped.clip_rect.y_range().contains(rect.top())
+                    && clipped.clip_rect.y_range().contains(rect.bottom())
+                {
+                    texts.push((text.galley.text().to_string(), rect.center()));
+                }
+            }
+        }
+        texts
+    };
+    let find = |texts: &[(String, egui::Pos2)], label: &str| {
+        texts.iter().find(|(text, _)| text == label).map(|t| t.1)
+    };
+    let twin_title = "No-Intro: Nintendo - Nintendo DSi (Digital) · File · id 200";
+    let inside_page = egui::pos2(900.0, 450.0);
+    let mut button = None;
+    for _ in 0..400 {
+        let texts = frame(
+            &mut state,
+            vec![
+                egui::Event::PointerMoved(inside_page),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -20.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        if find(&texts, "Show matches").is_some() {
+            button = Some(());
+            break;
+        }
+    }
+    let seen = frame(&mut state, vec![]);
+    assert!(button.is_some(), "the search offers Show matches: {seen:#?}");
+    // Let the scroll settle, then click.
+    let mut texts = Vec::new();
+    for _ in 0..20 {
+        texts = frame(&mut state, vec![]);
+    }
+    assert!(find(&texts, twin_title).is_none(), "already in view");
+    let pos = find(&texts, "Show matches").expect("still in view");
+    let press = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    frame(&mut state, vec![egui::Event::PointerMoved(pos)]);
+    frame(&mut state, vec![press(true)]);
+    frame(&mut state, vec![press(false)]);
+    for _ in 0..40 {
+        texts = frame(&mut state, vec![]);
+    }
+    assert!(
+        find(&texts, twin_title).is_some(),
+        "both same-name catalogues are in view and told apart: {texts:#?}"
+    );
 }
 
 /// Draws the task-oriented rename entry point without creating an audit job.

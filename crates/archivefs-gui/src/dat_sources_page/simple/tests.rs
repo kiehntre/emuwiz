@@ -958,3 +958,183 @@ fn a_refused_or_failed_assignment_reports_it_and_changes_nothing() {
 
 #[path = "recognition_journey_tests.rs"]
 mod recognition_journey;
+
+#[test]
+fn equivalent_systems_share_catalogues_without_merging_platform_identities() {
+    let dir = tempfile::tempdir().unwrap();
+    let dat = dir.path().join("equivalent.dat");
+    std::fs::write(&dat, MAME).unwrap();
+    let page = page(dir.path());
+    let mut view = page.view();
+    let row = |id: &str, platform: &str| DatSourceRowView {
+        id: id.into(),
+        display_name: format!("{platform} catalogue"),
+        path: dat.display().to_string(),
+        enabled: true,
+        platform_id: Some(platform.into()),
+        health_state: DatHealthState::Valid,
+        entry_count: Some(1),
+        ..Default::default()
+    };
+    // The core's three equivalences, plus a system equivalent to none of them.
+    let pairs = [
+        ("PC Engine", "TurboGrafx-16"),
+        ("PC-98", "NEC PC-9801"),
+        ("Commodore 16", "Commodore Plus-4"),
+    ];
+    view.rows = pairs
+        .iter()
+        .flat_map(|(a, b)| [row(a, a), row(b, b)])
+        .chain([row("Amiga", "Amiga")])
+        .collect();
+    let offered = |platform: &str| {
+        let mut ids: Vec<_> = choices(&view, &[], platform)
+            .into_iter()
+            .map(|choice| match choice.reference {
+                CatalogueRef::Local { source_id, .. } => source_id,
+                other => panic!("unexpected reference {other:?}"),
+            })
+            .collect();
+        ids.sort();
+        ids
+    };
+    for (a, b) in pairs {
+        let mut expected = vec![a.to_string(), b.to_string()];
+        expected.sort();
+        // Both directions, and nothing from the other pairs or from Amiga.
+        assert_eq!(offered(a), expected, "{a}");
+        assert_eq!(offered(b), expected, "{b}");
+    }
+    assert_eq!(offered("Amiga"), ["Amiga"]);
+    assert!(offered("Atari Lynx").is_empty());
+    // Eligibility only: no stored platform was rewritten.
+    assert!(
+        view.rows
+            .iter()
+            .all(|row| row.platform_id.as_deref() == Some(row.id.as_str()))
+    );
+}
+
+/// Drives the page through several frames, as a person would, and reports the
+/// texts whose whole height is inside their visible (clip) area.
+struct Frames {
+    ctx: egui::Context,
+    time: f64,
+}
+
+impl Frames {
+    fn run(
+        &mut self,
+        view: &DatSourcesPageView,
+        state: &mut DatSourcesPageUi,
+        events: Vec<egui::Event>,
+    ) -> Vec<(String, egui::Pos2, bool)> {
+        self.time += 0.1;
+        let output = self.ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100.0, 820.0),
+                )),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        let _ = show(ui, view, state);
+                    });
+                });
+            },
+        );
+        let mut texts = Vec::new();
+        for shape in output.shapes {
+            if let egui::Shape::Text(text) = &shape.shape {
+                let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                let visible = shape.clip_rect.top() <= rect.top() + 1.0
+                    && shape.clip_rect.bottom() + 1.0 >= rect.bottom();
+                texts.push((text.galley.text().to_string(), rect.center(), visible));
+            }
+        }
+        texts
+    }
+
+    fn click(&mut self, view: &DatSourcesPageView, state: &mut DatSourcesPageUi, label: &str) {
+        let texts = self.run(view, state, vec![]);
+        let pos = texts
+            .iter()
+            .find(|(text, _, visible)| text == label && *visible)
+            .unwrap_or_else(|| panic!("{label} not visible in {texts:?}"))
+            .1;
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        self.run(view, state, vec![egui::Event::PointerMoved(pos)]);
+        self.run(view, state, vec![button(true)]);
+        self.run(view, state, vec![button(false)]);
+        for _ in 0..4 {
+            self.run(view, state, vec![]);
+        }
+    }
+}
+
+#[test]
+fn the_catalogue_list_shows_every_match_after_a_narrower_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let dat = dir.path().join("nds.dat");
+    std::fs::write(&dat, MAME).unwrap();
+    let page = page(dir.path());
+    let mut view = page.view();
+    // Taller together than egui's 64-point minimum scroll area, which would
+    // otherwise hide a popup stuck at the size of its last, shorter list.
+    let names = [
+        "DS (Download Play)",
+        "DSi (Decrypted)",
+        "DSi (Digital)",
+        "DSi (Encrypted)",
+        "DS (Decrypted)",
+        "DS (Encrypted)",
+    ];
+    view.rows = names
+        .iter()
+        .map(|name| DatSourceRowView {
+            id: (*name).into(),
+            display_name: format!("No-Intro: Nintendo - Nintendo {name}"),
+            path: dat.display().to_string(),
+            enabled: true,
+            platform_id: Some("Nintendo DS".into()),
+            health_state: DatHealthState::Valid,
+            entry_count: Some(1),
+            ..Default::default()
+        })
+        .collect();
+    let mut state = DatSourcesPageUi::default();
+    state.simple.platform = Some("Nintendo DS".into());
+    let mut frames = Frames {
+        ctx: egui::Context::default(),
+        time: 0.0,
+    };
+    // Open the list while a search leaves one match, and choose it.
+    state.simple.catalogue_query = "Download".into();
+    frames.click(&view, &mut state, "Choose verification data");
+    let chosen = "No-Intro: Nintendo - Nintendo DS (Download Play)";
+    frames.click(&view, &mut state, chosen);
+    // Clear the search and open the list again: every catalogue is visible.
+    state.simple.catalogue_query.clear();
+    frames.click(&view, &mut state, chosen);
+    let texts = frames.run(&view, &mut state, vec![]);
+    for name in names {
+        let label = format!("No-Intro: Nintendo - Nintendo {name}");
+        // The chosen name also labels the closed combo box.
+        let wanted = if label == chosen { 2 } else { 1 };
+        let seen = texts
+            .iter()
+            .filter(|(text, _, visible)| *text == label && *visible)
+            .count();
+        assert!(seen >= wanted, "{label}: {seen} visible in {texts:#?}");
+    }
+}

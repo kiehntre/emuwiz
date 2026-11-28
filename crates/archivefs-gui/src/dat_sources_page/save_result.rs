@@ -340,9 +340,10 @@ pub(crate) fn disc_order_summary(order: &archivefs_core::DatDiscOrderOutcome) ->
     {
         return "Disc order: no matched disc, disk or tape image names a disc number in its catalogue entry, so there was nothing to order.".to_string();
     }
+    let changed = order.written.saturating_sub(order.unchanged);
     format!(
-        "Disc order from verified catalogue entries: {} disc/disk/tape image(s) numbered by the catalogue, {} without a known total, {} refused; {} game(s) saved.",
-        order.discs, order.unknown_total, order.refused, order.written
+        "Disc order across your whole library, from verified catalogue entries: {} disc/disk/tape image(s) numbered by the catalogue, {} without a known total, {} refused. This check saved disc order for {} game(s); {} game(s) already had the same disc order saved and were left unchanged.",
+        order.discs, order.unknown_total, order.refused, changed, order.unchanged
     )
 }
 
