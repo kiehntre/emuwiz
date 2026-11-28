@@ -59,6 +59,12 @@ alongside all existing project rules and task-specific restrictions:
    requirements. Distinguish executed tests from reported or proposed validation;
    explain unresolved blockers without claiming completion.
 
+## Merging into main
+
+`main` requires branches to be up to date before merging (enabled 2026-11-28). If
+another PR merges first, update the next PR against `main` and let its required checks
+pass on the new head before a pinned merge. See the CI section of `AGENTS.md`.
+
 ## AI Agent Efficiency and Usage Policy
 
 Read and follow the [canonical policy in AGENTS.md](AGENTS.md#ai-agent-efficiency-and-usage-policy),
