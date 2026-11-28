@@ -1773,3 +1773,110 @@ fn nothing_wrong_advice_only_when_the_catalogue_lists_none_of_the_formats() {
     let why = nothing_eligible_explanation(&p).expect("format gap explained");
     assert!(why.contains("Nothing is wrong with the files"), "{why}");
 }
+
+/// Stage D rehearsal (2026-11-28): a second, add-on catalogue for a system
+/// (a person chose "Nintendo DS" for "Nintendo DSi (Digital)") saves its
+/// matches, and its "no match" results are deliberately not saved, because
+/// missing from a partial catalogue says nothing against the file. That is
+/// a finished check with an explanation, not "Verification save was
+/// incomplete: <debug dump>" after the matches have already committed.
+#[test]
+fn an_add_on_catalogue_keeps_its_matches_and_explains_the_unsaved_no_matches() {
+    let mut f = Fixture::new();
+    f.write_dat("Nintendo - Nintendo DSi (Digital)");
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("Nintendo DS"),
+    );
+    f.add(2, "b.tap", Some(b"some other dump"), Some("Nintendo DS"));
+    let mut registry = DatSourceRegistry::default();
+    let mut entry = DatSourceEntry::new(
+        "dsi".into(),
+        "No-Intro: Nintendo - Nintendo DSi (Digital)".into(),
+        f.dat.clone(),
+        DatSourceKind::File,
+    );
+    entry.set_platform_by_person(Some("Nintendo DS".into()));
+    registry.add(entry).unwrap();
+    let resolved = resolve_catalogue(
+        &CatalogueRef::local("dsi"),
+        CatalogueInventoryInputs {
+            local_registry: &registry,
+            managed_sources: &Default::default(),
+            managed_root: f.dir.path(),
+            limits: DatLimits::default(),
+        },
+    )
+    .unwrap();
+    let preview =
+        preview_library_verification(resolved, f.db.clone(), "Nintendo DS".into(), None).unwrap();
+    assert_eq!(preview.eligible_games, 2);
+    let totals = preview
+        .execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+        .expect("a finished check, not an error");
+    assert_eq!((totals.verified, totals.no_match, totals.saved), (1, 1, 1));
+    let why = totals
+        .save_withheld
+        .expect("the unsaved no-match is explained");
+    assert!(why.contains("1 \"no catalogue match\" result"), "{why}");
+    assert!(!why.contains('{'), "no debug dump: {why}");
+    let db = Database::open_read_only(&f.db).unwrap();
+    assert!(!db.library_dat_identities_for_item(1).unwrap().is_empty());
+    assert!(db.library_dat_identities_for_item(2).unwrap().is_empty());
+}
+
+/// Stage D (2026-11-28): No-Intro's "NEC - PC Engine - TurboGrafx-16" is
+/// recognised as PC Engine, which EmuWiz counts as the same system as
+/// TurboGrafx-16 (`same_platform`). Checking TurboGrafx-16 games against it
+/// was refused only by the assigned-platform check comparing ids exactly.
+#[test]
+fn a_pc_engine_catalogue_checks_turbografx_16_games() {
+    let mut f = Fixture::new();
+    f.write_dat("NEC - PC Engine - TurboGrafx-16");
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("TurboGrafx-16"),
+    );
+    let mut registry = DatSourceRegistry::default();
+    let mut entry = DatSourceEntry::new(
+        "pce".into(),
+        "No-Intro: NEC - PC Engine - TurboGrafx-16".into(),
+        f.dat.clone(),
+        DatSourceKind::File,
+    );
+    entry.platform = Some("PC Engine".into());
+    registry.add(entry).unwrap();
+    let resolve = |registry: &DatSourceRegistry| {
+        resolve_catalogue(
+            &CatalogueRef::local("pce"),
+            CatalogueInventoryInputs {
+                local_registry: registry,
+                managed_sources: &Default::default(),
+                managed_root: f.dir.path(),
+                limits: DatLimits::default(),
+            },
+        )
+        .unwrap()
+    };
+    let preview = preview_library_verification(
+        resolve(&registry),
+        f.db.clone(),
+        "TurboGrafx-16".into(),
+        None,
+    )
+    .expect("TurboGrafx-16 is the same system as PC Engine");
+    assert_eq!((preview.selected_games, preview.eligible_games), (1, 1));
+    let totals = preview
+        .execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+        .unwrap();
+    assert_eq!((totals.verified, totals.saved), (1, 1));
+    // A different system is still refused.
+    assert!(
+        preview_library_verification(resolve(&registry), f.db.clone(), "Game Boy".into(), None)
+            .is_err()
+    );
+}

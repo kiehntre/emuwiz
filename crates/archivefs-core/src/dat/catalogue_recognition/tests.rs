@@ -665,3 +665,17 @@ fn recognisers_agree_on_every_known_header() {
     }
     assert!(disagreements.is_empty(), "{}", disagreements.join("\n"));
 }
+
+/// Stage D (2026-11-28): TOSEC's "MSX MSX2" system names one machine, MSX2.
+/// It was not recognised at all, so the MSX2 [DSK] catalogue was refused for
+/// MSX2 even when a person chose it.
+#[test]
+fn tosec_msx_msx2_is_the_msx2() {
+    for name in ["MSX MSX2 - Games - [DSK]", "MSX MSX2 - Games - [ROM]"] {
+        assert_eq!(
+            recognise_catalogue(Some(name), Some(DatEcosystem::Tosec)),
+            CatalogueRecognition::Games { platform: "MSX2" },
+            "{name}"
+        );
+    }
+}

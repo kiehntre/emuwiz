@@ -266,7 +266,9 @@ fn catalogue_fits(
         .assigned_platform
         .as_deref()
         .and_then(crate::canonical_platform_for_alias)
-        .is_some_and(|p| p != platform)
+        // The same rule as recognition: equivalent ids (PC Engine and
+        // TurboGrafx-16) name one system.
+        .is_some_and(|p| !super::catalogue_recognition::same_platform(p, platform))
     {
         return Err("Assigned and parsed catalogue platforms disagree.".into());
     }
@@ -889,22 +891,41 @@ impl VerificationPreview {
             // check reports that as an error, as it always has. A bounded
             // row set must not: its caller would take "error" to mean
             // nothing was saved, read the set again and stop at it forever.
-            if !self.rows_population {
+            // A no-match from a catalogue that covers only part of the
+            // game's system (an add-on catalogue a person chose) is not
+            // saved by design: it says nothing against the file. On its own
+            // that is a finished check with an explanation, not a failure.
+            let only_inapplicable_no_matches = saved.refused.is_none()
+                && saved.unassociated == 0
+                && saved.ambiguous == 0
+                && saved.platform_refused == 0;
+            if only_inapplicable_no_matches {
+                totals.save_withheld = Some(format!(
+                    "{} \"no catalogue match\" result{} not saved: this catalogue lists only part of this system's games, so a game missing from it is not evidence against the file.",
+                    saved.negative_platform_unproven_skipped,
+                    if saved.negative_platform_unproven_skipped == 1 {
+                        " was"
+                    } else {
+                        "s were"
+                    }
+                ));
+            } else if !self.rows_population {
                 return Err(format!("Verification save was incomplete: {saved:?}"));
+            } else {
+                totals.save_withheld = Some(format!(
+                    "Some results in this set were not saved ({} refused, {} not tied to one library row, {} negative results that do not apply to the game's system, {} results refused for the game's system{})",
+                    usize::from(saved.refused.is_some()),
+                    saved.unassociated + saved.ambiguous,
+                    saved.negative_platform_unproven_skipped,
+                    saved.platform_refused,
+                    saved
+                        .platform_refusals
+                        .reasons()
+                        .into_iter()
+                        .map(|(count, reason)| format!("; {count}: {reason}"))
+                        .collect::<String>()
+                ));
             }
-            totals.save_withheld = Some(format!(
-                "Some results in this set were not saved ({} refused, {} not tied to one library row, {} negative results that do not apply to the game's system, {} results refused for the game's system{})",
-                usize::from(saved.refused.is_some()),
-                saved.unassociated + saved.ambiguous,
-                saved.negative_platform_unproven_skipped,
-                saved.platform_refused,
-                saved
-                    .platform_refusals
-                    .reasons()
-                    .into_iter()
-                    .map(|(count, reason)| format!("; {count}: {reason}"))
-                    .collect::<String>()
-            ));
         }
         totals.saved = saved.inserted + saved.updated;
         totals.protected_prior = saved.skipped_protected_prior_result;
