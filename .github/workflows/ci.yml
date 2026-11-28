@@ -69,6 +69,21 @@ jobs:
       - name: Check main.rs boundary against PR base
         run: scripts/check-main-rs-boundary.sh --base "${{ github.event.pull_request.base.sha }}"
 
+  # Fast feedback only: the same check still runs (and is enforced) in every
+  # validation shard, so this adds a gate condition and removes none. A
+  # formatting slip fails CI in about a minute instead of after the shards.
+  formatting:
+    name: Formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt
+      - run: cargo fmt --all --check
+
   # The core and full tiers run their one `cargo test` command in parallel
   # shards defined by scripts/ci_test_shards.py: each shard runs its own libtest
   # name filters and --skips every earlier shard's, the last skips them all, so
@@ -306,6 +321,9 @@ jobs:
           toolchain: "1.97.1"
       - uses: Swatinem/rust-cache@v2
         with:
+          # One cache per image: build scripts compiled against 26.04's glibc
+          # must not be restored onto 24.04.
+          key: ${{ matrix.os }}
           cache-on-failure: true
       - name: Install bubblewrap, DOSBox, Xvfb and Ubuntu's extra AppArmor profiles
         run: |
@@ -429,42 +447,67 @@ jobs:
           cargo fetch --locked
           python3 -B scripts/release/test_generate_sbom.py
 
+  # Three independent suites on three fresh runners (FORGE H1c): every file
+  # makes its own temporary tree and private HOME and none uses sudo, cargo or
+  # another file's output. Each command still runs exactly once.
   install-script-tests:
-    name: Installer script tests
+    name: Installer script tests (${{ matrix.suite }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
     needs: [classify]
     if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [install, upgrade, assets]
     steps:
       - uses: actions/checkout@v5
       # desktop-file-validate (from desktop-file-utils) is exercised by
       # tests/test_install.sh; without it, those assertions silently skip
       # and the desktop entry's Desktop Entry Specification syntax is
-      # never actually checked in CI.
+      # never actually checked in CI. Installed for every suite.
       - name: Install desktop-file-utils
         run: sudo apt-get update && sudo apt-get install -y desktop-file-utils
-      - run: bash tests/test_install_environment_isolation.sh
-      - run: bash scripts/test-check-version-consistency.sh
-      - run: bash tests/test_install.sh
-      - run: python3 tests/test_installer_asset_races.py
-      - run: python3 tests/test_installer_upgrade_preservation.py
-      - run: python3 tests/test_installer_organise_gate.py
-      - run: bash scripts/qa/upgrade-preflight-selftest.sh
-      - run: python3 tests/test_installer_d5_regressions.py
+      - name: Known installer suite
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: case "$SUITE" in install|upgrade|assets) ;; *) echo "::error::unknown suite $SUITE"; exit 1 ;; esac
+      - if: matrix.suite == 'install'
+        run: bash tests/test_install_environment_isolation.sh
+      - if: matrix.suite == 'install'
+        run: bash tests/test_install.sh
+      - if: matrix.suite == 'upgrade'
+        run: python3 tests/test_installer_d5_regressions.py
+      - if: matrix.suite == 'upgrade'
+        run: python3 tests/test_installer_upgrade_preservation.py
+      - if: matrix.suite == 'upgrade'
+        run: python3 tests/test_installer_organise_gate.py
+      - if: matrix.suite == 'assets'
+        run: python3 tests/test_installer_asset_races.py
+      - if: matrix.suite == 'assets'
+        run: bash scripts/test-check-version-consistency.sh
+      - if: matrix.suite == 'assets'
+        run: bash scripts/qa/upgrade-preflight-selftest.sh
 
   # Cargo retention and retirement delete real data on developer machines, so
   # their safety tests run here too. Any change under scripts/ selects the full
   # tier, and main always runs it. Python 3.12 is what the real-root tests and
   # the supported hosts use, and the runner is disposable, so sudo is safe.
+  # Four balanced groups on four fresh runners (FORGE H1c); the script's last
+  # group takes every file the glob finds that no earlier group names.
   maintenance-script-tests:
-    name: Maintenance script tests
+    name: Maintenance script tests (${{ matrix.group }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: [classify]
     if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v5
-      - run: scripts/ci-maintenance-tests.sh
+      - run: scripts/ci-maintenance-tests.sh --group ${{ matrix.group }}
 
   release-artifact:
     name: Create canonical artifact
@@ -479,6 +522,8 @@ jobs:
     # with this job, and a failure there still fails CI.
     needs: [classify, security]
     if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
+    outputs:
+      sha256: ${{ steps.digest.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -498,8 +543,13 @@ jobs:
         run: |
           python3 -I scripts/release/check_glibc_compat.py --max 2.39 \
             --require bin/emuwiz --require bin/emuwiz-cli "$RUNNER_TEMP/release/"*.tar.xz
-      - name: Reject representative malformed artifacts
-        run: scripts/test-release-artifact-verifier.sh "$RUNNER_TEMP/release/"*.tar.xz
+      - id: digest
+        name: Record the candidate's SHA-256 for the jobs that download it
+        run: |
+          shopt -s nullglob
+          archives=("$RUNNER_TEMP/release/"*.tar.xz)
+          ((${#archives[@]} == 1)) || { echo "expected one archive" >&2; exit 1; }
+          echo "sha256=$(sha256sum "${archives[0]}" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - name: Check artifact and binary versions
         run: |
           scripts/check-version-consistency.sh \
@@ -539,15 +589,53 @@ jobs:
           python3 -I scripts/release/check_glibc_compat.py --max 2.39 \
             --require bin/emuwiz --require bin/emuwiz-cli "$RUNNER_TEMP/download/"*.tar.xz
 
+  # The malformed-artifact rejection tests, moved off the canonical build's
+  # critical path (FORGE H1d) and split in two. Both halves must succeed for
+  # the gate; each first proves it holds the exact archive the canonical job
+  # built (its recorded SHA-256), so no other candidate can stand in.
+  artifact-rejection:
+    name: Reject malformed artifacts (${{ matrix.group }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: [classify, release-artifact]
+    if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [1, 2]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: archivefs-release-candidate
+          path: ${{ runner.temp }}/download
+      - name: Install desktop-file-utils
+        run: sudo apt-get update && sudo apt-get install -y desktop-file-utils
+      - name: This is the canonical job's archive
+        env:
+          EXPECTED_SHA256: ${{ needs.release-artifact.outputs.sha256 }}
+        run: |
+          shopt -s nullglob
+          archives=("$RUNNER_TEMP/download/"*.tar.xz)
+          ((${#archives[@]} == 1)) || { echo "expected one archive" >&2; exit 1; }
+          [[ "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "no recorded digest" >&2; exit 1; }
+          actual=$(sha256sum "${archives[0]}" | cut -d' ' -f1)
+          [[ "$actual" == "$EXPECTED_SHA256" ]] || { echo "digest $actual != recorded $EXPECTED_SHA256" >&2; exit 1; }
+      - run: scripts/test-release-artifact-verifier.sh --group ${{ matrix.group }} "$RUNNER_TEMP/download/"*.tar.xz
+
   # The two clean builds run on separate runners, each with the same isolation
   # as before (disposable shared clone, own target, TMPDIR and output root, no
   # compiler wrapper, no incremental, no rust-cache); the comparison is the
   # unchanged byte-for-byte --archives check of both downloaded outputs.
+  # They need only classify: the audit has no outputs they use, and the
+  # validation jobs already build the same dependencies without waiting for it.
+  # The audit stays mandatory through CI gate (ALWAYS), and release-artifact,
+  # the canonical candidate, still needs it.
   reproducibility-build:
     name: Reproducibility build ${{ matrix.run }}
     runs-on: ubuntu-24.04
     timeout-minutes: 50
-    needs: [classify, security]
+    needs: [classify]
     if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     strategy:
       fail-fast: false
@@ -606,6 +694,7 @@ jobs:
     needs:
       - classify
       - repository-guardrails
+      - formatting
       - validation
       - test-shard-coverage
       - clippy
@@ -616,6 +705,7 @@ jobs:
       - maintenance-script-tests
       - release-artifact
       - verify-artifact
+      - artifact-rejection
       - reproducibility-build
       - reproducibility
     if: ${{ always() }}

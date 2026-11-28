@@ -18,7 +18,7 @@ import sys
 
 # Must succeed on every event and tier.
 ALWAYS = (
-    "classify", "validation", "test-shard-coverage", "clippy", "r2-filesystem-gate",
+    "classify", "formatting", "validation", "test-shard-coverage", "clippy", "r2-filesystem-gate",
     "dosbox-sandbox-enforcement", "security",
 )
 # Must succeed on pull requests; the job only runs there.
@@ -28,7 +28,7 @@ PULL_REQUEST_ONLY = ("repository-guardrails",)
 # needs failed is not an intended skip, and is refused on the full tier.
 FULL_TIER = (
     "install-script-tests", "maintenance-script-tests", "release-artifact", "verify-artifact",
-    "reproducibility-build", "reproducibility",
+    "artifact-rejection", "reproducibility-build", "reproducibility",
 )
 FAST_TIERS = ("core", "gui")
 TIERS = (*FAST_TIERS, "full")

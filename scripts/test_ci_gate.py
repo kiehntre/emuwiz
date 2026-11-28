@@ -102,7 +102,7 @@ class Decision(unittest.TestCase):
     def test_only_documented_jobs_can_skip_on_a_fast_tier(self) -> None:
         self.assertEqual(ci_gate.FULL_TIER, (
             "install-script-tests", "maintenance-script-tests", "release-artifact", "verify-artifact",
-            "reproducibility-build", "reproducibility"))
+            "artifact-rejection", "reproducibility-build", "reproducibility"))
         self.assertEqual(ci_gate.FAST_TIERS, ("core", "gui"))
 
 
@@ -151,6 +151,16 @@ class Workflow(unittest.TestCase):
         needed = re.search(r"(?ms)^    needs:\n((?:      - \S+\n)+)", gate).group(1).split()[1::2]
         self.assertEqual(sorted(needed), sorted(jobs))
         self.assertEqual(sorted(needed), sorted({*ci_gate.ALWAYS, *ci_gate.PULL_REQUEST_ONLY, *ci_gate.FULL_TIER}))
+
+    def test_the_security_audit_is_required_on_every_tier_and_event(self) -> None:
+        # Jobs may start without waiting for the audit; the gate never passes without it.
+        self.assertIn("security", ci_gate.ALWAYS)
+        for tier in ci_gate.TIERS:
+            for event in ci_gate.EVENTS:
+                for result in BAD + ("skipped",):
+                    jobs = needs(tier, event)
+                    jobs["security"]["result"] = result
+                    self.assertIn(f"security: {result}", ci_gate.problems(jobs, event), (tier, event, result))
 
     def test_the_gate_always_runs_and_cannot_be_softened(self) -> None:
         gate = self.jobs()["ci-gate"]

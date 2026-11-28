@@ -1,14 +1,14 @@
 'use strict';
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-const {ALWAYS, FULL, ANALYZE, classify, decide, notify, marker} = require('./ci-notify.cjs');
+const {ALWAYS, FULL, MATRIX_FULL, SHARDS, ANALYZE, classify, decide, notify, marker} = require('./ci-notify.cjs');
 
 const sha = 'a'.repeat(40);
 function fixture(tier = 'full') {
   const runs = [1, 2].map(id => ({id, name: id === 1 ? 'CI' : 'CodeQL',
     status: 'completed', conclusion: 'success', head_sha: sha,
     html_url: `https://github.com/o/r/actions/runs/${id}`}));
-  const shards = tier === 'gui' ? ['gui-tier-v2', 'gui-tier-other'] : ['recovery', 'dat', 'gui-v2', 'rest'];
+  const shards = tier === 'gui' ? ['gui-tier-v2', 'gui-tier-other'] : SHARDS;
   const names = [[...ALWAYS, ...FULL, ...shards.map(s => `Formatting and relevant tests (${s})`)], ANALYZE];
   const jobs = names.flatMap((group, i) => group.map((name, k) => ({name, run_id: i + 1,
     status: 'completed', conclusion: tier !== 'full' && FULL.includes(name) ? 'skipped' : 'success',
@@ -83,6 +83,20 @@ for (const tier of ['core', 'gui']) {
     assert.equal(decide(collapsedMatrix(tier)).status, 'READY');
   });
 }
+test('every full-tier matrix may collapse on a fast tier, and only there', () => {
+  for (const tier of ['core', 'gui', 'full']) {
+    const x = fixture(tier);
+    for (const m of MATRIX_FULL) {
+      const first = x.jobs.find(j => m.expanded.includes(j.name));
+      x.jobs = x.jobs.filter(j => !m.expanded.includes(j.name));
+      x.checks = x.checks.filter(c => !m.expanded.includes(c.name));
+      const job = {...first, name: m.unexpanded, conclusion: 'skipped'};
+      x.jobs.push(job);
+      x.checks.push({...job, id: Number(job.check_run_url.split('/').pop())});
+    }
+    assert.equal(decide(x).status, tier === 'full' ? 'FAILED' : 'READY', tier);
+  }
+});
 test('unexpanded matrix cannot bypass full-tier, classification, or job identity gates', () => {
   const variants = [
     x => {x.tier = 'full';},
@@ -226,9 +240,15 @@ test('failure comments render PR-controlled names as text and preserve safe job 
 test('workflow and job contract still matches existing CI', () => {
   const fs = require('node:fs');
   const ci = fs.readFileSync(pathFor('../.github/workflows/ci.yml'), 'utf8');
-  for (const name of [...ALWAYS, ...FULL].filter(n => !n.startsWith('DOSBox') && !n.startsWith('Reproducibility build'))) {
+  const expanded = MATRIX_FULL.flatMap(m => m.expanded);
+  for (const name of [...ALWAYS, ...FULL].filter(n => !n.startsWith('DOSBox') && !expanded.includes(n))) {
     assert.ok(ci.includes(`name: ${name}\n`), name);
   }
+  for (const m of MATRIX_FULL) assert.ok(ci.includes(`name: ${m.unexpanded}\n`), m.unexpanded);
+  // The shard list mirrors scripts/ci_test_shards.py.
+  const shards = fs.readFileSync(pathFor('ci_test_shards.py'), 'utf8');
+  const block = shards.slice(shards.indexOf('SHARDS: list'), shards.indexOf('GUI_TIER_SHARDS'));
+  assert.deepEqual([...block.matchAll(/^\s+\("([a-z0-9-]+)",/gm)].map(m => m[1]), SHARDS);
   const workflow = fs.readFileSync(pathFor('../.github/workflows/ci-notify.yml'), 'utf8');
   assert.match(workflow, /ref: \$\{\{ github.workflow_sha \}\}/);
   assert.match(workflow, /cancel-in-progress: false/);
