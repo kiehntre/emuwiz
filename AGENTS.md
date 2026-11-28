@@ -494,6 +494,14 @@ rules; efficiency never overrides those guarantees.
       artifact downloads; a guard hook denies them. This applies equally to subagents.
     - When CI passes, complete an already-authorised merge only after verifying the
       exact head SHA, the required checks and the merge state on GitHub.
+    - `main` requires branches to be up to date before merging (ruleset "Protect main
+      branch", `strict_required_status_checks_policy`, enabled 2026-11-28 by owner
+      decision): "CI gate" must pass on a head that already contains the current
+      `main`. When another PR merges first, update the next PR against `main`
+      (rebase or merge `main` in), wait for its required checks on the new head, and
+      only then merge it pinned. Passing checks on an older base, or disjoint file
+      lists, are not enough: two PRs can conflict without sharing a file. No merge
+      queue is used.
     - When CI fails, report the actual failure (failing job and log excerpt) instead
       of checking again.
     Never claim green CI early or merge without approval; all security, preservation,
