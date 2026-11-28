@@ -1308,6 +1308,38 @@ pub fn resolve_catalogue_for_platform(
     }
 }
 
+/// Enabled catalogues set to a system that no platform-scoped check uses
+/// yet because they were never validated, or changed since they were
+/// (`NeedsValidation`): `(system, catalogue name)`, sorted. A check that
+/// finds other usable catalogues for the system runs without these, so the
+/// caller must tell the person they exist instead of leaving them out
+/// silently. Reads configuration and catalogue metadata only.
+pub fn catalogues_needing_validation(
+    inputs: CatalogueInventoryInputs<'_>,
+) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = list_installed_catalogues(inputs)
+        .into_iter()
+        .filter(|row| row.enabled)
+        .filter(|row| {
+            matches!(
+                row.availability,
+                CatalogueAvailability::NeedsValidation { .. }
+            )
+        })
+        .filter_map(|row| match row.platform {
+            EvidenceValue::Assigned(p) | EvidenceValue::Confirmed(p) => {
+                let system = crate::canonical_platform_for_alias(&p)
+                    .map(str::to_string)
+                    .unwrap_or(p);
+                Some((system, row.display_name))
+            }
+            _ => None,
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
 fn platform_matches(a: &str, b: &str) -> bool {
     if a.eq_ignore_ascii_case(b) {
         return true;

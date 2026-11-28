@@ -3300,7 +3300,7 @@ impl NativeWorkflows {
             .as_ref()
             .map(|page| page.view());
         let mut dat_advanced = Vec::new();
-        let dat_status = if let Some(view) = dat.as_ref() {
+        let (dat_status, dat_reason) = if let Some(view) = dat.as_ref() {
             dat_advanced.push(format!("validated_sources={}", view.rows.len()));
             dat_advanced.push("provider_id=dat-sources".into());
             dat_advanced.extend(view.rows.iter().map(|row| {
@@ -3322,50 +3322,17 @@ impl NativeWorkflows {
                     row.source_label, row.configured, row.installed, row.status
                 )
             }));
-            let enabled = view
-                .rows
-                .iter()
-                .filter(|row| row.enabled)
-                .collect::<Vec<_>>();
-            if view.rows.is_empty() && !view.managed_rows.iter().any(|row| row.installed) {
-                SourceStatus::NeedsSetup
-            } else if !enabled.is_empty()
-                && enabled.iter().all(|row| {
-                    row.health_state == archivefs_core::dat::sources::DatHealthState::Unreadable
-                        || row.health_state == archivefs_core::dat::sources::DatHealthState::Invalid
-                })
-            {
-                SourceStatus::Problem
-            } else if enabled.iter().any(|row| {
-                row.health_state == archivefs_core::dat::sources::DatHealthState::Unreadable
-                    || row.health_state == archivefs_core::dat::sources::DatHealthState::Invalid
-            }) {
-                SourceStatus::NeedsAttention
-            } else if enabled.iter().any(|row| row.health_stale) {
-                SourceStatus::Stale
-            } else if enabled.iter().any(|row| {
-                row.health_state == archivefs_core::dat::sources::DatHealthState::Valid
-                    || row.health_state
-                        == archivefs_core::dat::sources::DatHealthState::ValidWithWarnings
-            }) || view.managed_rows.iter().any(|row| row.installed)
-            {
-                SourceStatus::Ready
-            } else if !view.rows.is_empty() && enabled.is_empty() {
-                SourceStatus::Disabled
-            } else {
-                SourceStatus::NotChecked
-            }
+            super::sources_providers::dat_sources_status(
+                &view.rows,
+                view.managed_rows.iter().any(|row| row.installed),
+            )
         } else {
             dat_advanced.push("The DAT registry has not been opened in this session.".into());
-            SourceStatus::NotChecked
-        };
-        let dat_reason = match dat_status {
-            SourceStatus::NeedsSetup => "No DAT source is configured. Game identity verification needs a trusted DAT source.".into(),
-            SourceStatus::Problem => "A DAT source cannot currently be read or validated. Review its details.".into(),
-            SourceStatus::Stale => "A DAT source changed since validation. Refresh its validation.".into(),
-            SourceStatus::Disabled => "Configured DAT sources are disabled. Enable one to use it for verification.".into(),
-            SourceStatus::Ready => "A usable DAT source is available for game identity and verification.".into(),
-            _ => "DAT status has not been checked here. Open DAT Sources to review the registry.".into(),
+            (
+                SourceStatus::NotChecked,
+                "DAT status has not been checked here. Open DAT Sources to review the registry."
+                    .into(),
+            )
         };
         cards.push(ProviderCard {
             id: "dat-sources",

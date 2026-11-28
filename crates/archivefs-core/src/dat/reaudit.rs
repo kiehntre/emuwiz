@@ -486,6 +486,21 @@ pub fn plan_first_matching(
     for_platform: &dyn Fn(&str) -> Result<ResolvedCatalogue, CatalogueResolveError>,
     resolve: &dyn Fn(&str) -> Result<ResolvedCatalogue, String>,
 ) -> Result<FirstMatchPlan, String> {
+    plan_first_matching_for(database_path, catalogues, for_platform, resolve, None)
+}
+
+/// [`plan_first_matching`] limited to one system: `only` is a canonical
+/// platform id ([`crate::canonical_platform_for_alias`]). Games of every
+/// other system, and games with no known system, are not looked at and are
+/// not counted anywhere in the plan, so the plan describes that system
+/// alone. `None` is exactly [`plan_first_matching`].
+pub fn plan_first_matching_for(
+    database_path: &Path,
+    catalogues: &HashMap<String, ConfiguredCatalogue>,
+    for_platform: &dyn Fn(&str) -> Result<ResolvedCatalogue, CatalogueResolveError>,
+    resolve: &dyn Fn(&str) -> Result<ResolvedCatalogue, String>,
+    only: Option<&str>,
+) -> Result<FirstMatchPlan, String> {
     let db = Database::open_read_only(database_path).map_err(|e| e.to_string())?;
     let saved = db.saved_dat_result_sources().map_err(|e| e.to_string())?;
     // (game, catalogue, catalogue digest) a previous run tried and saved
@@ -507,6 +522,13 @@ pub fn plan_first_matching(
     let mut groups: BTreeMap<(String, &'static str), PlannedGroup> = BTreeMap::new();
     let mut waiting: BTreeMap<(Option<String>, FirstMatchWait), usize> = BTreeMap::new();
     for archive in archives {
+        let platform = archive
+            .platform
+            .as_deref()
+            .and_then(crate::canonical_platform_for_alias);
+        if only.is_some_and(|only| platform != Some(only)) {
+            continue;
+        }
         let saved_here = saved.get(&archive.id);
         // A game with any saved result that cannot be planned now is left to
         // the re-check; it is not "waiting" for a first match.
@@ -517,10 +539,6 @@ pub fn plan_first_matching(
                 *waiting.entry(key).or_insert(0) += 1;
             }
         };
-        let platform = archive
-            .platform
-            .as_deref()
-            .and_then(crate::canonical_platform_for_alias);
         let Some(platform) = platform else {
             wait((None, FirstMatchWait::SystemUnknown));
             continue;
@@ -818,6 +836,12 @@ impl ReauditCatalogues {
     /// uses: none, exactly one, or several for the person to choose from.
     pub fn for_platform(&self, platform: &str) -> Result<ResolvedCatalogue, CatalogueResolveError> {
         super::catalogue_selection::resolve_catalogue_for_platform(platform, self.inputs())
+    }
+
+    /// Catalogues set to a system that [`Self::for_platform`] leaves out
+    /// until they are validated: `(system, catalogue name)`.
+    pub fn needing_validation(&self) -> Vec<(String, String)> {
+        super::catalogue_selection::catalogues_needing_validation(self.inputs())
     }
 }
 

@@ -1641,6 +1641,84 @@ mod first_matching {
         assert_eq!(f.saved_rows(), before);
     }
 
+    /// ORACLE I1: `--platform` plans one system alone. Every other system,
+    /// and games with no known system, are neither planned nor counted, and
+    /// no filter is exactly the unfiltered plan.
+    #[test]
+    fn a_platform_filter_plans_that_system_alone_and_none_changes_nothing() {
+        let f = library();
+        // Taken first: `registry()` rewrites the Game Boy catalogue files, so
+        // a registry built before another `first_plan()` would read them as
+        // changed since validation.
+        let unfiltered = f.first_plan();
+        let registry = f.registry();
+        let inputs = inputs_for(&registry, &f);
+        let configured = crate::dat::configured_catalogues::configured_catalogues(inputs);
+        let plan_for = |only: Option<&str>| {
+            crate::dat::reaudit::plan_first_matching_for(
+                &f.db,
+                &configured,
+                &|platform| {
+                    crate::dat::catalogue_selection::resolve_catalogue_for_platform(
+                        platform, inputs,
+                    )
+                },
+                &|id| crate::dat::configured_catalogues::resolve_configured_catalogue(id, inputs),
+                only,
+            )
+            .unwrap()
+        };
+        let summary = |plan: &FirstMatchPlan| {
+            let groups: Vec<(String, Vec<i64>)> = plan
+                .plan
+                .groups
+                .iter()
+                .map(|g| {
+                    (
+                        g.source_id.clone(),
+                        g.items.iter().map(|i| i.archive_id).collect(),
+                    )
+                })
+                .collect();
+            let waits: Vec<(Option<String>, FirstMatchWait, usize)> = plan
+                .waiting
+                .iter()
+                .map(|w| (w.platform.clone(), w.wait.clone(), w.games))
+                .collect();
+            (groups, waits, plan.already_checked)
+        };
+
+        assert_eq!(summary(&plan_for(None)), summary(&unfiltered));
+
+        let spectrum = plan_for(Some("ZX Spectrum"));
+        assert_eq!(
+            summary(&spectrum),
+            (
+                vec![("synthetic".to_string(), vec![1, 2, 3])],
+                vec![(
+                    Some("ZX Spectrum".to_string()),
+                    FirstMatchWait::FileUnavailable,
+                    1
+                )],
+                // Game 9, the one game with a saved result, is a Spectrum game.
+                1
+            )
+        );
+        let game_boy = plan_for(Some("Game Boy"));
+        assert_eq!(
+            summary(&game_boy),
+            (
+                vec![("catalogue-set:Game Boy".to_string(), vec![4])],
+                vec![],
+                0
+            )
+        );
+        // A system with no games planned leaves an empty plan, not a wider one.
+        let nes = plan_for(Some("NES"));
+        assert!(nes.plan.groups.is_empty());
+        assert_eq!(nes.waiting_games(), 1);
+    }
+
     #[test]
     fn a_run_saves_results_for_the_planned_games_only_and_then_has_nothing_left() {
         let f = library();
