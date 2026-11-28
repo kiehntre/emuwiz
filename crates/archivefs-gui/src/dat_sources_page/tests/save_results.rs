@@ -606,3 +606,108 @@ fn a_guessed_system_is_proposed_not_corrected_and_a_chosen_system_is_left_alone(
         .unwrap();
     assert_eq!(rows, 0);
 }
+
+fn settle_corrections(
+    page: &mut DatSourcesPageState,
+) -> super::platform_corrections_panel::PlatformCorrectionsView {
+    let start = std::time::Instant::now();
+    loop {
+        page.poll();
+        let view = page
+            .view()
+            .platform_corrections
+            .expect("corrections section");
+        if !view.busy {
+            return view;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(30),
+            "worker did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// The page end to end: an NES game guessed onto SNES by its folder is
+/// listed Ready and preselected with its evidence; a game added by a
+/// Discovery Import carries the warning; confirming corrects it (library
+/// views reload, no file changes); Undo from the page puts it back.
+#[test]
+fn the_page_previews_applies_and_undoes_a_platform_correction() {
+    use super::platform_corrections_panel::{CorrectionsAction as A, DISCOVERY_UNDO_WARNING};
+    let (fixture, mut page, roms) = audit_fixture();
+    let path = database(&fixture, Some(&roms));
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(
+            "INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at) VALUES(1,'SNES','folder_alias',1,'now'); \
+             INSERT INTO discovery_import_operations(operation_id,state,created_at,receipt_json) VALUES('op','committed','now',CAST('{}' AS BLOB)); \
+             INSERT INTO discovery_import_records(operation_id,archive_id,source_folder_id,relative_path,absolute_path,snapshot_json,touched) \
+             VALUES('op',1,1,CAST('super.bin' AS BLOB),CAST('x' AS BLOB),CAST('{}' AS BLOB),0);",
+        ).unwrap();
+    }
+    let bytes_before = std::fs::read(roms.join("super.bin")).unwrap();
+    page.database_path = Some(path.clone());
+    nes_header(&fixture, "collection.dat");
+    audit(&mut page, "collection", &roms);
+    let view = settle_corrections(&mut page);
+    let row = view
+        .rows
+        .iter()
+        .find(|r| r.archive_id == 1)
+        .expect("super.bin listed");
+    assert_eq!(row.group, archivefs_core::PlatformCorrectionGroup::Ready);
+    assert!(row.selected, "Ready corrections are preselected");
+    assert_eq!(row.current_source, "folder_alias");
+    assert!(row.evidence.contains("SHA-1"), "{row:?}");
+    assert!(row.loses_discovery_import_undo);
+    assert!(DISCOVERY_UNDO_WARNING.contains("cannot be offered again"));
+    assert_eq!(view.selected_losing_discovery_undo, 1);
+    let seen = page.identity_enrichment_generation();
+
+    // Review, then confirm.
+    page.apply(DatSourcesPageAction::PlatformCorrections(A::Review));
+    assert!(page.view().platform_corrections.unwrap().confirming);
+    page.apply(DatSourcesPageAction::PlatformCorrections(A::Apply {
+        proceed_with_rest: false,
+    }));
+    let view = settle_corrections(&mut page);
+    let current = |path: &Path| -> (String, String) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT platform, source FROM platform_assignments WHERE archive_id = 1 AND is_current = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(current(&path).1, "verified_dat", "{view:?}");
+    assert!(
+        page.identity_enrichment_generation() > seen,
+        "library views reload"
+    );
+    assert_eq!(view.receipts.len(), 1);
+    assert_eq!(view.receipts[0].undoable.len(), 1);
+    assert!(
+        view.rows.iter().all(|r| r.archive_id != 1),
+        "a corrected game leaves the preview"
+    );
+    assert_eq!(std::fs::read(roms.join("super.bin")).unwrap(), bytes_before);
+
+    // Undo this game from the page.
+    let receipt = view.receipts[0].path.clone();
+    page.apply(DatSourcesPageAction::PlatformCorrections(A::Undo {
+        receipt,
+        game: Some(1),
+        proceed_with_rest: false,
+    }));
+    let view = settle_corrections(&mut page);
+    assert_eq!(
+        current(&path),
+        ("SNES".to_string(), "folder_alias".to_string()),
+        "{view:?}"
+    );
+    assert!(view.receipts.is_empty(), "nothing left to undo: {view:?}");
+    assert_eq!(std::fs::read(roms.join("super.bin")).unwrap(), bytes_before);
+}

@@ -124,6 +124,13 @@ mod collection_records;
 mod disc_order_tests;
 pub use collection_records::{CollectionRecordRow, CollectionSourceFolder};
 pub(crate) mod forget_missing;
+pub(crate) mod platform_corrections;
+pub use platform_corrections::{
+    AssignmentBinding, PlatformCorrectionCandidate, PlatformCorrectionGroup,
+    PlatformCorrectionPreview, PlatformCorrectionReceiptSummary, PlatformCorrectionRecordSummary,
+    PlatformCorrectionRefusal, PlatformCorrectionsApplied, PlatformCorrectionsUndone,
+    WhenSomeChanged,
+};
 mod missing_cleanup;
 pub use missing_cleanup::MissingCleanupTarget;
 #[cfg(test)]
@@ -4636,7 +4643,7 @@ pub(crate) mod test_seams {
 
 /// Who set a game's current system, as far as EmuWiz can tell from the
 /// assignment's recorded source (owner decision 2026-11-26).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PlatformProvenanceClass {
     /// A guess from the folder, file type, path, archive layout or RomM
     /// metadata: strong catalogue evidence may correct it.
