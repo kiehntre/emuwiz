@@ -52,6 +52,9 @@ pub(crate) struct PlatformCorrectionsState {
     confirming: bool,
     worker: Option<Receiver<WorkerResult>>,
     status: Option<(widgets::StatusTone, String)>,
+    /// The raw error behind `status`, which may name local paths: shown
+    /// only under the collapsed technical details.
+    status_detail: Option<String>,
     refused: Vec<(i64, String)>,
     receipts: Vec<PlatformCorrectionReceiptSummary>,
     /// Whether the last Apply/Undo was refused because some games changed,
@@ -102,6 +105,7 @@ pub(crate) struct PlatformCorrectionsView {
     pub(crate) confirming: bool,
     pub(crate) busy: bool,
     pub(crate) status: Option<(widgets::StatusTone, String)>,
+    pub(crate) status_detail: Option<String>,
     pub(crate) refused: Vec<(i64, String)>,
     pub(crate) offer_rest: bool,
     pub(crate) receipts: Vec<ReceiptView>,
@@ -131,6 +135,7 @@ impl PlatformCorrectionsState {
         self.refused.clear();
         self.offer_rest = None;
         self.status = None;
+        self.status_detail = None;
         self.refresh(database);
     }
 
@@ -285,14 +290,16 @@ impl PlatformCorrectionsState {
             }
         };
         self.worker = None;
+        self.status_detail = None;
         let mut library_changed = false;
         match message {
             WorkerResult::Receipts(Ok(receipts)) => self.receipts = receipts,
             WorkerResult::Receipts(Err(error)) => {
                 self.status = Some((
                     widgets::StatusTone::Warning,
-                    format!("Earlier corrections could not be read: {error}"),
+                    "Earlier corrections could not be read from the library database.".into(),
                 ));
+                self.status_detail = Some(error);
             }
             WorkerResult::Applied(Ok(applied)) => {
                 self.refused = applied
@@ -470,6 +477,7 @@ impl PlatformCorrectionsState {
             confirming: self.confirming,
             busy: self.worker.is_some(),
             status: self.status.clone(),
+            status_detail: self.status_detail.clone(),
             refused: self.refused.clone(),
             offer_rest: self.offer_rest.is_some() && !self.refused.is_empty(),
             receipts,
@@ -530,6 +538,13 @@ pub(crate) fn show(ui: &mut egui::Ui, view: &PlatformCorrectionsView) -> Option<
     }
     if let Some((tone, text)) = &view.status {
         widgets::banner(ui, "Platform Corrections", text, *tone);
+        if let Some(detail) = &view.status_detail {
+            egui::CollapsingHeader::new("Technical details (may include local paths)")
+                .id_salt("platform-corrections-status-detail")
+                .show(ui, |ui| {
+                    ui.label(detail);
+                });
+        }
     }
     if !view.refused.is_empty() {
         for (id, reason) in &view.refused {

@@ -711,3 +711,52 @@ fn the_page_previews_applies_and_undoes_a_platform_correction() {
     assert!(view.receipts.is_empty(), "nothing left to undo: {view:?}");
     assert_eq!(std::fs::read(roms.join("super.bin")).unwrap(), bytes_before);
 }
+
+/// Main red after #548 (2026-11-28): the corrections panel's background
+/// listing of earlier corrections failed on an unusable database and put the
+/// raw error, local path included, in its visible banner. The navigation
+/// test above saw it only when that worker finished before its render, so it
+/// failed under CI load. This is the same scenario with the worker always
+/// finished first: the banner is plain and the error, path included, stays
+/// in the collapsed technical details.
+#[test]
+fn a_corrections_listing_error_keeps_local_paths_out_of_the_visible_text() {
+    let (fixture, mut page, roms) = audit_fixture();
+    page.database_path = Some(fixture.dir("not-a-database"));
+    audit(&mut page, "collection", &roms);
+    page.apply(DatSourcesPageAction::OpenDatSources);
+    page.apply(DatSourcesPageAction::OpenAdvancedIdentifyRename);
+    page.apply(DatSourcesPageAction::RefreshCoverage {
+        id: "collection".to_string(),
+    });
+    page.apply(DatSourcesPageAction::Revert);
+    // The section is hidden until the listing reports something.
+    let start = std::time::Instant::now();
+    let view = loop {
+        page.poll();
+        if let Some(view) = page.view().platform_corrections.filter(|v| !v.busy) {
+            break view;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(30),
+            "listing did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let (_, text) = view.status.clone().expect("the listing error is reported");
+    assert!(
+        text.contains("Earlier corrections could not be read"),
+        "{text}"
+    );
+    let root = fixture.root.to_string_lossy().into_owned();
+    assert!(!text.contains(&root), "{text}");
+    assert!(
+        view.status_detail.as_deref().is_some_and(|d| !d.is_empty()),
+        "the error is kept for the technical details"
+    );
+    for render in [render, render_identify_rename, render_quick_rename] {
+        let output = render(&page.view(), &mut DatSourcesPageUi::default());
+        assert!(rendered_text_contains(&output, "Save failed"));
+        assert!(!rendered_text_contains(&output, &root));
+    }
+}
