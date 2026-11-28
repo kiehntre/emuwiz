@@ -116,6 +116,78 @@ pub(super) enum HubAction {
     RommLibrary,
 }
 
+/// The DAT sources card's status and reason, from the registry rows and
+/// whether any managed catalogue is installed. Order matters: problems,
+/// then stale validations, then catalogues never validated, then Ready.
+/// An enabled catalogue that was never validated is left out of every
+/// check, so a usable catalogue elsewhere must not make the card read
+/// "Ready" (ORACLE I2, 2026-11-28: 23 ZX Spectrum catalogues went unused).
+pub(super) fn dat_sources_status(
+    rows: &[crate::dat_sources_page::DatSourceRowView],
+    managed_installed: bool,
+) -> (SourceStatus, String) {
+    use archivefs_core::dat::sources::DatHealthState;
+    let enabled = rows.iter().filter(|row| row.enabled).collect::<Vec<_>>();
+    let broken = |row: &&crate::dat_sources_page::DatSourceRowView| {
+        row.health_state == DatHealthState::Unreadable
+            || row.health_state == DatHealthState::Invalid
+    };
+    let unvalidated = enabled
+        .iter()
+        .filter(|row| row.health_state == DatHealthState::NotChecked)
+        .count();
+    let status = if rows.is_empty() && !managed_installed {
+        SourceStatus::NeedsSetup
+    } else if !enabled.is_empty() && enabled.iter().all(broken) {
+        SourceStatus::Problem
+    } else if enabled.iter().any(broken) {
+        SourceStatus::NeedsAttention
+    } else if enabled.iter().any(|row| row.health_stale) {
+        SourceStatus::Stale
+    } else if unvalidated > 0 {
+        return (
+            SourceStatus::NeedsAttention,
+            format!(
+                "{unvalidated} installed DAT {} not been validated, so Check Games does not use {} yet. Open DAT Sources and validate {}.",
+                if unvalidated == 1 {
+                    "source has"
+                } else {
+                    "sources have"
+                },
+                if unvalidated == 1 { "it" } else { "them" },
+                if unvalidated == 1 { "it" } else { "them" },
+            ),
+        );
+    } else if enabled.iter().any(|row| {
+        row.health_state == DatHealthState::Valid
+            || row.health_state == DatHealthState::ValidWithWarnings
+    }) || managed_installed
+    {
+        SourceStatus::Ready
+    } else if !rows.is_empty() && enabled.is_empty() {
+        SourceStatus::Disabled
+    } else {
+        SourceStatus::NotChecked
+    };
+    let reason = match status {
+        SourceStatus::NeedsSetup => {
+            "No DAT source is configured. Game identity verification needs a trusted DAT source."
+        }
+        SourceStatus::Problem => {
+            "A DAT source cannot currently be read or validated. Review its details."
+        }
+        SourceStatus::Stale => "A DAT source changed since validation. Refresh its validation.",
+        SourceStatus::Disabled => {
+            "Configured DAT sources are disabled. Enable one to use it for verification."
+        }
+        SourceStatus::Ready => {
+            "A usable DAT source is available for game identity and verification."
+        }
+        _ => "DAT status has not been checked here. Open DAT Sources to review the registry.",
+    };
+    (status, reason.into())
+}
+
 #[cfg(test)]
 pub(super) fn action_for_id(id: &str) -> Option<HubAction> {
     match id {
@@ -369,5 +441,47 @@ mod tests {
         let _ = rendered(&cards);
         assert_eq!(cards[0].id, before[0].id);
         assert_eq!(cards[0].status, before[0].status);
+    }
+
+    /// ORACLE I2: one validated catalogue no longer hides enabled ones that
+    /// were never validated (and are therefore left out of every check).
+    #[test]
+    fn never_validated_catalogues_are_named_instead_of_reading_ready() {
+        use crate::dat_sources_page::DatSourceRowView;
+        use archivefs_core::dat::sources::DatHealthState;
+        let row = |state, enabled| DatSourceRowView {
+            enabled,
+            health_state: state,
+            ..Default::default()
+        };
+        let valid = row(DatHealthState::Valid, true);
+        let unvalidated = row(DatHealthState::NotChecked, true);
+        let disabled_unvalidated = row(DatHealthState::NotChecked, false);
+
+        let (status, reason) = dat_sources_status(
+            &[valid.clone(), unvalidated.clone(), unvalidated.clone()],
+            false,
+        );
+        assert_eq!(status, SourceStatus::NeedsAttention);
+        assert_eq!(
+            reason,
+            "2 installed DAT sources have not been validated, so Check Games does not use them yet. Open DAT Sources and validate them."
+        );
+        let (_, one) = dat_sources_status(&[valid.clone(), unvalidated.clone()], false);
+        assert!(
+            one.starts_with("1 installed DAT source has not been validated"),
+            "{one}"
+        );
+
+        // A disabled one is the person's choice, not a gap.
+        let (status, _) = dat_sources_status(&[valid.clone(), disabled_unvalidated], false);
+        assert_eq!(status, SourceStatus::Ready);
+        // Problems still come first and keep their own wording.
+        let broken = row(DatHealthState::Unreadable, true);
+        let (status, reason) = dat_sources_status(&[valid.clone(), broken, unvalidated], false);
+        assert_eq!(status, SourceStatus::NeedsAttention);
+        assert!(!reason.contains("not been validated"), "{reason}");
+        assert_eq!(dat_sources_status(&[valid], false).0, SourceStatus::Ready);
+        assert_eq!(dat_sources_status(&[], false).0, SourceStatus::NeedsSetup);
     }
 }

@@ -18,8 +18,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use archivefs_core::dat::reaudit::{
     FirstMatchPlan, FirstMatchWait, ReauditBlock, ReauditCatalogues, ReauditGroup, ReauditLimits,
-    ReauditPlan, ReauditProgress, ReauditReport, ReauditStop, plan_first_matching, plan_reaudit,
-    run_reaudit,
+    ReauditPlan, ReauditProgress, ReauditReport, ReauditStop, plan_first_matching_for,
+    plan_reaudit, run_reaudit,
 };
 use archivefs_core::dat::sources::audit_run::DatAuditProgress;
 use archivefs_core::safe_read::TrustedRoots;
@@ -312,6 +312,15 @@ struct FirstPlanJson {
     waiting: Vec<WaitingJson>,
     not_listed: usize,
     not_eligible: Vec<NotEligibleJson>,
+    needs_validation: Vec<NeedsValidationJson>,
+}
+
+/// An installed catalogue for a system that this check does not use until it
+/// is validated on the DAT Sources page.
+#[derive(Serialize)]
+struct NeedsValidationJson {
+    system: String,
+    catalogue: String,
 }
 
 #[derive(Serialize)]
@@ -328,8 +337,15 @@ struct WaitingJson {
     games: usize,
 }
 
-fn first_plan_json(first: &FirstMatchPlan) -> FirstPlanJson {
+fn first_plan_json(first: &FirstMatchPlan, needs_validation: &[(String, String)]) -> FirstPlanJson {
     FirstPlanJson {
+        needs_validation: needs_validation
+            .iter()
+            .map(|(system, catalogue)| NeedsValidationJson {
+                system: system.clone(),
+                catalogue: catalogue.clone(),
+            })
+            .collect(),
         already_checked: first.already_checked,
         to_check: first.plan.games(),
         checked_elsewhere: first.checked_elsewhere,
@@ -405,6 +421,7 @@ fn print_first_plan(plan: &FirstPlanJson) {
             println!("    {}: {}: {}", n.system, n.catalogue, n.reason);
         }
     }
+    print_needs_validation(&plan.needs_validation);
     let waiting: usize = plan.waiting.iter().map(|w| w.games).sum();
     println!("Waiting, not matched now ({waiting}):");
     for w in &plan.waiting {
@@ -417,6 +434,37 @@ fn print_first_plan(plan: &FirstPlanJson) {
     }
 }
 
+/// Installed catalogues left out only because they were never validated (or
+/// changed since): said per system, so a system is never matched against
+/// part of its catalogues without the person knowing.
+fn print_needs_validation(rows: &[NeedsValidationJson]) {
+    if rows.is_empty() {
+        return;
+    }
+    println!(
+        "Installed catalogues not used yet because they need validation ({}). \
+         Validate them on the DAT Sources page, then run this again:",
+        rows.len()
+    );
+    let mut by_system: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for row in rows {
+        by_system
+            .entry(&row.system)
+            .or_default()
+            .push(&row.catalogue);
+    }
+    for (system, names) in by_system {
+        let shown = names.iter().take(3).copied().collect::<Vec<_>>().join("; ");
+        let more = names.len().saturating_sub(3);
+        let more = if more > 0 {
+            format!("; and {more} more")
+        } else {
+            String::new()
+        };
+        println!("    {:>7}  {system}: {shown}{more}", names.len());
+    }
+}
+
 pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut confirm = false;
     let mut unchecked = false;
@@ -424,6 +472,7 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut limit = None;
     let mut database = None;
     let mut games_per_set = None;
+    let mut platform = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -445,6 +494,12 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                         .ok_or("dat recheck: --games-per-set needs a number above zero")?,
                 );
             }
+            "--platform" => {
+                platform =
+                    Some(args.next().ok_or(
+                        "dat recheck: --platform needs a system name. Nothing was checked.",
+                    )?);
+            }
             "--database" => {
                 database = Some(PathBuf::from(
                     args.next().ok_or("dat recheck: --database needs a path")?,
@@ -453,22 +508,50 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             other => {
                 return Err(format!(
                     "dat recheck: unknown argument {other}. Nothing was checked.\n\
-                     usage: dat recheck [--unchecked] [--confirm] [--limit <n>] \
-                     [--games-per-set <n>] [--database <path>] [--json]\n\
+                     usage: dat recheck [--unchecked [--platform <system>]] [--confirm] \
+                     [--limit <n>] [--games-per-set <n>] [--database <path>] [--json]\n\
                      Without --confirm this only lists what would be checked. \
-                     --unchecked matches games that have no saved result yet."
+                     --unchecked matches games that have no saved result yet; \
+                     --platform limits that to one system."
                 )
                 .into());
             }
         }
     }
+    // Checked before anything is loaded or read: a system that is not
+    // known, or a filter on the re-check (which has no such option), is
+    // refused rather than silently widened to every system.
+    let platform = match platform {
+        None => None,
+        Some(_) if !unchecked => {
+            return Err(
+                "dat recheck: --platform is only available with --unchecked. Nothing was checked."
+                    .into(),
+            );
+        }
+        Some(name) => Some(
+            archivefs_core::canonical_platform_for_alias(&name).ok_or_else(|| {
+                format!("dat recheck: unknown system \"{name}\". Nothing was checked.")
+            })?,
+        ),
+    };
     let database = match database {
         Some(path) => std::path::absolute(path)?,
         None => archivefs_core::default_database_path()?,
     };
     let catalogues = ReauditCatalogues::load_default()?;
     if unchecked {
-        return run_first_time(&database, &catalogues, confirm, json, limit, games_per_set);
+        return run_first_time(
+            &database,
+            &catalogues,
+            FirstTimeOptions {
+                confirm,
+                json,
+                limit,
+                games_per_set,
+                platform,
+            },
+        );
     }
     let mut plan = plan_reaudit(&database, &catalogues.configured())?;
     if let Some(limit) = limit {
@@ -507,24 +590,43 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
 
 /// `dat recheck --unchecked`: first-time matching for games with no saved
 /// DAT result, through the same bounded, resumable run as a re-check.
-fn run_first_time(
-    database: &std::path::Path,
-    catalogues: &ReauditCatalogues,
+struct FirstTimeOptions {
     confirm: bool,
     json: bool,
     limit: Option<usize>,
     games_per_set: Option<usize>,
+    /// Canonical system id from `--platform`; `None` means every system.
+    platform: Option<&'static str>,
+}
+
+fn run_first_time(
+    database: &std::path::Path,
+    catalogues: &ReauditCatalogues,
+    options: FirstTimeOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut first = plan_first_matching(
+    let FirstTimeOptions {
+        confirm,
+        json,
+        limit,
+        games_per_set,
+        platform,
+    } = options;
+    let mut first = plan_first_matching_for(
         database,
         &catalogues.configured(),
         &|platform| catalogues.for_platform(platform),
         &|source_id| catalogues.resolve(source_id),
+        platform,
     )?;
     if let Some(limit) = limit {
         first = first.truncated(limit);
     }
-    let summary = first_plan_json(&first);
+    let needs_validation: Vec<_> = catalogues
+        .needing_validation()
+        .into_iter()
+        .filter(|(system, _)| platform.is_none_or(|only| system == only))
+        .collect();
+    let summary = first_plan_json(&first, &needs_validation);
     if !confirm {
         if json {
             println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -672,4 +774,38 @@ fn print_outcome(output: &ReportJson) {
     println!(
         "A verified file matches its catalogue entry. That says nothing about whether an emulator will run it."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run;
+
+    fn refusal(args: &[&str]) -> String {
+        run(args.iter().map(|a| a.to_string()).collect())
+            .unwrap_err()
+            .to_string()
+    }
+
+    /// `--platform` is refused before any configuration or database is
+    /// opened: an unknown system, a missing name, or use without
+    /// `--unchecked` never widens to every system.
+    #[test]
+    fn platform_filter_refuses_before_reading_anything() {
+        let unknown = refusal(&["--unchecked", "--platform", "Not A System"]);
+        assert!(
+            unknown.contains("unknown system \"Not A System\""),
+            "{unknown}"
+        );
+        assert!(unknown.contains("Nothing was checked"), "{unknown}");
+        let missing = refusal(&["--unchecked", "--platform"]);
+        assert!(
+            missing.contains("--platform needs a system name"),
+            "{missing}"
+        );
+        let recheck = refusal(&["--platform", "ZX Spectrum"]);
+        assert!(
+            recheck.contains("only available with --unchecked"),
+            "{recheck}"
+        );
+    }
 }

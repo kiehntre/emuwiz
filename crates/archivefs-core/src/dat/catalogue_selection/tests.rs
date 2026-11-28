@@ -1123,3 +1123,70 @@ fn disabled_installed_managed_sources_stay_visible_but_cannot_resolve_or_make_se
         assert_eq!(fs::read(snapshot).unwrap(), before);
     }
 }
+
+// ---------------------------------------------------------------------------
+// ORACLE I1/I2: a never-validated catalogue is reported, not dropped silently
+// ---------------------------------------------------------------------------
+
+/// Production 2026-11-28: 23 TOSEC ZX Spectrum catalogues were enabled and
+/// set to the system but never validated, so every platform check used only
+/// the validated "+3" list and nothing told the person why. The platform
+/// check still leaves them out (unproven), but they are now listed.
+#[test]
+fn never_validated_catalogue_of_a_system_is_listed_as_needing_validation() {
+    let temp = tempfile::tempdir().unwrap();
+    let plus3 = write_dat(temp.path(), "plus3.dat", &logiqx_dat("ZX Spectrum", "A"));
+    let tap = write_dat(temp.path(), "tap.dat", &logiqx_dat("ZX Spectrum", "B"));
+    let off = write_dat(temp.path(), "off.dat", &logiqx_dat("ZX Spectrum", "C"));
+    let loose = write_dat(temp.path(), "loose.dat", &logiqx_dat("Acorn Atom", "D"));
+    let reg = registry(&[
+        LocalEntrySpec {
+            id: "plus3",
+            display_name: "Spectrum +3 (validated)",
+            path: plus3,
+            platform: Some("ZX Spectrum"),
+            enabled: true,
+            health_valid: true,
+            ..Default::default()
+        },
+        LocalEntrySpec {
+            id: "tap",
+            display_name: "Spectrum TAP (never validated)",
+            path: tap,
+            platform: Some("ZX Spectrum"),
+            enabled: true,
+            ..Default::default()
+        },
+        LocalEntrySpec {
+            id: "off",
+            display_name: "Spectrum disabled",
+            path: off,
+            platform: Some("ZX Spectrum"),
+            enabled: false,
+            ..Default::default()
+        },
+        LocalEntrySpec {
+            id: "loose",
+            display_name: "No system set",
+            path: loose,
+            enabled: true,
+            ..Default::default()
+        },
+    ]);
+    let managed_root = temp.path().join("managed");
+    let sources = ManagedDatSources::new();
+
+    // The check itself is unchanged: only the validated catalogue is used.
+    let resolved =
+        resolve_catalogue_for_platform("ZX Spectrum", inputs(&reg, &sources, &managed_root))
+            .unwrap();
+    assert_eq!(resolved.source_id, "plus3");
+    // But the left-out one is now named, under its system.
+    assert_eq!(
+        catalogues_needing_validation(inputs(&reg, &sources, &managed_root)),
+        vec![(
+            "ZX Spectrum".to_string(),
+            "Spectrum TAP (never validated)".to_string()
+        )]
+    );
+}
