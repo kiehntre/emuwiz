@@ -2206,7 +2206,10 @@ fn show_matches_opens_the_list_and_scrolls_to_an_unassigned_catalogue() {
         }
     }
     let seen = frame(&mut state, vec![]);
-    assert!(button.is_some(), "the search offers Show matches: {seen:#?}");
+    assert!(
+        button.is_some(),
+        "the search offers Show matches: {seen:#?}"
+    );
     // Let the scroll settle, then click.
     let mut texts = Vec::new();
     for _ in 0..20 {
