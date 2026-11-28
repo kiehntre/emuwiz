@@ -20,6 +20,12 @@ free. Never run bare `cargo` for builds, never export a shared `CARGO_TARGET_DIR
 clean or delete a target directory you did not create. See the "Cargo builds" section of
 `AGENTS.md` for details, including shells that inherited the old shared target.
 
+New development worktrees put their target on `/mnt/nvme2` (a one-line
+`.claude/settings.local.json`; never for a worktree that already has a target). For a full
+local test pass use `scripts/emuwiz-test-lanes`; for targeted tests keep the package
+selection the worktree was built with, and keep `TMPDIR` under `/tmp`. Details:
+"Development worktrees and full local test passes" in `AGENTS.md`.
+
 ## Automatic repair and security policy
 
 The [shared policy in AGENTS.md](AGENTS.md#automatic-repair-and-security-policy)
