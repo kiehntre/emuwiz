@@ -80,8 +80,7 @@ fn real_database_gbc_rename_preview() {
     let read_only = std::fs::read_to_string("/proc/self/mountinfo")
         .unwrap()
         .lines()
-        .filter(|line| line.split(' ').nth(4) == Some("/mnt/usbdrive/games/gbc"))
-        .last()
+        .rfind(|line| line.split(' ').nth(4) == Some("/mnt/usbdrive/games/gbc"))
         .is_some_and(|line| {
             line.split(' ')
                 .nth(5)

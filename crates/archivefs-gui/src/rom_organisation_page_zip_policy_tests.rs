@@ -62,7 +62,9 @@ struct Library {
 
 /// The catalogue: one-file games, a two-file game, and a two-file game
 /// whose archive holds only one of its files.
-const GAMES: &[(&str, &[(&str, &[u8])])] = &[
+/// One catalogue game: its name and its (file name, bytes) entries.
+type Game = (&'static str, &'static [(&'static str, &'static [u8])]);
+const GAMES: &[Game] = &[
     ("Alpha (USA)", &[("Alpha (USA).gbc", b"alpha rom")]),
     ("Upper (Europe)", &[("Upper (Europe).gbc", b"upper rom")]),
     (
